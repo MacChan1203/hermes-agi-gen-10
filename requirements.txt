@@ -1,0 +1,13 @@
+# Hermes AGI Gen
+fire
+pyyaml
+requests
+rich
+prompt_toolkit
+pydantic>=2.0
+openai
+python-dotenv
+PyJWT[crypto]
+httpx
+jinja2
+tenacity

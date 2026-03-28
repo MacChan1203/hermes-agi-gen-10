@@ -1,0 +1,9 @@
+.Hermes2/
+.Hermes-AGI/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.db
+*.bak
+output.txt
