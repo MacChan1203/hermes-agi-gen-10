@@ -69,6 +69,9 @@ class HermesAgentV9:
 
         state.working_memory["session_id"] = state.session_id
 
+        # GoalQueueをLTMから復元 (セッション間の継続性)
+        self.meta.goal_queue.load_from_ltm(self.ltm)
+
         # 前回セッションの総括を読み込む
         latest_summary = load_latest_run_summary(self.repo_root)
         if latest_summary:
@@ -198,6 +201,16 @@ class HermesAgentV9:
         # 自己改善: 軌跡を分析してfew-shot例を更新
         self.self_improver.analyze_session(state)
 
+        # パフォーマンス記録 (自律改善ループ用)
+        perf_score = self.meta.performance_score(state)
+        if state.session_id:
+            self.self_improver.record_session_performance(
+                session_id=state.session_id,
+                goal=state.user_goal,
+                domain=state.domain or "general",
+                score=perf_score,
+            )
+
         # メタ認知: 次ゴールの自律提案
         next_goal = self.meta.generate_next_goal(state, self.ltm)
         if next_goal:
@@ -211,6 +224,9 @@ class HermesAgentV9:
                 {"goal": g.goal, "score": g.composite_score, "source": g.source}
                 for g in queued_goals[:5]
             ]
+
+        # GoalQueueをLTMに永続化 (次回セッションで復元するため)
+        self.meta.goal_queue.save_to_ltm(self.ltm)
 
         return state
 

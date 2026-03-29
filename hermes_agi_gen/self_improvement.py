@@ -21,6 +21,14 @@ if TYPE_CHECKING:
 _IMPROVEMENT_DB_PATH = Path.home() / ".hermes" / "self_improvement.db"
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS session_performance (
+    session_id TEXT PRIMARY KEY,
+    goal TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    score REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS few_shot_examples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
@@ -345,3 +353,54 @@ class SelfImprovementEngine:
             (score, example_id),
         )
         self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # パフォーマンス追跡 (AGI自律改善ループ用)
+    # ------------------------------------------------------------------
+
+    def record_session_performance(
+        self, session_id: str, goal: str, domain: str, score: float
+    ) -> None:
+        """セッションのパフォーマンススコアを記録する。"""
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO session_performance
+            (session_id, goal, domain, score, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_id, goal[:200], domain, score, time.time()),
+        )
+        self._conn.commit()
+
+    def get_performance_trend(self, domain: str = "general", window: int = 10) -> float:
+        """直近 window セッションの平均パフォーマンスを返す。
+
+        Returns:
+            0.0〜1.0 の平均スコア。データ不足の場合は 0.5。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT score FROM session_performance
+            WHERE domain = ? OR domain = 'general'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (domain, window),
+        ).fetchall()
+        if not rows:
+            return 0.5
+        scores = [r["score"] for r in rows]
+        return sum(scores) / len(scores)
+
+    def get_performance_history(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """パフォーマンス履歴を返す。"""
+        rows = self._conn.execute(
+            """
+            SELECT session_id, goal, domain, score, created_at
+            FROM session_performance
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]

@@ -13,7 +13,11 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from .hermes_constants import DEFAULT_MISTRAL_MODEL, GROQ_BASE_URL, GROQ_DEFAULT_MODEL, GROQ_FAST_MODEL, MISTRAL_API_BASE_URL, OLLAMA_BASE_URL
+from .hermes_constants import (
+    CLAUDE_DEFAULT_MODEL, CLAUDE_FAST_MODEL,
+    DEFAULT_MISTRAL_MODEL, GROQ_BASE_URL, GROQ_DEFAULT_MODEL, GROQ_FAST_MODEL,
+    MISTRAL_API_BASE_URL, OLLAMA_BASE_URL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +116,29 @@ class MistralClient:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
         mistral_key = api_key or os.getenv("MISTRAL_API_KEY", "")
         groq_key = os.getenv("GROQ_API_KEY", "")
 
-        # "groq" / "mistral" / "ollama" をバックエンド指定キーワードとして解釈
         model_lower = model.lower()
+        # デフォルトモデル名 "mistral" は自動選択扱い (バックエンドキーワードと区別)
+        is_auto = (model == DEFAULT_MISTRAL_MODEL)
+
+        # ━━━ バックエンド優先順位 ━━━
+        # 1. Claude (ANTHROPIC_API_KEY) — groq/ollama が明示指定された場合はスキップ
+        if anthropic_key and model_lower not in ("groq", "ollama") and not base_url:
+            from .claude_client import ClaudeClient
+            self._claude_client: Optional[ClaudeClient] = ClaudeClient(
+                model=os.getenv("CLAUDE_MODEL", CLAUDE_DEFAULT_MODEL)
+            )
+            self.api_key = anthropic_key
+            self.base_url = "https://api.anthropic.com"
+            self.model = self._claude_client.model
+            return
+        else:
+            self._claude_client = None
+
+        # 2. Groq (明示的キーワード指定 or 自動)
         if model_lower == "groq":
             if not groq_key:
                 raise ValueError(
@@ -128,26 +150,25 @@ class MistralClient:
             self.api_key = groq_key
             self.base_url = base_url or GROQ_BASE_URL
             self.model = os.getenv("GROQ_MODEL", GROQ_DEFAULT_MODEL)
-        elif model_lower == "mistral":
-            if not mistral_key:
-                raise ValueError(
-                    "モデルに 'mistral' を指定しましたが MISTRAL_API_KEY が設定されていません。\n"
-                    "  export MISTRAL_API_KEY=your_key  を実行してから再試行してください。"
-                )
+        # 3. Mistral (明示的キーワード指定 + MISTRAL_API_KEY あり)
+        elif model_lower == "mistral" and not is_auto and mistral_key:
             self.api_key = mistral_key
             self.base_url = base_url or MISTRAL_API_BASE_URL
             self.model = "mistral-small-latest"
+        elif model_lower == "mistral" and not is_auto and not mistral_key:
+            raise ValueError(
+                "モデルに 'mistral' を指定しましたが MISTRAL_API_KEY が設定されていません。\n"
+                "  export MISTRAL_API_KEY=your_key  を実行してから再試行してください。"
+            )
+        # 4. 自動選択: MISTRAL_API_KEY → GROQ_API_KEY → Ollama
         elif mistral_key:
             self.api_key = mistral_key
             self.base_url = base_url or MISTRAL_API_BASE_URL
-            self.model = model
+            self.model = model if not is_auto else "mistral-small-latest"
         elif groq_key:
             self.api_key = groq_key
             self.base_url = base_url or GROQ_BASE_URL
-            if model == DEFAULT_MISTRAL_MODEL:
-                self.model = os.getenv("GROQ_MODEL", GROQ_DEFAULT_MODEL)
-            else:
-                self.model = model
+            self.model = os.getenv("GROQ_MODEL", GROQ_DEFAULT_MODEL) if is_auto else model
         else:
             # Ollama は認証不要。OLLAMA_MODEL 環境変数でモデルを上書き可能
             self.api_key = "ollama"
@@ -162,9 +183,19 @@ class MistralClient:
     def fast(cls) -> "MistralClient":
         """インテント分類など軽量タスク用の高速モデルを返す。
 
-        Groq 使用時は GROQ_FAST_MODEL (llama-3.1-8b-instant) を使用。
-        Groq 未設定時はデフォルトモデルにフォールバック。
+        Claude使用時は Haiku、Groq使用時は GROQ_FAST_MODEL を使用。
         """
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if anthropic_key:
+            # Claude Haiku を使用
+            inst = cls.__new__(cls)
+            from .claude_client import ClaudeClient
+            inst._claude_client = ClaudeClient(model=CLAUDE_FAST_MODEL)
+            inst.api_key = anthropic_key
+            inst.base_url = "https://api.anthropic.com"
+            inst.model = CLAUDE_FAST_MODEL
+            return inst
+
         groq_key = os.getenv("GROQ_API_KEY", "")
         if groq_key:
             fast_model = os.getenv("GROQ_FAST_MODEL", GROQ_FAST_MODEL)
@@ -184,6 +215,12 @@ class MistralClient:
         max_tokens: int = 1024,
     ) -> str:
         """メッセージリストを送信してテキスト応答を返す。エラー時は空文字。"""
+        # Claude クライアントに委譲
+        if getattr(self, "_claude_client", None) is not None:
+            return self._claude_client.chat(
+                messages, temperature=temperature, max_tokens=max_tokens
+            )
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -222,6 +259,12 @@ class MistralClient:
         max_tokens: int = 1024,
     ) -> Optional[Any]:
         """JSON を期待する呼び出し。マークダウンコードブロックを除去して parse する。"""
+        # Claude クライアントに委譲
+        if getattr(self, "_claude_client", None) is not None:
+            return self._claude_client.chat_json(
+                messages, temperature=temperature, max_tokens=max_tokens
+            )
+
         raw = self.chat(messages, temperature=temperature, max_tokens=max_tokens)
         if not raw:
             return None

@@ -40,7 +40,9 @@ class QueuedGoal:
 
 
 class GoalQueue:
-    """自律的ゴールの優先度付きキュー。"""
+    """自律的ゴールの優先度付きキュー。セッション間でLTMに永続化可能。"""
+
+    _LTM_KEY_PREFIX = "goal_queue_v2_"
 
     def __init__(self, max_size: int = 20) -> None:
         self._queue: List[QueuedGoal] = []
@@ -73,6 +75,72 @@ class GoalQueue:
 
     def to_list(self) -> List[QueuedGoal]:
         return list(self._queue)
+
+    def save_to_ltm(self, ltm: "LongTermMemory") -> None:
+        """GoalQueueの内容をLTMに永続化する。"""
+        import json as _json
+        # 古いエントリを削除 (上書き用にキー一覧を取得)
+        for i, goal in enumerate(self._queue):
+            key = f"{self._LTM_KEY_PREFIX}{i:03d}"
+            data = {
+                "goal": goal.goal,
+                "priority_score": goal.priority_score,
+                "source": goal.source,
+                "rationale": goal.rationale,
+                "domain": goal.domain,
+                "estimated_value": goal.estimated_value,
+                "estimated_difficulty": goal.estimated_difficulty,
+                "created_at": goal.created_at,
+            }
+            ltm.learn(key, _json.dumps(data, ensure_ascii=False))
+        # キューが縮んだ場合は余分なエントリを無効化
+        sentinel_key = f"{self._LTM_KEY_PREFIX}count"
+        ltm.learn(sentinel_key, str(len(self._queue)))
+
+    def load_from_ltm(self, ltm: "LongTermMemory") -> None:
+        """LTMからGoalQueueを復元する。"""
+        import json as _json
+        # 保存数を取得
+        recent = ltm.recall_recent(limit=200)
+        count = 0
+        count_key = f"{self._LTM_KEY_PREFIX}count"
+        for f in recent:
+            if f["key"] == count_key:
+                try:
+                    count = int(f["value"])
+                except (ValueError, TypeError):
+                    count = 0
+                break
+
+        if count == 0:
+            return
+
+        # エントリをロード
+        items_by_key: dict = {}
+        for f in recent:
+            if f["key"].startswith(self._LTM_KEY_PREFIX) and f["key"] != count_key:
+                items_by_key[f["key"]] = f["value"]
+
+        loaded = 0
+        for i in range(count):
+            key = f"{self._LTM_KEY_PREFIX}{i:03d}"
+            if key not in items_by_key:
+                continue
+            try:
+                data = _json.loads(items_by_key[key])
+                self.add(QueuedGoal(
+                    goal=data["goal"],
+                    priority_score=float(data.get("priority_score", 0.5)),
+                    source=data.get("source", "restored"),
+                    rationale=data.get("rationale", ""),
+                    domain=data.get("domain", "general"),
+                    estimated_value=float(data.get("estimated_value", 0.5)),
+                    estimated_difficulty=float(data.get("estimated_difficulty", 0.5)),
+                    created_at=float(data.get("created_at", time.time())),
+                ))
+                loaded += 1
+            except (KeyError, ValueError, TypeError):
+                continue
 
 
 _GOAL_GENERATION_PROMPT = """\

@@ -11,3 +11,4 @@ PyJWT[crypto]
 httpx
 jinja2
 tenacity
+anthropic>=0.25.0

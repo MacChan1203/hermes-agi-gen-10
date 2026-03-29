@@ -5,6 +5,11 @@ OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 MISTRAL_API_BASE_URL = "https://api.mistral.ai/v1"
 DEFAULT_MISTRAL_MODEL = "mistral"
 
+# Anthropic Claude (最優先バックエンド)
+CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-6"
+CLAUDE_FAST_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_API_BASE = "https://api.anthropic.com"
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
 OPENROUTER_CHAT_URL = f"{OPENROUTER_BASE_URL}/chat/completions"

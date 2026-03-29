@@ -35,9 +35,11 @@ from rich.table import Table
 
 from hermes_agi_gen import AgentOrchestrator, AgentState, HermesAgentV9
 from hermes_agi_gen.code_agents import CodeGeneratorAgent, CodeReviewerAgent
+from hermes_agi_gen.daemon import HermesDaemon
 from hermes_agi_gen.hermes_constants import DOMAIN_CONFIG
 from hermes_agi_gen.mistral_client import MistralClient
 from hermes_agi_gen.self_improvement import SelfImprovementEngine
+from hermes_agi_gen.self_modifier import SelfModifier, _SAFE_MODIFY_TARGETS
 from hermes_agi_gen.state_store import SessionDB
 from hermes_agi_gen.tool_registry import ToolRegistry
 from hermes_agi_gen.world_model import WorldModel
@@ -49,9 +51,41 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 _GENERAL_SYSTEM = """\
-あなたは Hermes AI、汎用の対話型アシスタントです。
-ユーザーの質問・相談・依頼に対して、丁寧かつ簡潔に日本語で回答してください。
-コーディング、調査、文章作成、データ分析、一般的な質問など、あらゆるトピックに対応します。
+あなたは Hermes AGI — 自律型AIエージェントシステムです。
+あなたは **できる** ことに焦点を当てて回答してください。
+
+## 実際の能力 (Hermes AGI として)
+
+### ✅ 能動的な行動
+- CMD: でシェルコマンドを実行できます
+- PYTHON: でPythonコードを直接実行できます
+- WRITE: でファイルを作成・編集できます
+- READ: でファイルを読み込めます
+- PLAN: で複雑なタスクを複数ステップに分解できます
+
+### ✅ 外部システムへのアクセス
+- SEARCH: でウェブ検索（DuckDuckGo）ができます
+- CMD: curl/wget で任意のAPIを呼び出せます
+- ローカルファイルシステムへの読み書きができます
+
+### ✅ 継続的な実行 (AGI機能)
+- GoalQueueがLTM (SQLite) に永続化されており、再起動後も目標を継続できます
+- /daemon start でバックグラウンドAGIが自律的にGoalQueueを処理します
+- セッションをまたいで経験・失敗・戦略を記憶します
+
+### ✅ スケジュール実行
+- /daemon start でバックグラウンドデーモンが起動し自律稼働します
+- launchd (macOS) でシステム起動時に自動起動できます
+- GoalQueueに目標を積めばデーモンが自動的に処理します
+
+## 動作モード
+- **チャット**: 直接回答・相談・説明
+- **エージェント (/run)**: ローカル環境でタスクを実行
+- **オーケストレーター (/orch)**: 複数エージェントで並列実行
+- **デーモン (/daemon start)**: 24時間自律稼働
+
+ユーザーの質問・依頼に対して、上記の能力を前提に「できる」として回答してください。
+「できません」という回答は避け、どの機能を使えば実現できるか説明してください。
 """
 
 _INTENT_SYSTEM = """\
@@ -86,6 +120,11 @@ _HELP = """\
 | `/orch <目標>` | 階層的マルチエージェントで複雑なタスクを並列実行 |
 | `/reflect [対象]` | 自己診断: ソースを読んで改善提案を生成 |
 | `/apply` | 最後の `/reflect` 提案をコードに適用 |
+| `/self-modify [対象]` | 自律的コード修正: 提案→テスト→適用のサイクル |
+| `/daemon start` | AGI自律デーモンをバックグラウンドで起動 |
+| `/daemon stop` | デーモンを停止 |
+| `/daemon status` | デーモンの状態を確認 |
+| `/daemon log` | デーモンのログを表示 |
 | `/generate <説明>` | 自然言語からコードを生成 |
 | `/review` | コードのレビュー（貼り付けモード） |
 | `/tools [list/add]` | カスタムツールの一覧表示・登録 |
@@ -93,6 +132,7 @@ _HELP = """\
 | `/world` | 世界モデルの状態を表示 |
 | `/status` | AGIシステム全体のステータスを表示 |
 | `/improve` | 自己改善レポートを表示 |
+| `/perf` | パフォーマンス履歴を表示 |
 | `/clear` | 会話履歴をリセット |
 | `/provider` | 現在の LLM プロバイダーを表示 |
 | `/help` | このヘルプを表示 |
@@ -100,6 +140,9 @@ _HELP = """\
 
 **ヒント**: `/reflect` の対象は `planner` `executor` `reviewer` `runner` `memory`
 `meta` `world` `registry` `improver` `cli` など。省略するとコアファイル全体を診断します。
+
+**AGIデーモン**: `/daemon start` でバックグラウンドAGIが起動し、自律的にGoalQueueを処理します。
+GoalQueueはセッションをまたいでLTMに永続化されます。
 """
 
 # 短縮名 → 実ファイルパスのマッピング
@@ -182,6 +225,8 @@ def _is_likely_chat(message: str) -> bool:
 
 def _provider_label(llm: MistralClient) -> str:
     url = llm.base_url
+    if "anthropic" in url:
+        return f"[bold green]Claude[/bold green] ({llm.model})"
     if "groq" in url:
         return f"[bold yellow]Groq[/bold yellow] ({llm.model})"
     if "mistral" in url:
@@ -471,6 +516,165 @@ def _cmd_improve(improver: SelfImprovementEngine, domain: str = "general") -> No
 # AGI機能: AGIシステム全体のステータス
 # ---------------------------------------------------------------------------
 
+def _cmd_daemon(subcmd: str) -> None:
+    """デーモンの起動・停止・状態確認・ログ表示。"""
+    subcmd = subcmd.strip().lower()
+
+    if subcmd == "start":
+        status = HermesDaemon.get_status()
+        if status["running"]:
+            console.print(f"[yellow]デーモンはすでに起動中です (PID={status['pid']})。[/yellow]")
+            return
+        import subprocess as _sp
+        import sys as _sys
+        proc = _sp.Popen(
+            [_sys.executable, "-m", "hermes_agi_gen.daemon"],
+            cwd=str(Path(".")),
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+            start_new_session=True,
+        )
+        console.print(f"[green]AGI自律デーモンを起動しました (PID={proc.pid})。[/green]")
+        console.print(f"[dim]ログ: ~/.hermes/daemon.log | /daemon status で確認[/dim]")
+
+    elif subcmd == "stop":
+        if HermesDaemon.stop_daemon():
+            console.print("[yellow]デーモンに停止シグナルを送りました。[/yellow]")
+        else:
+            console.print("[dim]デーモンは起動していません。[/dim]")
+
+    elif subcmd == "status":
+        status = HermesDaemon.get_status()
+        if not status["running"]:
+            console.print("[dim]デーモンは起動していません。[/dim]")
+            return
+        hb = status.get("heartbeat") or {}
+        import time as _time
+        age = _time.time() - hb.get("timestamp", 0)
+        console.print(Panel(
+            f"[bold green]稼働中[/bold green] (PID={status['pid']})\n"
+            f"最終ハートビート: {age:.0f}秒前\n"
+            f"GoalQueue: {hb.get('queue_size', '?')}件\n"
+            f"本日の使用: {hb.get('daily_used', '?')}/{hb.get('daily_max', '?')}ゴール",
+            title="🤖 AGIデーモン状態",
+            border_style="green",
+        ))
+
+    elif subcmd == "log":
+        log = HermesDaemon.get_log(lines=30)
+        console.print(Panel(log, title="AGIデーモンログ (直近30行)", border_style="dim"))
+
+    else:
+        console.print("[dim]使い方: /daemon start|stop|status|log[/dim]")
+
+
+def _cmd_self_modify(
+    llm: MistralClient,
+    target: str,
+    last_reflection: Dict[str, str],
+) -> None:
+    """自律的コード修正サイクル: 提案 → テスト → 適用/ロールバック。"""
+    modifier = SelfModifier(llm=llm, repo_root=Path("."))
+
+    # 対象ファイルを決定
+    if target in _REFLECT_TARGETS:
+        file_path = _REFLECT_TARGETS[target]
+    elif target in _SAFE_MODIFY_TARGETS:
+        file_path = target
+    elif last_reflection.get("file"):
+        file_path = last_reflection["file"]
+        if "," in file_path:
+            # 複数ファイルの場合は最初の1つ
+            file_path = file_path.split(",")[0].strip()
+    else:
+        console.print(
+            "[yellow]対象を指定してください。例: /self-modify planner[/yellow]\n"
+            f"[dim]修正可能ファイル: {', '.join(_SAFE_MODIFY_TARGETS)}[/dim]"
+        )
+        return
+
+    if file_path not in _SAFE_MODIFY_TARGETS:
+        console.print(f"[red]{file_path} は修正が許可されていません。[/red]")
+        console.print(f"[dim]許可されているファイル: {', '.join(sorted(_SAFE_MODIFY_TARGETS))}[/dim]")
+        return
+
+    analysis = last_reflection.get("suggestion", "コードを改善してください。")
+
+    console.print(f"[magenta]自律コード修正モード[/magenta] — 対象: [bold]{file_path}[/bold]")
+    console.print("[dim]LLMに改善案を生成させています...[/dim]")
+
+    with console.status("[cyan]改善案を生成中...[/cyan]"):
+        patch = modifier.propose_change(file_path, analysis)
+
+    if patch is None:
+        console.print("[yellow]改善案が見つかりませんでした。/reflect で先に分析してください。[/yellow]")
+        return
+
+    # パッチ内容を表示して確認
+    console.print(Panel(
+        f"[bold]理由:[/bold] {patch.rationale}\n"
+        f"[bold]変更数:[/bold] {len(patch.changes)}件\n"
+        f"[bold]リスク:[/bold] {patch.risk_level}\n"
+        f"[bold]期待効果:[/bold] {patch.expected_benefit}",
+        title="提案されたパッチ",
+        border_style="cyan",
+    ))
+
+    for i, change in enumerate(patch.changes, 1):
+        console.print(f"[dim]変更 {i}: {change.description}[/dim]")
+
+    confirm = Prompt.ask("このパッチを適用してテストしますか？", choices=["y", "n"], default="n")
+    if confirm != "y":
+        console.print("[dim]キャンセルしました。[/dim]")
+        return
+
+    with console.status("[yellow]パッチを適用してテストを実行中...[/yellow]"):
+        success = modifier.validate_and_commit(patch)
+
+    if success:
+        console.print(f"[green]✓ パッチが適用されました！テストが通過しました。[/green]")
+        console.print(f"[dim]変更ファイル: {file_path}[/dim]")
+    else:
+        console.print("[red]✗ テストが失敗しました。変更はロールバックされました。[/red]")
+
+    # 履歴を表示
+    history_data = modifier.get_patch_history(limit=5)
+    if history_data:
+        success_rate = modifier.get_success_rate()
+        console.print(f"[dim]修正成功率: {success_rate:.0%} ({len(history_data)}件の履歴)[/dim]")
+
+
+def _cmd_perf(improver: SelfImprovementEngine) -> None:
+    """パフォーマンス履歴を表示する。"""
+    history = improver.get_performance_history(limit=10)
+    if not history:
+        console.print("[dim]パフォーマンス履歴がありません。/run でタスクを実行すると記録されます。[/dim]")
+        return
+
+    table = Table(title="セッションパフォーマンス履歴", border_style="cyan")
+    table.add_column("ドメイン", style="cyan")
+    table.add_column("ゴール")
+    table.add_column("スコア", justify="right", style="green")
+
+    import time as _time
+    from datetime import datetime
+    for h in history:
+        score = h["score"]
+        color = "green" if score >= 0.7 else ("yellow" if score >= 0.4 else "red")
+        table.add_row(
+            h["domain"],
+            h["goal"][:50],
+            f"[{color}]{score:.0%}[/{color}]",
+        )
+    console.print(table)
+
+    # 傾向を表示
+    for domain in ("general", "coding", "research"):
+        trend = improver.get_performance_trend(domain=domain, window=5)
+        color = "green" if trend >= 0.7 else ("yellow" if trend >= 0.4 else "red")
+        console.print(f"[dim]{domain} 直近5回の平均: [{color}]{trend:.0%}[/{color}][/dim]")
+
+
 def _cmd_status(
     llm: MistralClient,
     registry: ToolRegistry,
@@ -537,6 +741,11 @@ def _parse_args() -> argparse.Namespace:
         default=8,
         help="エージェントの最大イテレーション数 (デフォルト: 8)",
     )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="AGI自律デーモンモードで起動 (フォアグラウンドで継続実行)",
+    )
     return parser.parse_args()
 
 
@@ -557,6 +766,18 @@ def main() -> None:
     llm = _build_llm(args.model)
     if llm is None:
         sys.exit(1)
+
+    # デーモンモード
+    if args.daemon:
+        console.print(Panel(
+            f"[bold cyan]Hermes AGI デーモンモード[/bold cyan]\n"
+            f"LLM: {_provider_label(llm)}\n"
+            "[dim]GoalQueueを継続処理します。Ctrl+C で停止。[/dim]",
+            border_style="cyan",
+        ))
+        daemon = HermesDaemon(llm=llm)
+        daemon.run_forever()
+        return
 
     # fast_llm: Groq使用時は軽量モデル、それ以外は同じモデル
     fast_llm = MistralClient.fast() if args.model in (None, "groq") else llm
@@ -627,6 +848,20 @@ def main() -> None:
         elif raw.startswith("/tools"):
             args = raw[6:].strip()
             _cmd_tools(tool_registry, args)
+
+        # --- デーモン制御 ---
+        elif raw.startswith("/daemon"):
+            subcmd = raw[7:].strip()
+            _cmd_daemon(subcmd)
+
+        # --- 自律コード修正 ---
+        elif raw.startswith("/self-modify"):
+            target = raw[12:].strip().lower()
+            _cmd_self_modify(llm, target, last_reflection)
+
+        # --- パフォーマンス履歴 ---
+        elif raw == "/perf":
+            _cmd_perf(self_improver)
 
         # --- 自律ゴールキュー ---
         elif raw == "/goals":

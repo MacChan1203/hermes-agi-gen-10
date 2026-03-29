@@ -96,6 +96,9 @@ class Executor:
             state.working_memory["completion_summary"] = summary
             return {"ok": True, "stdout": summary, "stderr": "", "returncode": 0, "command": None}
 
+        if step.upper().startswith("SCHEDULE:"):
+            return self._schedule_goal(step[9:], state)
+
         # カスタムツール (ToolRegistry) を確認
         custom_result = self.tool_registry.dispatch(step)
         if custom_result is not None:
@@ -289,6 +292,51 @@ class Executor:
         return {"ok": proc.returncode == 0, "stdout": stdout, "stderr": stderr, "returncode": proc.returncode, "command": "PYTHON:"}
 
     # ------------------------------------------------------------------
+    # SCHEDULE: GoalQueueにゴールを追加
+    # ------------------------------------------------------------------
+
+    def _schedule_goal(self, args: str, state: AgentState) -> Dict[str, Any]:
+        """SCHEDULE: <goal> でGoalQueueに目標を追加する。デーモンが自動処理する。
+
+        書式:
+          SCHEDULE: <ゴールテキスト>
+          SCHEDULE: priority=0.8 <ゴールテキスト>
+        """
+        args = args.strip()
+        priority = 0.6
+        if args.startswith("priority="):
+            parts = args.split(None, 1)
+            try:
+                priority = float(parts[0].split("=")[1])
+                args = parts[1] if len(parts) > 1 else ""
+            except (ValueError, IndexError):
+                pass
+
+        if not args:
+            return {"ok": False, "stdout": "", "stderr": "SCHEDULE: ゴールテキストが空です", "returncode": 1}
+
+        # LTM経由でGoalQueueに永続保存
+        try:
+            from .long_term_memory import LongTermMemory
+            from .meta_cognition import GoalQueue, QueuedGoal
+            import time as _time
+            ltm = LongTermMemory()
+            q = GoalQueue()
+            q.load_from_ltm(ltm)
+            q.add(QueuedGoal(
+                goal=args,
+                priority_score=priority,
+                source="scheduled",
+                rationale=f"SCHEDULE: ツールで追加 (セッション {state.session_id or '?'})",
+                domain=state.domain or "general",
+            ))
+            q.save_to_ltm(ltm)
+            msg = f"ゴールをキューに追加しました: {args[:60]} (priority={priority:.1f}, queue={q.size()}件)"
+            state.working_memory.setdefault("scheduled_goals", []).append(args)
+            return {"ok": True, "stdout": msg, "stderr": "", "returncode": 0, "command": f"SCHEDULE: {args}"}
+        except Exception as exc:
+            return {"ok": False, "stdout": "", "stderr": f"スケジュール登録エラー: {exc}", "returncode": 1}
+
     # レガシー静的ステップ（後方互換）
     # ------------------------------------------------------------------
 
