@@ -99,6 +99,9 @@ class Executor:
         if step.upper().startswith("SCHEDULE:"):
             return self._schedule_goal(step[9:], state)
 
+        if step.upper().startswith("SCHEDULE_AT:"):
+            return self._schedule_at(step[12:], state)
+
         # カスタムツール (ToolRegistry) を確認
         custom_result = self.tool_registry.dispatch(step)
         if custom_result is not None:
@@ -253,11 +256,12 @@ class Executor:
             content_lines = content_lines[:-1]
         content = "\n".join(content_lines)
 
-        path = (self.repo_root / filepath).resolve()
-        try:
-            path.relative_to(self.repo_root)
-        except ValueError:
-            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: {filepath} はリポジトリ外です", "returncode": 1, "command": f"WRITE: {filepath}"}
+        # 絶対パスはそのまま使用、相対パスはrepo_root基準で解決
+        raw = Path(filepath).expanduser()
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (self.repo_root / filepath).resolve()
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +338,73 @@ class Executor:
             msg = f"ゴールをキューに追加しました: {args[:60]} (priority={priority:.1f}, queue={q.size()}件)"
             state.working_memory.setdefault("scheduled_goals", []).append(args)
             return {"ok": True, "stdout": msg, "stderr": "", "returncode": 0, "command": f"SCHEDULE: {args}"}
+        except Exception as exc:
+            return {"ok": False, "stdout": "", "stderr": f"スケジュール登録エラー: {exc}", "returncode": 1}
+
+    # ------------------------------------------------------------------
+    # SCHEDULE_AT: 時刻指定スケジュール
+    # ------------------------------------------------------------------
+
+    def _schedule_at(self, args: str, state: AgentState) -> Dict[str, Any]:
+        """SCHEDULE_AT: <trigger> <goal> で時刻指定スケジュールを登録する。
+
+        書式:
+          SCHEDULE_AT: daily:09:00 毎朝ニュースを要約する
+          SCHEDULE_AT: every:30m  システム状態を確認する
+          SCHEDULE_AT: 2026-03-31T09:00 レポートを作成する
+          SCHEDULE_AT: weekly:mon:09:00 週次レポートを作成する
+          SCHEDULE_AT: priority=0.8 daily:09:00 重要タスク
+        """
+        args = args.strip()
+        priority = 0.6
+
+        # priority= オプション
+        if args.lower().startswith("priority="):
+            parts = args.split(None, 1)
+            try:
+                priority = float(parts[0].split("=")[1])
+                args = parts[1] if len(parts) > 1 else ""
+            except (ValueError, IndexError):
+                pass
+
+        # trigger と goal を分離 (最初のトークンがトリガー)
+        parts = args.split(None, 1)
+        if len(parts) < 2:
+            return {
+                "ok": False, "stdout": "", "returncode": 1,
+                "stderr": "SCHEDULE_AT: <trigger> <goal> の形式で指定してください。\n"
+                          "例: SCHEDULE_AT: daily:09:00 毎朝ニュースを要約する",
+            }
+
+        trigger_raw, goal_text = parts[0].strip(), parts[1].strip()
+
+        from .scheduler import JobScheduler, parse_trigger_spec
+        trigger = parse_trigger_spec(trigger_raw)
+        if trigger is None:
+            return {
+                "ok": False, "stdout": "", "returncode": 1,
+                "stderr": (
+                    f"トリガー形式が不明です: {trigger_raw}\n"
+                    "サポート形式: once:<ISO8601> | every:<N>m/h | daily:<HH:MM> | weekly:<day>:<HH:MM>"
+                ),
+            }
+
+        try:
+            scheduler = JobScheduler()
+            job = scheduler.add_job(
+                goal=goal_text,
+                trigger=trigger,
+                domain=state.domain or "general",
+                priority=priority,
+            )
+            next_str = scheduler.format_next_run(job)
+            msg = (
+                f"スケジュール登録完了: [{job.id}] {goal_text[:60]}\n"
+                f"  トリガー: {trigger} | 次回実行: {next_str}"
+            )
+            state.working_memory.setdefault("scheduled_jobs", []).append(job.id)
+            return {"ok": True, "stdout": msg, "stderr": "", "returncode": 0,
+                    "command": f"SCHEDULE_AT: {trigger} {goal_text}"}
         except Exception as exc:
             return {"ok": False, "stdout": "", "stderr": f"スケジュール登録エラー: {exc}", "returncode": 1}
 

@@ -30,6 +30,7 @@ from .agent_state import AgentState
 from .hermes_constants import DOMAIN_CONFIG
 from .long_term_memory import LongTermMemory
 from .meta_cognition import GoalQueue, MetaCognition, QueuedGoal
+from .scheduler import JobScheduler
 from .self_improvement import SelfImprovementEngine
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ class HermesDaemon:
         self.self_improver = SelfImprovementEngine(llm=llm)
         self.budget = DailyBudgetGuard(self.ltm, max_daily_goals)
         self.curiosity_threshold = curiosity_threshold
+        self.scheduler = JobScheduler()
         self._stop_event = threading.Event()
         self._recently_completed: list[str] = []  # 重複防止LRU (最大20件)
         self._max_recent = 20
@@ -156,6 +158,14 @@ class HermesDaemon:
 
     def _run_one_cycle(self) -> None:
         """1サイクル: ゴールを1つ処理するか、アイドル探索を行う。"""
+        # スケジューラーをティックして期限到達ジョブをGoalQueueに追加
+        triggered = self.scheduler.tick(self.meta.goal_queue)
+        if triggered:
+            for job in triggered:
+                logger.info("スケジューラー発火 → GoalQueue: [%s] %s", job.id, job.goal[:60])
+                print(f"[スケジューラー] ジョブ発火: [{job.id}] {job.goal[:60]}")
+            self._save_state()
+
         if self.budget.is_exhausted():
             logger.info("本日の予算を使い切りました。明日まで待機します。")
             self._stop_event.wait(self.idle_seconds)

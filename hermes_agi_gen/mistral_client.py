@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 60
 
 
-_VALID_JSON_ESCAPES = set('"\\\/bfnrtu')
+_VALID_JSON_ESCAPES = set('"\\bfnrtu/')
 
 
 def _sanitize_json_strings(text: str) -> str:

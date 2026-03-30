@@ -20,7 +20,7 @@ _DEFAULT_TIMEOUT = 120
 
 def _sanitize_json_strings(text: str) -> str:
     """JSON文字列値内の不正なエスケープ・裸の改行などを修正する。"""
-    _VALID = set('"\\\/bfnrtu')
+    _VALID = set('"\\bfnrtu/')
     result: list[str] = []
     in_string = False
     escape = False

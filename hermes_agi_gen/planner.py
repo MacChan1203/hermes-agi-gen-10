@@ -288,7 +288,7 @@ class Planner:
         response = self.llm.chat(
             [{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=768,
+            max_tokens=2048,
         )
 
         # CoT推論を観測に記録 (デバッグ・自己改善用)

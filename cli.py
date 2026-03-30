@@ -38,6 +38,7 @@ from hermes_agi_gen.code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from hermes_agi_gen.daemon import HermesDaemon
 from hermes_agi_gen.hermes_constants import DOMAIN_CONFIG
 from hermes_agi_gen.mistral_client import MistralClient
+from hermes_agi_gen.scheduler import JobScheduler, parse_trigger_spec
 from hermes_agi_gen.self_improvement import SelfImprovementEngine
 from hermes_agi_gen.self_modifier import SelfModifier, _SAFE_MODIFY_TARGETS
 from hermes_agi_gen.state_store import SessionDB
@@ -125,6 +126,10 @@ _HELP = """\
 | `/daemon stop` | デーモンを停止 |
 | `/daemon status` | デーモンの状態を確認 |
 | `/daemon log` | デーモンのログを表示 |
+| `/schedule` | スケジュール済みジョブ一覧 |
+| `/schedule add <trigger> <goal>` | ジョブ追加 (例: `daily:09:00` `every:30m` `weekly:mon:09:00`) |
+| `/schedule remove <id>` | ジョブ削除 |
+| `/schedule enable/disable <id>` | ジョブ有効・無効化 |
 | `/generate <説明>` | 自然言語からコードを生成 |
 | `/review` | コードのレビュー（貼り付けモード） |
 | `/tools [list/add]` | カスタムツールの一覧表示・登録 |
@@ -568,6 +573,105 @@ def _cmd_daemon(subcmd: str) -> None:
         console.print("[dim]使い方: /daemon start|stop|status|log[/dim]")
 
 
+def _cmd_schedule(args: str) -> None:
+    """スケジュールジョブの管理。
+
+    /schedule               → 一覧表示
+    /schedule list          → 一覧表示
+    /schedule add <trigger> <goal>
+                            → ジョブ追加
+                              例: /schedule add daily:09:00 毎朝ニュースを要約
+                                  /schedule add every:30m  システム状態を確認
+                                  /schedule add 2026-04-01T09:00 四半期レポートを作成
+                                  /schedule add weekly:mon:09:00 週次レポートを作成
+    /schedule remove <id>   → ジョブ削除
+    /schedule enable <id>   → ジョブ有効化
+    /schedule disable <id>  → ジョブ無効化
+    """
+    scheduler = JobScheduler()
+    parts = args.strip().split(None, 1)
+    subcmd = parts[0].lower() if parts else "list"
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if subcmd in ("", "list"):
+        jobs = scheduler.list_jobs()
+        if not jobs:
+            console.print("[dim]スケジュール済みジョブはありません。[/dim]")
+            console.print("[dim]/schedule add <trigger> <goal> で追加できます。[/dim]")
+            return
+
+        table = Table(title="スケジュールジョブ一覧", border_style="cyan")
+        table.add_column("ID", style="cyan bold", width=10)
+        table.add_column("状態", width=6)
+        table.add_column("トリガー", style="dim")
+        table.add_column("次回実行")
+        table.add_column("ゴール")
+
+        for job in jobs:
+            status_str = "[green]有効[/green]" if job.enabled else "[dim]無効[/dim]"
+            next_str = scheduler.format_next_run(job)
+            table.add_row(job.id, status_str, job.trigger, next_str, job.goal[:50])
+        console.print(table)
+        return
+
+    if subcmd == "add":
+        add_parts = rest.split(None, 1)
+        if len(add_parts) < 2:
+            console.print("[red]使い方: /schedule add <trigger> <goal>[/red]")
+            console.print("[dim]例: /schedule add daily:09:00 毎朝ニュースを要約する[/dim]")
+            return
+        trigger_raw, goal_text = add_parts[0], add_parts[1]
+        trigger = parse_trigger_spec(trigger_raw)
+        if trigger is None:
+            console.print(f"[red]トリガー形式が不明です: {trigger_raw}[/red]")
+            console.print(
+                "[dim]サポート形式:\n"
+                "  daily:09:00          毎日09:00\n"
+                "  weekly:mon:09:00     毎週月曜09:00\n"
+                "  every:30m            30分ごと\n"
+                "  every:2h             2時間ごと\n"
+                "  2026-04-01T09:00     指定日時に1回[/dim]"
+            )
+            return
+        job = scheduler.add_job(goal=goal_text, trigger=trigger)
+        next_str = scheduler.format_next_run(job)
+        console.print(
+            f"[green]ジョブを登録しました:[/green] [{job.id}] {goal_text[:60]}\n"
+            f"[dim]トリガー: {trigger} | 次回実行: {next_str}[/dim]"
+        )
+        console.print("[dim]デーモン起動中の場合は自動実行されます。/daemon start で起動。[/dim]")
+        return
+
+    if subcmd == "remove":
+        job_id = rest.strip()
+        if not job_id:
+            console.print("[red]使い方: /schedule remove <id>[/red]")
+            return
+        if scheduler.remove_job(job_id):
+            console.print(f"[yellow]ジョブ [{job_id}] を削除しました。[/yellow]")
+        else:
+            console.print(f"[red]ジョブ [{job_id}] が見つかりません。[/red]")
+        return
+
+    if subcmd == "enable":
+        job_id = rest.strip()
+        if scheduler.enable_job(job_id, enabled=True):
+            console.print(f"[green]ジョブ [{job_id}] を有効化しました。[/green]")
+        else:
+            console.print(f"[red]ジョブ [{job_id}] が見つかりません。[/red]")
+        return
+
+    if subcmd == "disable":
+        job_id = rest.strip()
+        if scheduler.enable_job(job_id, enabled=False):
+            console.print(f"[yellow]ジョブ [{job_id}] を無効化しました。[/yellow]")
+        else:
+            console.print(f"[red]ジョブ [{job_id}] が見つかりません。[/red]")
+        return
+
+    console.print("[dim]使い方: /schedule [list|add|remove|enable|disable] ...[/dim]")
+
+
 def _cmd_self_modify(
     llm: MistralClient,
     target: str,
@@ -854,6 +958,10 @@ def main() -> None:
             subcmd = raw[7:].strip()
             _cmd_daemon(subcmd)
 
+        # --- スケジュール管理 ---
+        elif raw.startswith("/schedule"):
+            _cmd_schedule(raw[9:].strip())
+
         # --- 自律コード修正 ---
         elif raw.startswith("/self-modify"):
             target = raw[12:].strip().lower()
@@ -987,6 +1095,24 @@ def main() -> None:
             with console.status("[cyan]レビュー中...[/cyan]"):
                 result = reviewer_agent.review(code)
             _display(result, title="コードレビュー")
+
+        # --- 未知の /コマンド: タイポ警告 ---
+        elif raw.startswith("/"):
+            _KNOWN_CMDS = [
+                "/quit", "/exit", "/help", "/clear", "/provider", "/status",
+                "/tools", "/daemon", "/schedule", "/self-modify", "/run",
+                "/orch", "/reflect", "/apply", "/generate", "/review",
+            ]
+            import difflib
+            cmd_word = raw.split()[0]
+            close = difflib.get_close_matches(cmd_word, _KNOWN_CMDS, n=1, cutoff=0.6)
+            if close:
+                console.print(
+                    f"[red]未知のコマンド: {cmd_word}[/red]  "
+                    f"もしかして: [bold]{close[0]}[/bold] ?"
+                )
+            else:
+                console.print(f"[red]未知のコマンド: {cmd_word}[/red]  /help でコマンド一覧を確認してください。")
 
         # --- フリーテキスト: チャット or エージェントを自動判断 ---
         else:
