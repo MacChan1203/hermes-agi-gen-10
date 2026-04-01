@@ -153,13 +153,21 @@ _DECOMPOSE_HIERARCHICAL = """\
 分解ルール:
 1. 独立して実行できるタスクは並列 (is_parallel: true)
 2. 前のタスクの結果が必要なタスクは依存関係を設定 (depends_on: [goal_id])
-3. 各タスクにロールを割り当て: researcher/developer/critic/worker
-4. タスクは2〜5個に収める
+3. 各タスクにロールを割り当て:
+   - perceiver:   入力の意図・要件を明確化する
+   - memorist:    ローカルファイル・コードを調査して情報を収集する
+   - ethicist:    実行計画の安全性・倫理的問題を評価する
+   - strategist:  実行計画を立案する
+   - innovator:   創造的・代替的アプローチを提案する
+   - executor:    コード実行・ファイル操作・テスト実行を担当する
+   - critic:      成果物の評価・確認・改善提案を行う
+   - goal_manager: 追加ゴールの特定と優先付けを行う
+4. タスクは2〜4個に収める
 
 必ずJSON配列のみで返してください:
 [
-  {{"goal_id": "a1", "goal": "...", "role": "researcher", "depends_on": [], "is_parallel": true, "priority": 1}},
-  {{"goal_id": "a2", "goal": "...", "role": "developer", "depends_on": ["a1"], "is_parallel": false, "priority": 0}}
+  {{"goal_id": "a1", "goal": "...", "role": "memorist", "depends_on": [], "is_parallel": true, "priority": 1}},
+  {{"goal_id": "a2", "goal": "...", "role": "executor", "depends_on": ["a1"], "is_parallel": false, "priority": 0}}
 ]\
 """
 

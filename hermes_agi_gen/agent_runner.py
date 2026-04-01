@@ -11,10 +11,12 @@ from .memory import initialize_working_memory
 from .meta_cognition import MetaCognition
 from .mistral_client import MistralClient
 from .planner import Planner
+from .predictive_engine import PredictiveEngine
 from .reviewer import Reviewer
 from .self_improvement import SelfImprovementEngine
 from .state_store import SessionDB
 from .state_store import load_latest_run_summary, save_run_summary
+from .value_system import ValueSystem
 from .world_model import WorldModel
 
 
@@ -52,6 +54,9 @@ class HermesAgentV9:
         self.ltm = ltm or LongTermMemory()
         self.meta = MetaCognition(llm=llm)
         self.self_improver = SelfImprovementEngine(llm=llm)
+        # Gen 6: 予測エンジン & 価値体系
+        self.predictor = PredictiveEngine(ltm=self.ltm)
+        self.value_system = ValueSystem()
 
     def run(self, state: AgentState) -> AgentState:
         initialize_working_memory(state)
@@ -119,12 +124,47 @@ class HermesAgentV9:
                 state.last_status = "finished"
                 break
 
+            # --- Gen 6: ValueSystem による倫理評価 ---
+            ethics = self.value_system.assess(step)
+            if ethics.is_blocked:
+                print(
+                    f"  [ValueSystem] ブロック: {ethics.recommendation[:60]}",
+                    flush=True,
+                )
+                state.observations.append(f"[ValueSystem] {ethics.recommendation}")
+                state.failed_steps.append(step)
+                state.working_memory.setdefault("blocked_by_ethics", []).append(step)
+                continue
+
+            # --- Gen 6: PredictiveEngine による事前予測 ---
+            prediction = self.predictor.predict(
+                action=step,
+                goal=state.user_goal,
+            )
+            if prediction.confidence > 0.6 and prediction.success_probability < 0.25:
+                print(
+                    f"  [PredictiveEngine] 低成功予測 ({prediction.success_probability:.0%}): "
+                    f"{prediction.basis[:60]}",
+                    flush=True,
+                )
+                state.observations.append(
+                    f"[予測] {step[:40]} — 成功確率={prediction.success_probability:.0%}"
+                )
+
             state.last_step = step
             print(f"  [{state.iteration_count}/{state.max_iterations}] {step[:80]}", flush=True)
             self.session_db.append_message(state.session_id, "assistant", f"次の一手: {step}")
             result = self.executor.execute(step, state)
 
             review = self.reviewer.evaluate(step, result, state)
+
+            # --- Gen 6: 予測誤差の記録 (学習) ---
+            actual_success = review.get("status") == "success"
+            self.predictor.record_outcome(
+                prediction=prediction,
+                actual_outcome=review.get("summary", "")[:200],
+                actual_success=actual_success,
+            )
 
             state.observations.append(review["summary"])
             state.last_status = review["status"]
@@ -242,7 +282,7 @@ class HermesAgentV9:
 
     def render_progress(self, state: AgentState) -> str:
         lines: List[str] = []
-        lines.append("=== Hermes AGI Gen 進捗 ===")
+        lines.append("=== Hermes AGI Gen 6 進捗 ===")
         lines.append(f"目的: {state.user_goal}")
         lines.append(f"反復回数: {state.iteration_count}/{state.max_iterations}")
         lines.append(f"最後のステップ: {state.last_step}")
@@ -271,6 +311,12 @@ class HermesAgentV9:
         lines.append("[優先改善案]")
         upgrades = state.working_memory.get("priority_upgrades", [])
         lines.extend([f"- {u}" for u in upgrades] or ["- なし"])
+        lines.append("")
+        lines.append("[Gen 6: 予測エンジン]")
+        lines.append(f"- {self.predictor.summary()}")
+        blocked_ethics = state.working_memory.get("blocked_by_ethics", [])
+        if blocked_ethics:
+            lines.append(f"- 倫理ブロック: {len(blocked_ethics)}件")
         lines.append("")
         lines.append("[メタ認知レポート]")
         lines.append(self.meta.reflection_summary(state))
