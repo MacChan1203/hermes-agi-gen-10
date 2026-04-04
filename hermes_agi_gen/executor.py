@@ -12,6 +12,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
+import re
+import shlex
 from pathlib import Path
 from typing import Any, Dict
 
@@ -117,16 +119,31 @@ class Executor:
     # ------------------------------------------------------------------
 
     def _run_shell(self, cmd: str, state: AgentState) -> Dict[str, Any]:
+        # セキュリティ: コマンドチェインを禁止 (VULN-001)
+        if any(char in cmd for char in [";", "&&", "||", "|", "`", "$", "(", ")"]):
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": "セキュリティ制限: コマンドに禁止文字 (; && || | ` $ ( )) が含まれています。単一のコマンドのみ実行可能です。",
+                "returncode": 1,
+                "command": cmd
+            }
+
         try:
+            # シェルインジェクションを防ぐため、シェル経由ではなくリスト形式で実行するのが望ましいが、
+            # 現状の設計ではコマンド文字列を受け取っている。
+            # 最小限の対策として禁止文字チェックを導入。
             proc = subprocess.run(
-                ["bash", "-lc", cmd],
+                shlex.split(cmd),  # shlex.splitでクォートやスペースを正しく処理
                 capture_output=True,
                 text=True,
                 cwd=str(self.repo_root),
                 timeout=_SH_TIMEOUT,
             )
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "stdout": "", "stderr": f"タイムアウト ({_SH_TIMEOUT}秒)", "returncode": -1, "command": cmd}
+        except ValueError as e:
+            return {"ok": False, "stdout": "", "stderr": f"コマンド解析エラー: {e}", "returncode": -1, "command": cmd}
+        except Exception as e:
+            return {"ok": False, "stdout": "", "stderr": f"実行エラー: {e}", "returncode": -1, "command": cmd}
 
         stdout = (proc.stdout or "")[:_MAX_OUTPUT]
         stderr = (proc.stderr or "")[:_MAX_OUTPUT]
@@ -182,6 +199,16 @@ class Executor:
         }
 
     def _run_calc(self, expr: str, state: AgentState) -> Dict[str, Any]:
+        # セキュリティ: eval() エスケープを防止 (VULN-004)
+        if "__" in expr or "." in expr:
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": "セキュリティ制限: 式に禁止文字 (__ または .) が含まれています。",
+                "returncode": 1,
+                "command": f"CALC: {expr}"
+            }
+
         if not Executor._CALC_NS:
             Executor._CALC_NS = self._build_calc_ns()
         try:
@@ -256,12 +283,12 @@ class Executor:
             content_lines = content_lines[:-1]
         content = "\n".join(content_lines)
 
-        # 絶対パスはそのまま使用、相対パスはrepo_root基準で解決
-        raw = Path(filepath).expanduser()
-        if raw.is_absolute():
-            path = raw.resolve()
-        else:
-            path = (self.repo_root / filepath).resolve()
+        # 絶対パスは禁止 (repo_root 基準のみ許可)
+        path = (self.repo_root / filepath).resolve()
+        try:
+            path.relative_to(self.repo_root)
+        except ValueError:
+            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: {filepath} はリポジトリ外です", "returncode": 1, "command": f"WRITE: {filepath}"}
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,6 +303,24 @@ class Executor:
     # ------------------------------------------------------------------
 
     def _run_python(self, code: str, state: AgentState) -> Dict[str, Any]:
+        # セキュリティ: 危険なインポートを禁止 (VULN-002)
+        dangerous_patterns = [
+            r"import\s+os", r"from\s+os",
+            r"import\s+subprocess", r"from\s+subprocess",
+            r"import\s+sys", r"from\s+sys",
+            r"import\s+shutil", r"from\s+shutil",
+            r"eval\(", r"exec\(", r"__import__"
+        ]
+        for pattern in dangerous_patterns:
+            if re.search(pattern, code):
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": f"セキュリティ制限: 禁止されたコードパターンが検出されました ({pattern})",
+                    "returncode": 1,
+                    "command": "PYTHON:"
+                }
+
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", code],

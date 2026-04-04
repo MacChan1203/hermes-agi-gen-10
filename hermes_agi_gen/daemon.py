@@ -30,8 +30,10 @@ from .agent_state import AgentState
 from .hermes_constants import DOMAIN_CONFIG
 from .long_term_memory import LongTermMemory
 from .meta_cognition import GoalQueue, MetaCognition, QueuedGoal
+from .reflection_engine import ReflectionEngine
 from .scheduler import JobScheduler
 from .self_improvement import SelfImprovementEngine
+from .world_model import WorldModel
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,11 @@ class HermesDaemon:
         self.budget = DailyBudgetGuard(self.ltm, max_daily_goals)
         self.curiosity_threshold = curiosity_threshold
         self.scheduler = JobScheduler()
+        self.reflection_engine = ReflectionEngine(
+            llm=llm,
+            reflection_interval=5,  # 5ゴールごとに省察
+        )
+        self.world_model = WorldModel()
         self._stop_event = threading.Event()
         self._recently_completed: list[str] = []  # 重複防止LRU (最大20件)
         self._max_recent = 20
@@ -133,6 +140,10 @@ class HermesDaemon:
         self._register_signals()
         self._write_pid()
         self._load_state()
+
+        # 世界モデルのグラウンディング
+        self.world_model.initialize_from_filesystem(".")
+        logger.info("世界モデルをグラウンディング済み")
 
         logger.info("=== Hermes AGI デーモン起動 ===")
         logger.info("PIDファイル: %s", _PID_FILE)
@@ -186,6 +197,10 @@ class HermesDaemon:
             return
 
         self._process_one_goal(goal)
+
+        # 省察タイミングチェック: N ゴールごとに能動的省察を実行
+        if self.reflection_engine.should_reflect():
+            self._run_reflection_cycle()
 
     def _process_one_goal(self, goal: QueuedGoal) -> None:
         """GoalQueueからポップしたゴールを実行する。"""
@@ -244,6 +259,38 @@ class HermesDaemon:
 
         except Exception as exc:
             logger.error("ゴール処理エラー: %s → %s", goal.goal[:60], exc)
+
+    def _run_reflection_cycle(self) -> None:
+        """能動的自己省察サイクル: LTMを分析して洞察と新ゴールを生成する。"""
+        logger.info("[ReflectionCycle] 自己省察を開始します...")
+        print("\n[デーモン] 自己省察フェーズ...", flush=True)
+
+        try:
+            # 世界モデルが古ければ再グラウンディング
+            if self.world_model.needs_regrounding(max_age_seconds=600):
+                self.world_model.initialize_from_filesystem(".")
+                logger.info("[ReflectionCycle] 世界モデルを再グラウンディング")
+
+            # 省察を実行
+            insights = self.reflection_engine.reflect(self.ltm)
+
+            # 洞察から戦略的ゴールを生成してキューに追加
+            strategic_goals = self.reflection_engine.generate_strategic_goals(insights, self.ltm)
+            for goal in strategic_goals:
+                self.meta.goal_queue.add(goal)
+                logger.info(
+                    "[ReflectionCycle] 戦略的ゴールを追加: [score=%.2f] %s",
+                    goal.composite_score, goal.goal[:60],
+                )
+                print(f"[省察] 新ゴール: {goal.goal[:60]}", flush=True)
+
+            self._save_state()
+            logger.info(
+                "[ReflectionCycle] 完了: %d洞察, %d新ゴール",
+                len(insights), len(strategic_goals),
+            )
+        except Exception as exc:
+            logger.error("[ReflectionCycle] エラー: %s", exc, exc_info=True)
 
     def _idle_explore(self) -> None:
         """GoalQueueが空のとき、好奇心駆動のゴールを生成して追加する。"""

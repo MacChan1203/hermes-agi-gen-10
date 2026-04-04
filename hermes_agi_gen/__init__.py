@@ -1,3 +1,4 @@
+from .agi_core import AGICore, AGIIdentity
 from .agent_message import AgentMessage
 from .agent_runner import HermesAgentV9
 from .agent_state import AgentState
@@ -12,6 +13,7 @@ from .meta_cognition import GoalQueue, MetaCognition, QueuedGoal
 from .mistral_client import MistralClient
 from .orchestrator import AgentOrchestrator
 from .predictive_engine import Prediction, PredictiveEngine
+from .reflection_engine import GrowthMetrics, Insight, ReflectionEngine
 from .self_improvement import SelfImprovementEngine
 from .self_modifier import SelfModifier
 from .state_store import SessionDB
@@ -20,6 +22,12 @@ from .value_system import CoreValue, ValueAssessment, ValueSystem
 from .world_model import CausalEffect, WorldModel
 
 __all__ = [
+    # Gen 7: AGI Core
+    "AGICore",
+    "AGIIdentity",
+    "GrowthMetrics",
+    "Insight",
+    "ReflectionEngine",
     # Core agent
     "AgentMessage",
     "AgentOrchestrator",

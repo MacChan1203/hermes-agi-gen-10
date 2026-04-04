@@ -2,9 +2,14 @@
 
 各アクションが世界に与えた変化を記録し、
 計画前に環境の現在状態を考慮できるようにする。
+
+Gen 7追加: プロアクティブなグラウンディング (initialize_from_filesystem)
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -118,3 +123,58 @@ class WorldModel:
         """最近の因果関係を返す。"""
         recent = self.causal_graph[-limit:]
         return [(e.action, e.effect) for e in reversed(recent)]
+
+    # ------------------------------------------------------------------
+    # Gen 7: プロアクティブなグラウンディング
+    # ------------------------------------------------------------------
+
+    def initialize_from_filesystem(self, path: str = ".") -> None:
+        """実際のファイルシステムをスキャンして世界モデルを初期化する。
+
+        デーモン起動時・セッション開始時に呼び出すことで、
+        エージェントが実際の環境状態を把握した上で行動できるようにする。
+        """
+        try:
+            # Python バージョン情報
+            self.environment["python_version"] = sys.version
+            self.environment["python_executable"] = sys.executable
+
+            # カレントディレクトリ
+            self.environment["cwd"] = os.path.abspath(path)
+
+            # ファイルシステムの簡易スキャン (最大深度2)
+            result = subprocess.run(
+                ["find", path, "-maxdepth", "2", "-not", "-path", "*/.git/*",
+                 "-not", "-path", "*/__pycache__/*"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                self.filesystem["shallow_scan"] = result.stdout[:3000]
+                self.filesystem["scan_time"] = time.time()
+
+            # Git状態
+            git_result = subprocess.run(
+                ["git", "status", "--short"],
+                capture_output=True, text=True, timeout=5, cwd=path,
+            )
+            if git_result.returncode == 0:
+                self.git_state["status"] = git_result.stdout[:500]
+                self.git_state["updated_at"] = time.time()
+
+            self.environment["grounded_at"] = time.time()
+        except Exception:
+            pass  # グラウンディング失敗は致命的ではない
+
+    def needs_regrounding(self, max_age_seconds: float = 300.0) -> bool:
+        """世界モデルが古くなっていて再グラウンディングが必要か。"""
+        grounded_at = self.environment.get("grounded_at")
+        if grounded_at is None:
+            return True
+        return (time.time() - grounded_at) > max_age_seconds
+
+    def grounding_age(self) -> Optional[float]:
+        """グラウンディングからの経過秒数。未グラウンディングの場合はNone。"""
+        grounded_at = self.environment.get("grounded_at")
+        if grounded_at is None:
+            return None
+        return time.time() - grounded_at

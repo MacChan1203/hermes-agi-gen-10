@@ -790,19 +790,25 @@ def _cmd_status(
     examples = improver.get_best_examples(limit=3)
     anti = improver.get_anti_patterns(limit=3)
 
-    wm_summary = "未初期化"
-    goals_count = 0
+    from hermes_agi_gen.agi_core import AGICore
+    agi_core = AGICore(llm=llm)
+    agi_status = agi_core.get_status()
+
+    wm_summary = agi_status.get("world_model_age", "未初期化")
+    goals_count = agi_status.get("goal_queue_size", 0)
     if last_state:
-        if last_state.world_model:
-            wm_summary = last_state.world_model.summary()
-        goals_count = len(last_state.working_memory.get("goal_queue", []))
+        goals_count = max(goals_count, len(last_state.working_memory.get("goal_queue", [])))
 
     status_text = (
+        f"[bold cyan]AGI Identity[/bold cyan]: {agi_status['identity']}\n"
         f"[bold cyan]LLM[/bold cyan]: {_provider_label(llm)}\n"
         f"[bold cyan]カスタムツール[/bold cyan]: {len(tools)}個登録済み\n"
         f"[bold cyan]学習済みパターン[/bold cyan]: 良い例 {len(examples)}件 / 悪い例 {len(anti)}件\n"
         f"[bold cyan]世界モデル[/bold cyan]: {wm_summary}\n"
         f"[bold cyan]自律ゴールキュー[/bold cyan]: {goals_count}件待機中\n"
+        f"[bold cyan]成長指標[/bold cyan]: {agi_status.get('growth_metrics', 'N/A')}\n"
+        f"[bold cyan]予測精度[/bold cyan]: {agi_status.get('prediction_accuracy', 0):.0%}\n"
+        f"[bold cyan]省察エンジン[/bold cyan]: {agi_status.get('reflection', 'N/A')}\n"
     )
 
     if last_state:
@@ -894,6 +900,7 @@ def main() -> None:
     tool_registry = ToolRegistry()
     self_improver = SelfImprovementEngine(llm=llm)
     shared_world_model = WorldModel()  # セッション間で世界モデルを引き継ぐ
+    shared_world_model.initialize_from_filesystem(".")  # 起動時にグラウンディング
 
     history: List[Dict[str, str]] = []
     last_reflection: Dict[str, str] = {}

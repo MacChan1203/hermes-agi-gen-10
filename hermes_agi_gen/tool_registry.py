@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -46,8 +47,21 @@ class DynamicTool:
 
     def compile(self) -> bool:
         """ツールコードをコンパイルして実行可能にする。"""
+        # セキュリティ: 危険なパターンをチェック (VULN-003)
+        dangerous_patterns = [
+            r"import\s+os", r"from\s+os",
+            r"import\s+subprocess", r"from\s+subprocess",
+            r"import\s+sys", r"from\s+sys",
+            r"import\s+shutil", r"from\s+shutil",
+            r"eval\(", r"exec\(", r"__import__",
+            r"__subclasses__", r"__class__"
+        ]
+        for pattern in dangerous_patterns:
+            if re.search(pattern, self.code):
+                return False
+
         try:
-            ns: Dict[str, Any] = {}
+            ns: Dict[str, Any] = {"__builtins__": {}} # 組み込みを制限
             exec(self.code, ns)  # noqa: S102
             # main関数またはツール名の関数を探す
             fn = ns.get("main") or ns.get(self.name) or ns.get("run") or ns.get("execute")
@@ -64,7 +78,7 @@ class DynamicTool:
             return {
                 "ok": False,
                 "stdout": "",
-                "stderr": f"ツール '{self.name}' のコンパイルに失敗しました",
+                "stderr": f"ツール '{self.name}' のコンパイルに失敗しました。セキュリティ制限または構文エラーの可能性があります。",
                 "returncode": 1,
                 "command": f"{self.invocation_prefix}: {args}",
             }
