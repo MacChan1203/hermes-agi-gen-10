@@ -170,10 +170,26 @@ class ReflectionEngine:
     # Public: 省察サイクル
     # ------------------------------------------------------------------
 
-    def should_reflect(self) -> bool:
-        """省察を行うべきタイミングかどうか。"""
+    def should_reflect(self, recent_success_rate: Optional[float] = None) -> bool:
+        """省察を行うべきタイミングかどうか。
+
+        Args:
+            recent_success_rate: 直近の成功率 (0-1)。指定時はインターバルを動的調整する。
+              - 0.3未満 (苦戦中): インターバルを3に短縮 → 頻繁に省察
+              - 0.75超 (好調): インターバルを8に延長 → 余裕を持って省察
+              - それ以外: デフォルトインターバルを使用
+        """
         self._goal_counter += 1
-        return self._goal_counter % self.reflection_interval == 0
+        if recent_success_rate is not None:
+            if recent_success_rate < 0.3:
+                interval = 3
+            elif recent_success_rate > 0.75:
+                interval = 8
+            else:
+                interval = self.reflection_interval
+        else:
+            interval = self.reflection_interval
+        return self._goal_counter % interval == 0
 
     def reflect(self, ltm: "LongTermMemory") -> List[Insight]:
         """LTMを分析して洞察リストを生成する。
@@ -200,6 +216,10 @@ class ReflectionEngine:
                 print(f"[ReflectionEngine] LLM省察エラー: {e}", flush=True)
 
         insights = rule_insights + llm_insights
+
+        # 持続的課題の検出: 前回の省察と内容が重複する洞察を「持続的課題」として昇格
+        insights = self._mark_persistent_insights(insights, ltm)
+
         self._last_reflection_time = time.time()
 
         # LTMに省察記録を保存
@@ -287,6 +307,47 @@ class ReflectionEngine:
                 gaps.append(f"未解決: {step}")
 
         return gaps[:5]
+
+    # ------------------------------------------------------------------
+    # 持続的課題の検出
+    # ------------------------------------------------------------------
+
+    def _mark_persistent_insights(
+        self,
+        insights: List[Insight],
+        ltm: "LongTermMemory",
+    ) -> List[Insight]:
+        """前回の省察と重複する洞察を「持続的課題」として昇格する。
+
+        同じ洞察が2回以上連続して現れた場合、確信度を高めてラベルを付与する。
+        これにより、一度見つかったが対処されていない問題を見落とさないようにする。
+        """
+        recent_reflections = self.get_recent_reflections(ltm, limit=3)
+        # 過去の洞察内容の先頭30文字でシグネチャセットを構築
+        past_signatures: set[str] = set()
+        for record in recent_reflections:
+            for past in record.get("insights", []):
+                sig = past.get("content", "")[:30]
+                if sig:
+                    past_signatures.add(sig)
+
+        marked: List[Insight] = []
+        for insight in insights:
+            sig = insight.content[:30]
+            if sig in past_signatures:
+                # 繰り返し検出: 確信度を上げ、内容に「[持続的課題]」を付与
+                upgraded = Insight(
+                    category=insight.category,
+                    content=f"[持続的課題] {insight.content}",
+                    confidence=min(1.0, insight.confidence + 0.15),
+                    source=insight.source,
+                    actionable=True,  # 繰り返すなら必ず行動可能とみなす
+                    timestamp=insight.timestamp,
+                )
+                marked.append(upgraded)
+            else:
+                marked.append(insight)
+        return marked
 
     # ------------------------------------------------------------------
     # ルールベース省察

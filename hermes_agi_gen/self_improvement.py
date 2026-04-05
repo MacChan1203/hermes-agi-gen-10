@@ -295,7 +295,11 @@ class SelfImprovementEngine:
     def get_best_examples(
         self, domain: str = "general", limit: int = 5
     ) -> List[Dict[str, Any]]:
-        """品質スコア・使用回数でランキングしたfew-shot例を返す。"""
+        """品質スコア・使用回数でランキングしたfew-shot例を返す。
+
+        ドメイン固有の例が少ない場合、他ドメインから品質スコアを0.7倍に割り引いて補完する。
+        これにより異なるドメインで蓄積した知識を横断的に活用できる。
+        """
         rows = self._conn.execute(
             """
             SELECT goal_pattern, good_action, context, outcome, quality_score, use_count
@@ -306,7 +310,25 @@ class SelfImprovementEngine:
             """,
             (domain, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        results = [dict(r) for r in rows]
+
+        # ドメイン固有例が2件未満の場合、他ドメインから補完 (クロスドメイン転用)
+        if len(results) < 2:
+            shortage = limit - len(results)
+            other_rows = self._conn.execute(
+                """
+                SELECT goal_pattern, good_action, context, outcome,
+                       quality_score * 0.7 AS quality_score, use_count
+                FROM few_shot_examples
+                WHERE domain != ? AND domain != 'general'
+                ORDER BY quality_score DESC
+                LIMIT ?
+                """,
+                (domain, shortage),
+            ).fetchall()
+            results.extend([dict(r) for r in other_rows])
+
+        return results[:limit]
 
     def get_anti_patterns(self, domain: str = "general", limit: int = 5) -> List[Dict[str, Any]]:
         """頻度順のanti-patternを返す。"""

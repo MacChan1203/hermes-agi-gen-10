@@ -46,6 +46,7 @@ from .mistral_client import MistralClient
 from .predictive_engine import PredictiveEngine
 from .reflection_engine import GrowthMetrics, Insight, ReflectionEngine
 from .self_improvement import SelfImprovementEngine
+from .self_modifier import SelfModifier
 from .state_store import SessionDB
 from .value_system import ValueSystem
 from .world_model import WorldModel
@@ -165,7 +166,11 @@ class AGICore:
         self.meta = MetaCognition(llm=llm)
         self.reflection_engine = ReflectionEngine(llm=llm, reflection_interval=reflection_interval)
         self.self_improver = SelfImprovementEngine(llm=llm)
+        self.self_modifier = SelfModifier(llm=llm, repo_root=self.repo_root)
         self.session_db = SessionDB()
+
+        # 省察サイクルカウンタ (self_modifier 呼び出し頻度制御用)
+        self._reflection_count: int = 0
 
         # 初期グラウンディング
         self._ground_world_model()
@@ -248,6 +253,9 @@ class AGICore:
             world_model=self.world_model,
         )
 
+        # few-shot例とanti-patternをワーキングメモリに注入
+        self.self_improver.inject_into_state(state)
+
         final_state = agent.run(state)
         result_text = "\n".join(final_state.observations) if final_state.observations else "（観測なし）"
         success = final_state.is_done and len(final_state.failed_steps) == 0
@@ -263,11 +271,22 @@ class AGICore:
         if success:
             self.identity.successful_goals += 1
 
-        # --- 省察フェーズ (定期的) ---
+        # 軌跡から few-shot 例・anti-pattern を学習
+        self.self_improver.analyze_session(final_state)
+        perf_score = 1.0 if success else (0.4 if final_state.completed_steps else 0.1)
+        self.self_improver.record_session_performance(
+            session_id=final_state.session_id,
+            goal=goal,
+            domain=getattr(final_state, "domain", "general"),
+            score=perf_score,
+        )
+
+        # --- 省察フェーズ (定期的・適応的インターバル) ---
+        recent_trend = self.self_improver.get_performance_trend(window=10)
         insights_summary: List[str] = []
         new_goals_count = 0
 
-        if self.reflection_engine.should_reflect():
+        if self.reflection_engine.should_reflect(recent_success_rate=recent_trend):
             insights = self.reflection_engine.reflect(self.ltm)
             insights_summary = [f"[{i.category}] {i.content[:60]}" for i in insights[:3]]
 
@@ -277,9 +296,15 @@ class AGICore:
                 self.meta.goal_queue.add(sg)
                 new_goals_count += 1
 
-            # 自己同一性を更新
+            # 自己同一性を更新 (予測精度も含む)
             metrics = self.reflection_engine.compute_growth_metrics(self.ltm)
+            metrics.prediction_accuracy = self.predictor.get_accuracy()
             self.identity.update_from_metrics(metrics)
+
+            # 3回に1回、洞察に基づくコード自己修正を試みる
+            self._reflection_count += 1
+            if self._reflection_count % 3 == 0:
+                self._attempt_self_modification(insights)
 
         return {
             "result": result_text,
@@ -326,6 +351,64 @@ class AGICore:
     # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
+
+    def _attempt_self_modification(self, insights: List[Insight]) -> None:
+        """洞察に基づいてソースコードの自己修正を試みる。
+
+        actionable な weakness/gap 洞察の中で最も確信度が高いものを選び、
+        関連するソースファイルへのパッチを提案・適用する。
+        """
+        if self.llm is None:
+            return
+
+        # 行動可能な弱点・ギャップ洞察を確信度順に並べる
+        candidates = sorted(
+            [i for i in insights if i.actionable and i.category in ("weakness", "gap")],
+            key=lambda i: i.confidence,
+            reverse=True,
+        )
+        if not candidates:
+            return
+
+        insight = candidates[0]
+
+        # 洞察の内容キーワードから修正対象ファイルを選定
+        keyword_to_target = {
+            "計画": "hermes_agi_gen/planner.py",
+            "plan": "hermes_agi_gen/planner.py",
+            "実行": "hermes_agi_gen/executor.py",
+            "executor": "hermes_agi_gen/executor.py",
+            "記憶": "hermes_agi_gen/long_term_memory.py",
+            "memory": "hermes_agi_gen/long_term_memory.py",
+            "自己改善": "hermes_agi_gen/self_improvement.py",
+            "few-shot": "hermes_agi_gen/self_improvement.py",
+            "world": "hermes_agi_gen/world_model.py",
+            "世界モデル": "hermes_agi_gen/world_model.py",
+            "レビュー": "hermes_agi_gen/reviewer.py",
+            "review": "hermes_agi_gen/reviewer.py",
+        }
+        target = "hermes_agi_gen/self_improvement.py"  # デフォルト
+        content_lower = insight.content.lower()
+        for keyword, filepath in keyword_to_target.items():
+            if keyword in content_lower:
+                target = filepath
+                break
+
+        analysis = (
+            f"洞察カテゴリ: {insight.category}\n"
+            f"洞察内容: {insight.content}\n"
+            f"確信度: {insight.confidence:.2f}\n"
+            f"根拠: {insight.source}\n"
+            f"最近の成功率: {self.identity.success_rate:.0%}"
+        )
+        print(f"[SelfModifier] 自己修正を試みる: {target}", flush=True)
+        patch = self.self_modifier.propose_change(target, analysis)
+        if patch:
+            accepted = self.self_modifier.validate_and_commit(patch)
+            status = "受け入れ ✓" if accepted else "ロールバック ✗"
+            print(f"[SelfModifier] {target} → {status}: {patch.rationale[:60]}", flush=True)
+        else:
+            print("[SelfModifier] 適切なパッチ提案なし", flush=True)
 
     def _ground_world_model(self) -> None:
         """世界モデルをファイルシステムの実態にグラウンドする。"""

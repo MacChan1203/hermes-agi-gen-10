@@ -7,21 +7,27 @@ Gen 6 の統合認知アーキテクチャに、**能動的自己省察ループ
 
 ---
 
-## Gen 7 で新たに追加したもの
+## Gen 7 で新たに追加・強化したもの
 
 ### 5. 自己省察エンジン (`reflection_engine.py`)
 
 AGIの「考える時間」を実装。Nゴールごとに能動的な反省フェーズを実行し、経験から戦略を自律更新する。
 
-- **`ReflectionEngine`**: Nゴールごとに省察サイクルを実行（デフォルト: 5ゴールごと）
+- **`ReflectionEngine`**: 適応的インターバルで省察サイクルを実行
+  - 成功率 < 0.3（苦戦中）→ 3ゴールごとに省察（頻度を高めて課題を早期発見）
+  - 成功率 > 0.75（好調）→ 8ゴールごとに省察（余裕を持った振り返り）
+  - それ以外 → デフォルト（5ゴールごと）
 - **`Insight`**: 省察で抽出された洞察（`strength` / `weakness` / `gap` / `pattern` / `opportunity`）
-- **`GrowthMetrics`**: 成長指標（成功率・知識量・反省回数）
+- **`GrowthMetrics`**: 成長指標（成功率・知識量・反省回数・予測精度）
+- **持続的課題の検出**: 過去3回の省察で同一の洞察が繰り返された場合、`[持続的課題]` として確信度を昇格させ行動を促す
 
 省察フロー:
 ```
 LTM (成功/失敗パターン・学習事実)
   ↓
 ルールベース + LLM深層省察
+  ↓
+持続的課題の検出 (前回省察との重複チェック)
   ↓
 Insight リスト (強み・弱み・知識ギャップ・改善機会)
   ↓
@@ -34,6 +40,8 @@ Insight リスト (強み・弱み・知識ギャップ・改善機会)
 
 - **`AGICore`**: 統一認知サイクルのエントリポイント
 - **`AGIIdentity`**: 永続的自己同一性（能力プロファイル・自己評価・価値観）。経験とともに自己評価が自動更新される
+- **SelfModifier 統合**: 3回の省察ごとに洞察ベースのコード自己修正を自律的に試みる
+- **完全な自己改善ループ**: `inject_into_state` → 実行 → `analyze_session` → 省察 が1サイクルとして繋がった
 
 認知サイクル:
 ```
@@ -45,17 +53,26 @@ Insight リスト (強み・弱み・知識ギャップ・改善機会)
   ↓
 予測 (Predict)    — PredictiveEngine が成功確率を算出
   ↓
+few-shot 注入     — SelfImprovementEngine が過去の成功例をワーキングメモリへ
+  ↓
 実行 (Act)        — HermesAgentV9 が認知ロールで実行
   ↓
-学習 (Learn)      — 予測誤差を記録、LTMに経験を蓄積
+学習 (Learn)      — 予測誤差を記録・LTMに経験蓄積・軌跡からfew-shot例を抽出
   ↓
-省察 (Reflect)    — N回ごとに洞察生成 → 戦略的ゴールを自律生成
+省察 (Reflect)    — 適応的インターバルで洞察生成 → 戦略的ゴールを自律生成
+  ↓                  (3回に1回) 洞察に基づくコード自己修正を試みる
 ```
 
 ### Gen 7 の改善点
 
 | モジュール | 変更内容 |
 |---|---|
+| `agi_core.py` | `analyze_session()` / `inject_into_state()` を統合 — 自己改善ループが実際に機能するよう接続 |
+| `agi_core.py` | `SelfModifier` を統合 — 3省察ごとに洞察ベースの自律コード修正 |
+| `agi_core.py` | `GrowthMetrics.prediction_accuracy` を `PredictiveEngine` と接続 — 常に0だった値が正確に反映される |
+| `reflection_engine.py` | 適応的インターバル — 成功率に応じて省察頻度を動的調整 |
+| `reflection_engine.py` | 持続的課題の検出 — 繰り返し現れる洞察を昇格させ行動を促す |
+| `self_improvement.py` | クロスドメイン few-shot 転用 — ドメイン固有例不足時に他ドメインの知識を0.7倍割引で補完 |
 | `executor.py` | `cmd.split()` → `shlex.split()` に修正（クォート・複雑引数を正しく処理） |
 | `world_model.py` | `initialize_from_filesystem()` 追加 — ファイルシステム・Git状態に接地（グラウンディング） |
 | `daemon.py` | `ReflectionEngine` を統合 — 5ゴールごとに省察し、戦略的ゴールを自律生成 |
@@ -107,12 +124,13 @@ Clark & Friston の**予測符号化理論**に基づく事前予測と学習。
 入力 (ユーザーの目標)
   │
   ▼
-[AGICore / AgentOrchestrator]
+[AGICore]
   │
-  ├─ [WorldModel.initialize_from_filesystem]  環境を実態にグラウンド (Gen 7)
+  ├─ [WorldModel.initialize_from_filesystem]  環境を実態にグラウンド
   ├─ [ValueSystem]  倫理評価・危険な行動をブロック
   ├─ [GlobalWorkspace]  注意競争・認知リソース配分
   ├─ [PredictiveEngine]  成功確率を事前予測
+  ├─ [SelfImprovementEngine.inject_into_state]  few-shot例を注入
   │
   ▼
 [認知パイプライン]
@@ -123,11 +141,17 @@ Clark & Friston の**予測符号化理論**に基づく事前予測と学習。
   └─ LongTermMemory が成功/失敗を記録・次回に活用
   │
   ▼
-[ReflectionEngine]  (N ゴールごと) (Gen 7)
-  LTM分析 → Insight生成 → 戦略的ゴール → GoalQueue
+[学習フェーズ]
+  ├─ PredictiveEngine  予測誤差を記録
+  ├─ SelfImprovementEngine.analyze_session  few-shot例・anti-patternを抽出
+  └─ record_session_performance  ドメイン別パフォーマンストレンドを更新
   │
-  ├─ AGIIdentity.self_assessment を更新 (Gen 7)
-  └─ GrowthMetrics を計算 (Gen 7)
+  ▼
+[ReflectionEngine]  (適応的インターバル: 成功率に応じて3〜8ゴールごと)
+  LTM分析 → 持続的課題検出 → Insight生成 → 戦略的ゴール → GoalQueue
+  │
+  ├─ AGIIdentity.self_assessment を更新 (prediction_accuracy 含む)
+  └─ (3省察ごと) SelfModifier で洞察ベースのコード自己修正
   │
   ▼
 出力 (統合された最終回答)
@@ -155,8 +179,10 @@ python run_agent.py --query "このプロジェクトの構造を調べてくだ
 
 | ファイル | 役割 |
 |---|---|
-| `hermes_agi_gen/agi_core.py` | **[Gen 7]** 統合AGI認知コア・AGIIdentity |
-| `hermes_agi_gen/reflection_engine.py` | **[Gen 7]** 能動的自己省察エンジン |
+| `hermes_agi_gen/agi_core.py` | **[Gen 7]** 統合AGI認知コア・AGIIdentity・SelfModifier統合 |
+| `hermes_agi_gen/reflection_engine.py` | **[Gen 7]** 能動的自己省察エンジン（適応的インターバル・持続的課題検出） |
+| `hermes_agi_gen/self_improvement.py` | **[Gen 7]** few-shot学習・anti-pattern記録・クロスドメイン転用 |
+| `hermes_agi_gen/self_modifier.py` | **[Gen 7]** ソースコード自己修正エンジン（AGICoreに統合済み） |
 | `hermes_agi_gen/consciousness.py` | **[Gen 6]** グローバル・ワークスペース (GWT) |
 | `hermes_agi_gen/value_system.py` | **[Gen 6]** 価値整合・倫理的意思決定 |
 | `hermes_agi_gen/cognitive_roles.py` | **[Gen 6]** 8つの専門認知ロール定義 |
@@ -166,8 +192,6 @@ python run_agent.py --query "このプロジェクトの構造を調べてくだ
 | `hermes_agi_gen/meta_cognition.py` | 行き詰まり検出・GoalQueue・自律ゴール生成 |
 | `hermes_agi_gen/long_term_memory.py` | SQLite + セマンティック検索 (LTM) |
 | `hermes_agi_gen/world_model.py` | 環境状態・因果グラフ追跡・FS グラウンディング |
-| `hermes_agi_gen/self_improvement.py` | few-shot 学習・anti-pattern 記録 |
-| `hermes_agi_gen/self_modifier.py` | ソースコード自己修正エンジン |
 | `hermes_agi_gen/daemon.py` | 24/7 自律デーモン (省察ループ付き) |
 | `hermes_agi_gen/planner.py` | Chain-of-Thought プランナー |
 | `hermes_agi_gen/executor.py` | ツール実行ディスパッチャー |
@@ -210,7 +234,7 @@ from hermes_agi_gen import ReflectionEngine, LongTermMemory
 ltm = LongTermMemory()
 engine = ReflectionEngine(llm=llm, reflection_interval=5)
 
-# 省察の実行
+# 省察の実行 (持続的課題の自動検出付き)
 insights = engine.reflect(ltm)
 for insight in insights:
     print(f"[{insight.category}] {insight.content} (確信={insight.confidence:.0%})")
@@ -218,9 +242,34 @@ for insight in insights:
 # 洞察から戦略的ゴールを生成
 goals = engine.generate_strategic_goals(insights, ltm)
 
-# 成長指標の取得
+# 成長指標の取得 (prediction_accuracy 含む)
 metrics = engine.compute_growth_metrics(ltm)
 print(metrics.summary())
+
+# 適応的インターバルによる省察トリガー
+if engine.should_reflect(recent_success_rate=0.4):
+    insights = engine.reflect(ltm)
+```
+
+### `SelfImprovementEngine` (Gen 7)
+
+```python
+from hermes_agi_gen.self_improvement import SelfImprovementEngine
+
+improver = SelfImprovementEngine(llm=llm)
+
+# 実行前: few-shot例とanti-patternをワーキングメモリへ注入
+improver.inject_into_state(state)
+
+# 実行後: 軌跡から学習
+improver.analyze_session(state)
+improver.record_session_performance(session_id, goal, domain, score=1.0)
+
+# クロスドメイン転用: 該当ドメインの例が少ない場合は他ドメインから補完
+examples = improver.get_best_examples(domain="analysis")
+
+# パフォーマンストレンドを取得 (適応的インターバルに活用)
+trend = improver.get_performance_trend(window=10)
 ```
 
 ### `AgentOrchestrator` (Gen 6)
@@ -326,6 +375,9 @@ echo "GROQ_API_KEY=gsk_..." > .env
 | # | ファイル | 問題 | 修正 |
 |---|---|---|---|
 | 7 | `executor.py` | `cmd.split()` がスペースを含む引数・クォートを正しく処理しない | `shlex.split(cmd)` に変更 |
+| 8 | `agi_core.py` | `analyze_session()` が呼ばれず few-shot 学習が機能していなかった | `run_goal()` に `inject_into_state` → `analyze_session` → `record_session_performance` を追加 |
+| 9 | `agi_core.py` | `SelfModifier` が孤立しており自律コード修正が機能しなかった | `AGICore` に統合し、3省察ごとに自動呼び出し |
+| 10 | `agi_core.py` | `GrowthMetrics.prediction_accuracy` が常に 0.0 だった | `PredictiveEngine.get_accuracy()` と接続 |
 
 ### Gen 6
 
