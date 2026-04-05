@@ -23,7 +23,7 @@ from .world_model import WorldModel
 from .tool_registry import ToolRegistry
 
 _MAX_OUTPUT = 8000   # stdout/stderr の最大文字数
-_PY_TIMEOUT = 30     # Python 実行タイムアウト (秒)
+_PY_TIMEOUT = 90     # Python 実行タイムアウト (秒)
 _SH_TIMEOUT = 30     # シェル実行タイムアウト (秒)
 
 
@@ -73,6 +73,10 @@ class Executor:
         if step.upper().startswith("CALC:"):
             expr = step[5:].strip()
             return self._run_calc(expr, state)
+
+        if step.upper().startswith("FETCH:"):
+            url = step[6:].strip().splitlines()[0].strip()
+            return self._run_fetch(url, state)
 
         if step.upper().startswith("SEARCH:"):
             query = step[7:].strip()
@@ -245,6 +249,30 @@ class Executor:
         }
 
     # ------------------------------------------------------------------
+    # FETCH: URL コンテンツ取得
+    # ------------------------------------------------------------------
+
+    def _run_fetch(self, url: str, state: AgentState) -> Dict[str, Any]:
+        from .web_search import fetch_url
+
+        result = fetch_url(url)
+        if result.get("type") == "error":
+            err = result.get("error", "不明なエラー")
+            return {"ok": False, "stdout": "", "stderr": f"FETCH エラー ({url}): {err}", "returncode": 1, "command": f"FETCH: {url}"}
+
+        content = result.get("content", "")
+        remember_successful_command(state, f"FETCH: {url[:60]}")
+        state.working_memory["last_fetch_url"] = url
+        state.working_memory["last_fetch_content"] = content[:500]
+        return {
+            "ok": True,
+            "stdout": content,
+            "stderr": "",
+            "returncode": 0,
+            "command": f"FETCH: {url}",
+        }
+
+    # ------------------------------------------------------------------
     # READ: ファイル読み込み
     # ------------------------------------------------------------------
 
@@ -283,12 +311,26 @@ class Executor:
             content_lines = content_lines[:-1]
         content = "\n".join(content_lines)
 
-        # 絶対パスは禁止 (repo_root 基準のみ許可)
-        path = (self.repo_root / filepath).resolve()
+        # パス解決: ~/... は絶対パスに展開、それ以外は repo_root 基準
+        home = Path.home()
+        expanded = filepath.replace("~", str(home), 1) if filepath.startswith("~") else filepath
+        path = Path(expanded).resolve() if Path(expanded).is_absolute() else (self.repo_root / expanded).resolve()
+
+        # セキュリティ: repo_root 内 または ホームディレクトリ内のみ許可。システムパスは禁止
+        allowed = False
         try:
             path.relative_to(self.repo_root)
+            allowed = True
         except ValueError:
-            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: {filepath} はリポジトリ外です", "returncode": 1, "command": f"WRITE: {filepath}"}
+            pass
+        if not allowed:
+            try:
+                path.relative_to(home)
+                allowed = True
+            except ValueError:
+                pass
+        if not allowed:
+            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: {filepath} はホームディレクトリ外です", "returncode": 1, "command": f"WRITE: {filepath}"}
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -448,6 +490,8 @@ class Executor:
                 f"  トリガー: {trigger} | 次回実行: {next_str}"
             )
             state.working_memory.setdefault("scheduled_jobs", []).append(job.id)
+            state.working_memory["completion_summary"] = msg
+            state.is_done = True  # 登録完了 = タスク完了。別途実行は不要
             return {"ok": True, "stdout": msg, "stderr": "", "returncode": 0,
                     "command": f"SCHEDULE_AT: {trigger} {goal_text}"}
         except Exception as exc:

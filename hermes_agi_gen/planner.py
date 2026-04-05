@@ -21,8 +21,14 @@ if TYPE_CHECKING:
 _DOMAIN_HINTS: dict[str, str] = {
     "general": "質問・相談には ANSWER: で直接回答する。ファイル操作が必要なら CMD:/READ:、外部情報が必要なら SEARCH: を使う。",
     "coding": "コードを読んで理解してから変更を提案する。テストを確認する。外部ライブラリ情報は SEARCH: で調べる。",
-    "research": "SEARCH: でウェブ情報を収集し、複数ソースを比較して整理する。根拠のある結論を出す。",
-    "writing": "既存の文章・構造を確認してから追記・編集する。参考資料が必要なら SEARCH: を活用する。",
+    "research": (
+        "URLが含まれる場合は SEARCH: でなく FETCH: でそのURLに直接アクセスする。"
+        "「URLからデータ取得 → 処理 → ファイル保存」のような複数ステップのタスクは、"
+        "requests/json/os/datetime などを使った単一の PYTHON: スクリプトにまとめて一括実行する。"
+        "スクリプト内でのLLM呼び出しは不要 — テキスト処理・フィルタ・保存はPythonで完結させる。"
+        "ファイル保存先が ~/Desktop/... の場合は os.path.expanduser('~') で絶対パスに展開する。"
+    ),
+    "writing": "既存の文章・構造を確認してから追記・編集する。参考資料が必要なら SEARCH: を活用する。URLから直接コンテンツ取得するなら FETCH: を使う。時刻指定タスクは SCHEDULE_AT: で登録する。",
     "data": "データファイルの形式・サイズを確認してから処理する。簡単な集計は CALC: で行う。手法に迷ったら SEARCH: で調べる。",
     "ops": "現在の状態を確認してから操作する。破壊的操作は避ける。エラー解決策は SEARCH: で調べる。",
 }
@@ -68,17 +74,19 @@ _COT_TEMPLATE = """\
 
 <thinking>
 1. 現状把握: [今何が分かっているか]
-2. 目標分析: [何を達成する必要があるか]
-3. 選択肢検討: [取りうるアクションは何か]
-4. リスク評価: [各選択肢の危険性・副作用は何か]
-5. 最良の選択: [なぜこのアクションが最善か]
+2. 時間指定チェック: [目標に「〜時になったら」「〜日に」など未来時刻の指定があるか? → あれば即 SCHEDULE_AT: を使う]
+3. 目標分析: [何を達成する必要があるか]
+4. 選択肢検討: [取りうるアクションは何か]
+5. リスク評価: [各選択肢の危険性・副作用は何か]
+6. 最良の選択: [なぜこのアクションが最善か]
 </thinking>
 <action>
-[ツール形式1行のみ: ANSWER: / SEARCH: / CALC: / CMD: / READ: / WRITE: / PYTHON: / PLAN: / DONE:]
+[ツール形式1行のみ: ANSWER: / SEARCH: / FETCH: / CALC: / CMD: / READ: / WRITE: / PYTHON: / PLAN: / SCHEDULE_AT: / DONE:]
 </action>
 
 - DONE: は目標が完全に達成されたときだけ使う
-- 複雑なタスク: PLAN: step1 || step2 || step3 で全ステップを一括計画する\
+- 複雑なタスク: PLAN: step1 || step2 || step3 で全ステップを一括計画する
+- 「〜時になったら」「〜日に」など未来の時刻が指定されている場合は **SCHEDULE_AT:** で即座にスケジュール登録し、次のステップで DONE: を返す。実行は試みない\
 """
 
 # 会話的なクエリを検出するキーワード
@@ -153,7 +161,10 @@ def _extract_action_from_cot(response: str) -> Optional[str]:
         line = line.strip()
         if not line or line.startswith('#') or line.startswith('//'):
             continue
-        prefixes = ("ANSWER:", "SEARCH:", "CALC:", "CMD:", "READ:", "WRITE:", "PYTHON:", "PLAN:", "DONE:")
+        prefixes = (
+            "ANSWER:", "SEARCH:", "FETCH:", "CALC:", "CMD:", "READ:",
+            "WRITE:", "PYTHON:", "PLAN:", "SCHEDULE_AT:", "SCHEDULE:", "DONE:",
+        )
         if any(line.upper().startswith(p) for p in prefixes):
             return line
 

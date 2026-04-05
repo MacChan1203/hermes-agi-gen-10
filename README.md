@@ -196,9 +196,10 @@ python run_agent.py --query "このプロジェクトの構造を調べてくだ
 | `hermes_agi_gen/planner.py` | Chain-of-Thought プランナー |
 | `hermes_agi_gen/executor.py` | ツール実行ディスパッチャー |
 | `hermes_agi_gen/reviewer.py` | 結果評価・リカバリ提案 |
+| `hermes_agi_gen/web_search.py` | DuckDuckGo 検索 (ddgs ライブラリ + HTML スクレイピング fallback) |
 | `hermes_agi_gen/mistral_client.py` | LLM クライアント (Claude / Groq / Mistral / Ollama) |
 | `hermes_agi_gen/state_store.py` | SQLite セッション永続化 |
-| `cli.py` | インタラクティブ TUI |
+| `cli.py` | インタラクティブ TUI・自然言語スケジューラ・URL取得＆翻訳パイプライン |
 
 ---
 
@@ -342,11 +343,60 @@ python cli.py
 | `/goals` | 自律ゴールキューを表示 |
 | `/world` | 世界モデルの状態を表示 |
 | `/improve` | 自己改善レポートを表示 |
+| `/schedule` | スケジュール済みジョブ一覧を表示 |
 | `/daemon start` | 24/7 自律デーモンをバックグラウンドで起動 |
+| `/daemon stop` | デーモンを停止 (インラインスケジューラ使用時は先に停止) |
 | `/daemon status` | デーモンの稼働状態を確認 |
 | `/daemon log` | デーモンのログを表示 |
 | `/help` | コマンド一覧 |
 | `/quit` | 終了 |
+
+### 自然言語スケジュール
+
+フリーテキスト入力で時刻付きタスクを自動スケジュール登録できます。
+
+```
+# 一回限り (絶対時刻)
+2026年4月7日午前9時になったら、天気予報を取得して要約してください
+
+# 毎日
+毎日午前8時になったら、HNのAIニュースを翻訳して~/Desktop/AI_News/に保存して
+
+# インターバル
+30分ごとにシステム状態を確認して
+```
+
+`〜になったら` より前の時刻表現を自動検出し `SCHEDULE_AT:` トリガーに変換します。  
+登録後はターミナルを開いたままにしておくことで **インラインスケジューラ** (20秒ごとにポーリング) が自動実行します。
+
+> **注意**: `/daemon start` で起動した外部デーモンとインラインスケジューラが同時に動くと  
+> ジョブが二重消費される場合があります。スケジュール機能を使う際は先に `/daemon stop` してください。
+
+### URL + 翻訳 + ファイル保存パイプライン
+
+URL・保存先・翻訳の3要素が揃ったゴールは、LLMを経由せず動作確認済みの Python スクリプトを直接実行します。
+
+```
+https://news.ycombinator.com/ からAI関連のニュースを一つ選んで
+日本語に翻訳して800字程度にまとめて、~/Desktop/AI_News/にtxtファイルにして入れてください
+```
+
+処理フロー:
+1. HN ページからAIキーワードで記事を選択
+2. 記事本文を取得 (`<script>`/`<style>` 除去後)
+3. Groq API で日本語タイトル＋要約を生成 (文字数はゴールから自動抽出)
+4. `~/Desktop/AI_News/AI_News_MM-DD_HHMM.txt` に保存
+
+出力フォーマット:
+```
+【AI News】{日本語タイトル}
+原題: {English title}
+出典: {URL}
+
+{日本語要約 (指定文字数)}
+
+(Hacker Newsより取得 YYYY-MM-DD HH:MM)
+```
 
 ---
 
@@ -369,6 +419,25 @@ echo "GROQ_API_KEY=gsk_..." > .env
 ---
 
 ## 不具合修正ログ
+
+### CLI・スケジューラ・検索改善 (2026-04)
+
+| # | ファイル | 問題 | 修正 |
+|---|---|---|---|
+| 11 | `cli.py` | 入力時にターミナルがクラッシュする | 各コマンドハンドラに `try/except` を追加、トップレベルにも保護を追加 |
+| 12 | `cli.py` | `/tools` コマンドで `args` 変数が argparse Namespace を上書きしてクラッシュ | 変数名を `tools_args` に変更 |
+| 13 | `cli.py` | 「〜時になったら〜してください」を即時実行しようとする | 時刻表現を検出して `SCHEDULE_AT:` に自動変換するプリプロセッサを追加 |
+| 14 | `planner.py` | `SCHEDULE_AT:` アクションが `_extract_action_from_cot()` で無視される | `SCHEDULE_AT:` / `FETCH:` を認識プレフィックスに追加 |
+| 15 | `web_search.py` | DuckDuckGo HTML スクレイピングが CAPTCHA でブロックされる | `ddgs` ライブラリを優先使用し、失敗時のみ HTML スクレイピングにフォールバック |
+| 16 | `cli.py` | スケジュール実行時にファイルが作成されない / 内容が空 | LLM生成スクリプトをバイパスし、動作確認済みの Python スクリプトを `state.current_plan` に直接注入 |
+| 17 | `cli.py` | 保存先パスに日本語が混入する (`~/Desktop/AI_News/にtxt...`) | URL・パス抽出の正規表現を ASCII 文字限定 (`[a-zA-Z0-9/_.-]+`) に変更 |
+| 18 | `executor.py` | Python スクリプト実行が 30 秒でタイムアウト (HTTP 3リクエスト合計で超過) | `_PY_TIMEOUT` を 30 → 90 秒に延長 |
+| 19 | `agent_runner.py` | PYTHON ステップのエラーが無音で飲み込まれる | `stderr` / `stdout` を実行直後にターミナルへ表示 |
+| 20 | `cli.py` | 生成スクリプト内の `f'{\"key\"...}'` が `SyntaxError` になる | プロンプト構築を f-string から文字列連結に変更してクォート衝突を回避 |
+| 21 | `cli.py` | 要約文字数指示が「100字」固定でゴールの指定を無視する | ゴールから `(\d+)[字文]` を抽出し `max_tokens`・本文取得量・プロンプト指示に動的反映 |
+| 22 | `cli.py` | LLM が文字数指示に従わず短い要約を返す | プロンプトを「短い要約は不可。詳細・背景・技術的内容をすべて含めること」と強制化 |
+| 23 | `cli.py` | 記事本文に JavaScript が大量混入して翻訳品質が低下 | `<script>`/`<style>` タグをタグ除去前に削除するステップを追加 |
+| 24 | `cli.py` | スケジュール完了後にプロンプトが戻らない | バックグラウンドスレッドの `finally` ブロックで `hermes: ` プロンプトを再描画 |
 
 ### Gen 7
 

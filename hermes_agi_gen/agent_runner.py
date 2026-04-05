@@ -155,6 +155,10 @@ class HermesAgentV9:
             print(f"  [{state.iteration_count}/{state.max_iterations}] {step[:80]}", flush=True)
             self.session_db.append_message(state.session_id, "assistant", f"次の一手: {step}")
             result = self.executor.execute(step, state)
+            if not result.get("ok") and result.get("stderr"):
+                print(f"  [エラー] {result['stderr'][:200]}", flush=True)
+            elif result.get("stdout") and step.upper().startswith("PYTHON:"):
+                print(f"  [出力] {result['stdout'][:200]}", flush=True)
 
             review = self.reviewer.evaluate(step, result, state)
 

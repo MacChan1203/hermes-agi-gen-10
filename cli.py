@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,7 +39,7 @@ from hermes_agi_gen.code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from hermes_agi_gen.daemon import HermesDaemon
 from hermes_agi_gen.hermes_constants import DOMAIN_CONFIG
 from hermes_agi_gen.mistral_client import MistralClient
-from hermes_agi_gen.scheduler import JobScheduler, parse_trigger_spec
+from hermes_agi_gen.scheduler import JobScheduler, ScheduledJob, parse_trigger_spec
 from hermes_agi_gen.self_improvement import SelfImprovementEngine
 from hermes_agi_gen.self_modifier import SelfModifier, _SAFE_MODIFY_TARGETS
 from hermes_agi_gen.state_store import SessionDB
@@ -224,6 +225,60 @@ def _is_likely_chat(message: str) -> bool:
     return any(kw in m for kw in _CHAT_KEYWORDS)
 
 
+# 時間指定パターン (「〜時になったら」「〜日の〜時に」など)
+_TIME_SPEC_PATTERNS = [
+    r'\d{4}年\d{1,2}月\d{1,2}日',   # 2026年4月6日
+    r'午前\d{1,2}時\d{0,2}分?',     # 午前3時32分
+    r'午後\d{1,2}時\d{0,2}分?',
+    r'\d{1,2}:\d{2}に',              # 09:00に
+    r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}',  # ISO8601
+    r'になったら',
+    r'になれば',
+    r'の時に',
+    r'every:\d',
+    r'daily:',
+    r'weekly:',
+]
+
+_TIME_SPEC_RE = re.compile("|".join(_TIME_SPEC_PATTERNS))
+
+def _extract_schedule_trigger(message: str) -> Optional[str]:
+    """時間指定リクエストからISO8601トリガー文字列を抽出する。なければNone。"""
+    import re
+
+    # ISO8601 直接指定
+    m = re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}', message)
+    if m:
+        return f"once:{m.group()}"
+
+    # 「YYYY年MM月DD日 午前/午後HH時MM分」形式
+    date_m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', message)
+    time_m = re.search(r'午前(\d{1,2})時(\d{1,2})?分?', message)
+    if not time_m:
+        time_m = re.search(r'午後(\d{1,2})時(\d{1,2})?分?', message)
+        if time_m:
+            hour = int(time_m.group(1))
+            if hour != 12:
+                hour += 12
+            minute = int(time_m.group(2) or 0)
+        else:
+            hour, minute = None, None
+    else:
+        hour = int(time_m.group(1))
+        minute = int(time_m.group(2) or 0)
+
+    if date_m and hour is not None:
+        y, mo, d = date_m.group(1), date_m.group(2).zfill(2), date_m.group(3).zfill(2)
+        return f"once:{y}-{mo}-{d}T{str(hour).zfill(2)}:{str(minute).zfill(2)}"
+
+    # 「HH:MM に」形式
+    hhmm_m = re.search(r'(\d{1,2}):(\d{2})に', message)
+    if hhmm_m:
+        return f"daily:{hhmm_m.group(1).zfill(2)}:{hhmm_m.group(2)}"
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # ヘルパー関数
 # ---------------------------------------------------------------------------
@@ -297,6 +352,109 @@ def _run_agent(
     world_model: Optional[WorldModel] = None,
 ) -> Tuple[str, AgentState]:
     """HermesAgentV9 を起動してタスクを実行し、(サマリー, 最終state) を返す。"""
+    # ゴール内の URL を抽出 (ASCII文字のみ = 日本語で誤って伸びない)
+    _urls = re.findall(r'https?://[a-zA-Z0-9./_?=&#%+~-]+', goal)
+    _wants_save = any(w in goal for w in ["保存", "ファイル", "txt", "Desktop", "save", "write"])
+    _wants_translate = any(w in goal for w in ["翻訳", "要約", "日本語", "translate", "summarize"])
+
+    # URL + 保存 + 要約タスク: LLMに生成させず動作確認済みスクリプトを直接プランに注入
+    _prebuilt_plan: List[str] = []
+    if _urls and _wants_save and _wants_translate:
+        _target_url = _urls[0]
+        _out_dir_kw = ""
+        _m = re.search(r'~/[a-zA-Z0-9/_.-]+', goal)  # ASCII文字のみ
+        if _m:
+            _out_dir_kw = _m.group(0).rstrip("/")
+        if not _out_dir_kw:
+            _out_dir_kw = "~/Desktop/AI_News"
+        _groq_model = llm.model if "groq" in getattr(llm, "base_url", "") else "llama-3.1-8b-instant"
+        # ゴールから長さ・詳細指示を抽出してスクリプトに注入
+        # 数値(字/文字)があればそれを使い、なければユーザーの表現をそのまま使う
+        _num_m = re.search(r'(\d+)\s*[字文]', goal)
+        _target_chars = int(_num_m.group(1)) if _num_m else None
+        # 翻訳/要約の指示部分を抽出 (例: "翻訳して1500字程度にまとめて" → "1500字程度にまとめること")
+        _inst_m = re.search(r'(?:翻訳して|日本語[にで])(.+?)(?:[、,。]|~/|ファイル|txt)', goal)
+        if _inst_m:
+            _length_instruction = re.sub(r'(?:してください|して|ください)$', '', _inst_m.group(1).strip())
+        elif _target_chars:
+            _length_instruction = f"{_target_chars}字程度にまとめること"
+        else:
+            _length_instruction = "詳しくまとめること"
+        _max_tokens = max(800, _target_chars * 3) if _target_chars else 2000
+        _body_limit = max(4000, _target_chars * 10) if _target_chars else 8000
+        _script = f"""\
+import requests, os, re, datetime, json
+# 1. HNからAI記事を取得
+_hn = requests.get({_target_url!r}, timeout=15, headers={{"User-Agent": "Mozilla/5.0"}})
+_items = re.findall(r'class=[\\x22\\x27]titleline[\\x22\\x27]><a href=[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]>([^<]+)', _hn.text)
+_kw = ["ai", "llm", "gpt", "machine learning", "neural", "model", "agent", "openai", "anthropic", "deepmind"]
+_ai = [(u, t) for u, t in _items if any(k in t.lower() for k in _kw)]
+_url, _title = _ai[0] if _ai else (_items[0] if _items else ({_target_url!r}, "AI News"))
+# 2. 記事本文を取得
+_body = ""
+try:
+    _art = requests.get(_url, timeout=20, headers={{"User-Agent": "Mozilla/5.0"}})
+    _html = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", _art.text, flags=re.DOTALL|re.IGNORECASE)
+    _body = re.sub(r"<[^>]+>", " ", _html)
+    _body = re.sub(r"\\s+", " ", _body).strip()[:{_body_limit}]
+except Exception as _e:
+    _body = f"(記事取得失敗: {{_e}})"
+# 3. Groq APIで翻訳・要約
+_groq_key = os.environ.get("GROQ_API_KEY", "")
+_title_ja, _summary_ja = _title, ""
+if _groq_key:
+    _json_fmt = '{{"title_ja": "日本語タイトル", "summary_ja": "ここに日本語の本文を書く"}}'
+    _prompt = (
+        "以下の英語記事を日本語に翻訳してください。\\n"
+        "【重要な制約】summary_jaには{_length_instruction}の内容を書くこと。短い要約は不可。記事の詳細・背景・技術的内容・著者の主張をすべて含めること。\\n\\n"
+        "タイトル: "
+        + _title
+        + "\\n\\n本文:\\n"
+        + _body
+        + "\\n\\n以下のJSON形式のみで返してください(他のテキスト不要):\\n"
+        + _json_fmt
+    )
+    try:
+        _gr = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={{"Authorization": f"Bearer {{_groq_key}}", "Content-Type": "application/json"}},
+            json={{"model": {_groq_model!r}, "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": {_max_tokens}, "temperature": 0.3}},
+            timeout=60,
+        )
+        _gr.raise_for_status()
+        _raw = _gr.json()["choices"][0]["message"]["content"]
+        _m = re.search(r"\\{{[^{{}}]+\\}}", _raw, re.DOTALL)
+        if _m:
+            _d = json.loads(_m.group())
+            _title_ja = _d.get("title_ja", _title)
+            _summary_ja = _d.get("summary_ja", "")
+    except Exception as _e:
+        _summary_ja = f"(翻訳エラー: {{_e}})"
+# 4. ファイル保存
+_content = (
+    f"【AI News】{{_title_ja}}\\n"
+    f"原題: {{_title}}\\n"
+    f"出典: {{_url}}\\n\\n"
+    f"{{_summary_ja}}\\n\\n"
+    f"(Hacker Newsより取得 {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}})"
+)
+_out_dir = os.path.expanduser({_out_dir_kw!r})
+os.makedirs(_out_dir, exist_ok=True)
+_fname = os.path.join(_out_dir, f"AI_News_{{datetime.datetime.now().strftime('%m-%d_%H%M')}}.txt")
+with open(_fname, "w", encoding="utf-8") as _f:
+    _f.write(_content)
+print(f"保存完了: {{_fname}}")
+print(_content)
+"""
+        _prebuilt_plan = [f"PYTHON:\n{_script}", "DONE: ファイルを保存しました"]
+    elif _urls:
+        context_hint = (
+            "【重要】ゴールに以下のURLが含まれています。"
+            "SEARCH: ではなく FETCH: でこのURLに直接アクセスしてください: "
+            + ", ".join(_urls)
+        )
+        context = (context_hint + "\n" + context) if context else context_hint
+
     console.print(Rule(
         f"[bold yellow]エージェントモード[/bold yellow]  domain=[cyan]{domain}[/cyan]",
         style="yellow",
@@ -319,6 +477,9 @@ def _run_agent(
         max_iterations=max_iterations,
         world_model=world_model,  # 世界モデルを引き継ぐ
     )
+    # 動作確認済みプランがあれば直接注入 (LLM計画をスキップ)
+    if _prebuilt_plan:
+        state.current_plan = _prebuilt_plan
 
     final_state = agent.run(state)
 
@@ -825,6 +986,67 @@ def _cmd_status(
 
 
 # ---------------------------------------------------------------------------
+# インプロセス スケジューラ (デーモン不要でCLI内から定時実行)
+# ---------------------------------------------------------------------------
+
+def _start_inline_scheduler(llm: MistralClient, con: Console) -> "threading.Event":
+    """バックグラウンドスレッドでスケジューラを監視し、期限ジョブをその場で実行する。
+
+    戻り値の Event を set() すると停止する。
+    """
+    import threading
+    from hermes_agi_gen.meta_cognition import GoalQueue
+
+    stop_event = threading.Event()
+
+    def _loop() -> None:
+        scheduler = JobScheduler()
+        goal_queue = GoalQueue()  # ダミー — tick() の戻り値ジョブだけ使う
+        while not stop_event.wait(timeout=20):  # 20秒ごとにチェック
+            try:
+                triggered = scheduler.tick(goal_queue)
+                for job in triggered:
+                    con.print(f"\n[bold cyan][スケジューラ][/bold cyan] ジョブ発火: [{job.id}] {job.goal[:60]}")
+                    _run_scheduled_job(llm, job, con)
+            except Exception as exc:
+                con.print(f"[dim][スケジューラ] エラー: {exc}[/dim]")
+
+    t = threading.Thread(target=_loop, daemon=True, name="hermes-inline-scheduler")
+    t.start()
+    return stop_event
+
+
+def _run_scheduled_job(llm: MistralClient, job: "ScheduledJob", con: Console) -> None:
+    """スケジュールされたゴールをエージェントで実行する。"""
+    import threading
+    import time as _time
+
+    def _execute() -> None:
+        try:
+            con.print(f"[cyan][スケジューラ] 実行開始: {job.goal[:80]}[/cyan]")
+            _time.sleep(5)  # Groqレートリミット回避: 直前のAPI呼び出しから間隔を空ける
+            summary, _ = _run_agent(
+                llm=llm,
+                goal=job.goal,
+                domain=job.domain or "general",
+                max_iterations=6,  # スケジュール実行はイテレーションを控えめに
+            )
+            if not summary:
+                summary = f"[{job.id}] 完了"
+            con.print(f"[green][スケジューラ] 完了: {summary[:120]}[/green]")
+        except Exception as exc:
+            con.print(f"[red][スケジューラ] 実行エラー [{job.id}]: {exc}[/red]")
+        finally:
+            # バックグラウンド出力後、Prompt.ask() の表示が崩れるのを修復
+            import sys
+            sys.stdout.write("\n\033[32mhermes\033[0m: ")
+            sys.stdout.flush()
+
+    t = threading.Thread(target=_execute, daemon=True, name=f"hermes-job-{job.id}")
+    t.start()
+
+
+# ---------------------------------------------------------------------------
 # メインループ
 # ---------------------------------------------------------------------------
 
@@ -906,6 +1128,9 @@ def main() -> None:
     last_reflection: Dict[str, str] = {}
     last_state: Optional[AgentState] = None
 
+    # --- インプロセス スケジューラ (デーモン不要) ---
+    _sched_stop = _start_inline_scheduler(llm, console)
+
     fast_label = (
         f" / fast=[dim]{fast_llm.model}[/dim]"
         if fast_llm.model != llm.model else ""
@@ -924,6 +1149,7 @@ def main() -> None:
         try:
             raw = Prompt.ask("[bold green]hermes[/bold green]")
         except (EOFError, KeyboardInterrupt):
+            _sched_stop.set()
             console.print("\n[dim]終了します。[/dim]")
             break
 
@@ -933,6 +1159,7 @@ def main() -> None:
 
         # --- 終了 ---
         if raw in {"/quit", "/exit", "quit", "exit"}:
+            _sched_stop.set()
             console.print("[dim]終了します。[/dim]")
             break
 
@@ -953,12 +1180,15 @@ def main() -> None:
 
         # --- AGIステータス ---
         elif raw == "/status":
-            _cmd_status(llm, tool_registry, self_improver, last_state)
+            try:
+                _cmd_status(llm, tool_registry, self_improver, last_state)
+            except Exception as _exc:
+                console.print(f"[bold red]ステータス取得エラー:[/bold red] {_exc}")
 
         # --- カスタムツール ---
         elif raw.startswith("/tools"):
-            args = raw[6:].strip()
-            _cmd_tools(tool_registry, args)
+            tools_args = raw[6:].strip()
+            _cmd_tools(tool_registry, tools_args)
 
         # --- デーモン制御 ---
         elif raw.startswith("/daemon"):
@@ -997,12 +1227,15 @@ def main() -> None:
             if not goal:
                 console.print("[red]使い方: /run <実行したい目標・タスク>[/red]")
                 continue
-            with console.status("[yellow]ドメインを判定中...[/yellow]"):
-                _, domain = _classify_intent(fast_llm, goal)
-            _, last_state = _run_agent(llm, goal, domain, world_model=shared_world_model,
-                                       max_iterations=args.max_turns)
-            if last_state.world_model:
-                shared_world_model = last_state.world_model  # 世界モデルを更新
+            try:
+                with console.status("[yellow]ドメインを判定中...[/yellow]"):
+                    _, domain = _classify_intent(fast_llm, goal)
+                _, last_state = _run_agent(llm, goal, domain, world_model=shared_world_model,
+                                           max_iterations=args.max_turns)
+                if last_state.world_model:
+                    shared_world_model = last_state.world_model  # 世界モデルを更新
+            except Exception as _exc:
+                console.print(f"[bold red]エラーが発生しました:[/bold red] {_exc}")
 
         # --- 階層的マルチエージェント ---
         elif raw.startswith("/orch"):
@@ -1010,78 +1243,87 @@ def main() -> None:
             if not goal:
                 console.print("[red]使い方: /orch <複雑な目標・タスク>[/red]")
                 continue
-            console.print(Rule(
-                "[bold magenta]オーケストレーターモード (階層的並列実行)[/bold magenta]",
-                style="magenta",
-            ))
-            with console.status("[magenta]階層的ゴールツリーを生成・実行中...[/magenta]"):
-                orch = AgentOrchestrator(llm=llm, use_hierarchical=True)
-                result = orch.run(goal)
-            console.print(Rule(style="magenta"))
-            _display(result, title="オーケストレーター完了", border="magenta")
+            try:
+                console.print(Rule(
+                    "[bold magenta]オーケストレーターモード (階層的並列実行)[/bold magenta]",
+                    style="magenta",
+                ))
+                with console.status("[magenta]階層的ゴールツリーを生成・実行中...[/magenta]"):
+                    orch = AgentOrchestrator(llm=llm, use_hierarchical=True)
+                    result = orch.run(goal)
+                console.print(Rule(style="magenta"))
+                _display(result, title="オーケストレーター完了", border="magenta")
+            except Exception as _exc:
+                console.print(f"[bold red]エラーが発生しました:[/bold red] {_exc}")
 
         # --- 自己診断・改善提案 ---
         elif raw.startswith("/reflect"):
-            target = raw[8:].strip().lower()
-            if target in _REFLECT_TARGETS:
-                file_path = _REFLECT_TARGETS[target]
-                files_desc = file_path
-                goal = (
-                    f"READ: {file_path} でファイルを読み込み、自己診断してください。"
-                    f"バグ・パフォーマンス問題・設計改善・未実装機能の観点で "
-                    f"具体的なコードスニペット付きの改善提案を日本語でまとめてください。"
-                    f"SEARCH: は使わず、READ: でローカルファイルを直接読んでください。"
-                )
-            else:
-                if target and target not in _REFLECT_TARGETS:
-                    console.print(
-                        f"[yellow]対象 '{target}' は不明です。コアファイル全体を診断します。[/yellow]"
+            try:
+                target = raw[8:].strip().lower()
+                if target in _REFLECT_TARGETS:
+                    file_path = _REFLECT_TARGETS[target]
+                    files_desc = file_path
+                    goal = (
+                        f"READ: {file_path} でファイルを読み込み、自己診断してください。"
+                        f"バグ・パフォーマンス問題・設計改善・未実装機能の観点で "
+                        f"具体的なコードスニペット付きの改善提案を日本語でまとめてください。"
+                        f"SEARCH: は使わず、READ: でローカルファイルを直接読んでください。"
                     )
-                files_desc = ", ".join(_REFLECT_CORE_FILES)
-                read_steps = " || ".join(f"READ: {f}" for f in _REFLECT_CORE_FILES)
-                goal = (
-                    f"PLAN: {read_steps} || ANSWER: まとめ を使って "
-                    f"コアファイルを順に読んで自己診断してください。\n"
-                    f"バグ・パフォーマンス問題・設計改善・未実装機能の観点で "
-                    f"優先度付きの改善提案を日本語でまとめてください。"
-                    f"SEARCH: は使わず READ: でローカルファイルを直接読んでください。"
+                else:
+                    if target and target not in _REFLECT_TARGETS:
+                        console.print(
+                            f"[yellow]対象 '{target}' は不明です。コアファイル全体を診断します。[/yellow]"
+                        )
+                    files_desc = ", ".join(_REFLECT_CORE_FILES)
+                    read_steps = " || ".join(f"READ: {f}" for f in _REFLECT_CORE_FILES)
+                    goal = (
+                        f"PLAN: {read_steps} || ANSWER: まとめ を使って "
+                        f"コアファイルを順に読んで自己診断してください。\n"
+                        f"バグ・パフォーマンス問題・設計改善・未実装機能の観点で "
+                        f"優先度付きの改善提案を日本語でまとめてください。"
+                        f"SEARCH: は使わず READ: でローカルファイルを直接読んでください。"
+                    )
+                console.print(f"[magenta]自己診断モード[/magenta] — 対象: [bold]{files_desc}[/bold]")
+                suggestion, last_state = _run_agent(
+                    llm, goal, "coding",
+                    context=_SELF_REFLECT_CONTEXT,
+                    max_iterations=12,
+                    world_model=shared_world_model,
                 )
-            console.print(f"[magenta]自己診断モード[/magenta] — 対象: [bold]{files_desc}[/bold]")
-            suggestion, last_state = _run_agent(
-                llm, goal, "coding",
-                context=_SELF_REFLECT_CONTEXT,
-                max_iterations=12,
-                world_model=shared_world_model,
-            )
-            if suggestion:
-                last_reflection["file"] = files_desc
-                last_reflection["suggestion"] = suggestion
-            if last_state.world_model:
-                shared_world_model = last_state.world_model
+                if suggestion:
+                    last_reflection["file"] = files_desc
+                    last_reflection["suggestion"] = suggestion
+                if last_state.world_model:
+                    shared_world_model = last_state.world_model
+            except Exception as _exc:
+                console.print(f"[bold red]エラーが発生しました:[/bold red] {_exc}")
 
         # --- 改善提案を適用 ---
         elif raw.startswith("/apply"):
             if not last_reflection:
                 console.print("[yellow]まず /reflect を実行してください。[/yellow]")
                 continue
-            detail = raw[6:].strip()
-            files = last_reflection.get("file", "（不明）")
-            suggestion = last_reflection.get("suggestion", "")
-            apply_goal = (
-                f"以下の改善提案を {files} に適用してください。\n\n"
-                f"改善提案:\n{suggestion[:800]}\n\n"
-                + (f"特に適用したい改善: {detail}\n" if detail else "")
-                + "既存の動作を維持しながら改善を適用し、WRITE: でファイルを更新してください。"
-            )
-            console.print(f"[magenta]自己改善モード[/magenta] — 対象: [bold]{files}[/bold]")
-            _, last_state = _run_agent(
-                llm, apply_goal, "coding",
-                context=_SELF_APPLY_CONTEXT,
-                max_iterations=12,
-                world_model=shared_world_model,
-            )
-            if last_state.world_model:
-                shared_world_model = last_state.world_model
+            try:
+                detail = raw[6:].strip()
+                files = last_reflection.get("file", "（不明）")
+                suggestion = last_reflection.get("suggestion", "")
+                apply_goal = (
+                    f"以下の改善提案を {files} に適用してください。\n\n"
+                    f"改善提案:\n{suggestion[:800]}\n\n"
+                    + (f"特に適用したい改善: {detail}\n" if detail else "")
+                    + "既存の動作を維持しながら改善を適用し、WRITE: でファイルを更新してください。"
+                )
+                console.print(f"[magenta]自己改善モード[/magenta] — 対象: [bold]{files}[/bold]")
+                _, last_state = _run_agent(
+                    llm, apply_goal, "coding",
+                    context=_SELF_APPLY_CONTEXT,
+                    max_iterations=12,
+                    world_model=shared_world_model,
+                )
+                if last_state.world_model:
+                    shared_world_model = last_state.world_model
+            except Exception as _exc:
+                console.print(f"[bold red]エラーが発生しました:[/bold red] {_exc}")
 
         # --- コード生成 ---
         elif raw.startswith("/generate"):
@@ -1123,29 +1365,82 @@ def main() -> None:
 
         # --- フリーテキスト: チャット or エージェントを自動判断 ---
         else:
-            with console.status("[cyan]判断中...[/cyan]"):
-                intent_type, domain = _classify_intent(fast_llm, raw)
+            try:
+                # 時間指定リクエストを事前検出して直接スケジュール登録
+                trigger = _extract_schedule_trigger(raw)
+                if trigger and _TIME_SPEC_RE.search(raw):
+                    from hermes_agi_gen.scheduler import JobScheduler, parse_trigger_spec
+                    parsed = parse_trigger_spec(trigger.split(":", 1)[1] if ":" in trigger else trigger)
+                    if parsed is None:
+                        parsed = trigger
+                    job_scheduler = JobScheduler()
+                    # ゴールテキスト: 「になったら」「になれば」以降を抽出、なければ日時部分だけ除去
+                    _split = re.split(r'になったら[、,]?\s*|になれば[、,]?\s*', raw, maxsplit=1)
+                    if len(_split) > 1:
+                        goal_text = _split[1].strip()
+                    else:
+                        goal_text = re.sub(
+                            r'\d{4}年\d{1,2}月\d{1,2}日\s*(?:午前|午後)?\d{1,2}時\d{0,2}分?'
+                            r'|\d{1,2}:\d{2}に',
+                            '', raw
+                        ).strip()
+                    if not goal_text:
+                        goal_text = raw  # fallback: 原文をそのまま使う
+                    job = job_scheduler.add_job(goal=goal_text, trigger=parsed, domain="research")
+                    next_str = job_scheduler.format_next_run(job)
+                    # デーモン稼働中の警告
+                    daemon_status = HermesDaemon.get_status()
+                    if daemon_status["running"]:
+                        daemon_note = (
+                            f"\n[bold yellow]⚠️  デーモン (PID={daemon_status['pid']}) が起動中です。[/bold yellow]\n"
+                            "[yellow]ジョブはデーモンが実行するため、このターミナルに出力されません。[/yellow]\n"
+                            "[yellow]/daemon stop してから再登録すると、このターミナルで実行されます。[/yellow]"
+                        )
+                    else:
+                        daemon_note = "[dim]このターミナルのインラインスケジューラが自動実行します。[/dim]"
+                    console.print(Panel(
+                        f"[bold green]スケジュール登録完了[/bold green]\n"
+                        f"ゴール: {goal_text[:80]}\n"
+                        f"トリガー: {parsed} | 次回実行: {next_str}\n"
+                        + daemon_note,
+                        title="🕐 スケジュール登録",
+                        border_style="green" if not daemon_status["running"] else "yellow",
+                    ))
+                    continue
 
-            if intent_type == "task":
-                console.print(
-                    f"[yellow]タスクを検出しました（domain=[cyan]{domain}[/cyan]）。"
-                    f"エージェントを起動します...[/yellow]"
-                )
-                _, last_state = _run_agent(llm, raw, domain, world_model=shared_world_model)
-                if last_state.world_model:
-                    shared_world_model = last_state.world_model
-            else:
-                history.append({"role": "user", "content": raw})
-                messages = [{"role": "system", "content": _GENERAL_SYSTEM}] + history
-                with console.status("[cyan]考え中...[/cyan]"):
-                    reply = llm.chat(messages, temperature=0.7, max_tokens=2048)
-                if not reply:
-                    console.print("[red]応答を取得できませんでした。[/red]")
-                    history.pop()
+                with console.status("[cyan]判断中...[/cyan]"):
+                    intent_type, domain = _classify_intent(fast_llm, raw)
+
+                if intent_type == "task":
+                    console.print(
+                        f"[yellow]タスクを検出しました（domain=[cyan]{domain}[/cyan]）。"
+                        f"エージェントを起動します...[/yellow]"
+                    )
+                    _, last_state = _run_agent(llm, raw, domain, world_model=shared_world_model)
+                    if last_state.world_model:
+                        shared_world_model = last_state.world_model
                 else:
-                    history.append({"role": "assistant", "content": reply})
-                    _display(reply, title="Hermes AI")
+                    history.append({"role": "user", "content": raw})
+                    messages = [{"role": "system", "content": _GENERAL_SYSTEM}] + history
+                    with console.status("[cyan]考え中...[/cyan]"):
+                        reply = llm.chat(messages, temperature=0.7, max_tokens=2048)
+                    if not reply:
+                        console.print("[red]応答を取得できませんでした。[/red]")
+                        history.pop()
+                    else:
+                        history.append({"role": "assistant", "content": reply})
+                        _display(reply, title="Hermes AI")
+            except Exception as _exc:
+                console.print(f"[bold red]エラーが発生しました:[/bold red] {_exc}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as _top_exc:
+        import logging as _logging
+        _logging.basicConfig()
+        _logging.getLogger(__name__).exception("CLI top-level error")
+        print(f"\n[エラー] 予期しない例外が発生しました: {_top_exc}")
+        print("cli.py を再起動してください。")
+        sys.exit(1)
