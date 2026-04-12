@@ -35,6 +35,8 @@ from rich.rule import Rule
 from rich.table import Table
 
 from hermes_agi_gen import AgentOrchestrator, AgentState, HermesAgentV9
+from hermes_agi_gen.agi_core import AGICore
+from hermes_agi_gen.claude_client import ClaudeClient
 from hermes_agi_gen.code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from hermes_agi_gen.daemon import HermesDaemon
 from hermes_agi_gen.hermes_constants import DOMAIN_CONFIG
@@ -123,6 +125,7 @@ _HELP = """\
 | `/reflect [対象]` | 自己診断: ソースを読んで改善提案を生成 |
 | `/apply` | 最後の `/reflect` 提案をコードに適用 |
 | `/self-modify [対象]` | 自律的コード修正: 提案→テスト→適用のサイクル |
+| `/experiment` | AutoResearch方式: 洞察→コード実験→メトリクス比較→受容/ロールバック |
 | `/daemon start` | AGI自律デーモンをバックグラウンドで起動 |
 | `/daemon stop` | デーモンを停止 |
 | `/daemon status` | デーモンの状態を確認 |
@@ -265,6 +268,9 @@ def _extract_schedule_trigger(message: str) -> Optional[str]:
             hour, minute = None, None
     else:
         hour = int(time_m.group(1))
+        # 午前12時 = 深夜0時 (midnight = 00:xx)
+        if hour == 12:
+            hour = 0
         minute = int(time_m.group(2) or 0)
 
     if date_m and hour is not None:
@@ -283,8 +289,10 @@ def _extract_schedule_trigger(message: str) -> Optional[str]:
 # ヘルパー関数
 # ---------------------------------------------------------------------------
 
-def _provider_label(llm: MistralClient) -> str:
-    url = llm.base_url
+def _provider_label(llm) -> str:
+    if isinstance(llm, ClaudeClient):
+        return f"[bold green]Claude (Anthropic)[/bold green] ({llm.model})"
+    url = getattr(llm, "base_url", "")
     if "anthropic" in url:
         return f"[bold green]Claude[/bold green] ({llm.model})"
     if "groq" in url:
@@ -382,62 +390,89 @@ def _run_agent(
             _length_instruction = "詳しくまとめること"
         _max_tokens = max(800, _target_chars * 3) if _target_chars else 2000
         _body_limit = max(4000, _target_chars * 10) if _target_chars else 8000
+        _target_count_m = re.search(r'(\d+)\s*[件つ個]', goal)
+        _target_count = int(_target_count_m.group(1)) if _target_count_m else 3
         _script = f"""\
 import requests, os, re, datetime, json
 # 1. HNからAI記事を取得
 _hn = requests.get({_target_url!r}, timeout=15, headers={{"User-Agent": "Mozilla/5.0"}})
 _items = re.findall(r'class=[\\x22\\x27]titleline[\\x22\\x27]><a href=[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]>([^<]+)', _hn.text)
-_kw = ["ai", "llm", "gpt", "machine learning", "neural", "model", "agent", "openai", "anthropic", "deepmind"]
+_kw = ["ai", "llm", "gpt", "machine learning", "neural", "model", "agent", "openai", "anthropic",
+       "deepmind", "claude", "gemini", "mistral", "ml", "nlp", "robot", "coding", "software"]
 _ai = [(u, t) for u, t in _items if any(k in t.lower() for k in _kw)]
-_url, _title = _ai[0] if _ai else (_items[0] if _items else ({_target_url!r}, "AI News"))
-# 2. 記事本文を取得
-_body = ""
-try:
-    _art = requests.get(_url, timeout=20, headers={{"User-Agent": "Mozilla/5.0"}})
-    _html = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", _art.text, flags=re.DOTALL|re.IGNORECASE)
-    _body = re.sub(r"<[^>]+>", " ", _html)
-    _body = re.sub(r"\\s+", " ", _body).strip()[:{_body_limit}]
-except Exception as _e:
-    _body = f"(記事取得失敗: {{_e}})"
-# 3. Groq APIで翻訳・要約
-_groq_key = os.environ.get("GROQ_API_KEY", "")
-_title_ja, _summary_ja = _title, ""
-if _groq_key:
-    _json_fmt = '{{"title_ja": "日本語タイトル", "summary_ja": "ここに日本語の本文を書く"}}'
-    _prompt = (
-        "以下の英語記事を日本語に翻訳してください。\\n"
-        "【重要な制約】summary_jaには{_length_instruction}の内容を書くこと。短い要約は不可。記事の詳細・背景・技術的内容・著者の主張をすべて含めること。\\n\\n"
-        "タイトル: "
-        + _title
-        + "\\n\\n本文:\\n"
-        + _body
-        + "\\n\\n以下のJSON形式のみで返してください(他のテキスト不要):\\n"
-        + _json_fmt
-    )
+# 目標件数に満たなければ一般記事で補完
+_targets = _ai[:{_target_count}]
+if len(_targets) < {_target_count}:
+    _non_ai = [(u, t) for u, t in _items if (u, t) not in _ai]
+    _targets += _non_ai[:{_target_count} - len(_targets)]
+# 2. 各記事の本文を取得
+def _fetch_body(url, limit={_body_limit}):
+    if url.startswith("item?") or url.startswith("//"):
+        return ""
     try:
-        _gr = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={{"Authorization": f"Bearer {{_groq_key}}", "Content-Type": "application/json"}},
-            json={{"model": {_groq_model!r}, "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": {_max_tokens}, "temperature": 0.3}},
-            timeout=60,
-        )
-        _gr.raise_for_status()
-        _raw = _gr.json()["choices"][0]["message"]["content"]
-        _m = re.search(r"\\{{[^{{}}]+\\}}", _raw, re.DOTALL)
-        if _m:
-            _d = json.loads(_m.group())
-            _title_ja = _d.get("title_ja", _title)
-            _summary_ja = _d.get("summary_ja", "")
-    except Exception as _e:
-        _summary_ja = f"(翻訳エラー: {{_e}})"
+        _r = requests.get(url, timeout=15, headers={{"User-Agent": "Mozilla/5.0"}})
+        _h = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", _r.text, flags=re.DOTALL|re.IGNORECASE)
+        _t = re.sub(r"<[^>]+>", " ", _h)
+        return re.sub(r"\\s+", " ", _t).strip()[:limit]
+    except Exception:
+        return ""
+_articles = []
+for _u, _tit in _targets:
+    _tit_clean = re.sub(r"&#x27;", "'", _tit).strip()
+    _body = _fetch_body(_u)
+    _articles.append({{"title": _tit_clean, "url": _u, "body": _body}})
+# 3. Anthropic/Groq APIで翻訳・要約
+_anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+_groq_key = os.environ.get("GROQ_API_KEY", "")
+_sections = []
+for _i, _a in enumerate(_articles):
+    _body_snip = _a["body"][:2000] if _a["body"] else "(本文取得不可)"
+    _prompt = (
+        f"以下の英語記事を日本語に翻訳して{_length_instruction}で要約してください。\\n\\n"
+        f"タイトル: {{_a['title']}}\\n\\n本文抜粋:\\n{{_body_snip}}\\n\\n"
+        "以下のJSON形式のみで返してください:\\n"
+        '{{"title_ja":"翻訳タイトル","summary_ja":"日本語要約"}}'
+    )
+    _title_ja, _summary_ja = _a["title"], "(翻訳なし)"
+    if _anthropic_key:
+        try:
+            _resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={{"x-api-key": _anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}},
+                json={{"model": "claude-haiku-4-5-20251001", "max_tokens": {_max_tokens},
+                      "messages": [{{"role": "user", "content": _prompt}}]}},
+                timeout=60,
+            )
+            _resp.raise_for_status()
+            _raw = _resp.json()["content"][0]["text"]
+            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
+            if _m:
+                _d = json.loads(_m.group())
+                _title_ja = _d.get("title_ja", _title_ja)
+                _summary_ja = _d.get("summary_ja", _summary_ja)
+        except Exception as _e:
+            _summary_ja = f"(翻訳エラー: {{_e}})"
+    elif _groq_key:
+        try:
+            _gr = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={{"Authorization": f"Bearer {{_groq_key}}", "Content-Type": "application/json"}},
+                json={{"model": {_groq_model!r}, "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": {_max_tokens}}},
+                timeout=60,
+            )
+            _gr.raise_for_status()
+            _raw = _gr.json()["choices"][0]["message"]["content"]
+            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
+            if _m:
+                _d = json.loads(_m.group())
+                _title_ja = _d.get("title_ja", _title_ja)
+                _summary_ja = _d.get("summary_ja", _summary_ja)
+        except Exception as _e:
+            _summary_ja = f"(翻訳エラー: {{_e}})"
+    _sections.append(f"## 記事{{_i+1}}: {{_title_ja}}\\n原題: {{_a['title']}}\\n出典: {{_a['url']}}\\n\\n{{_summary_ja}}")
 # 4. ファイル保存
-_content = (
-    f"【AI News】{{_title_ja}}\\n"
-    f"原題: {{_title}}\\n"
-    f"出典: {{_url}}\\n\\n"
-    f"{{_summary_ja}}\\n\\n"
-    f"(Hacker Newsより取得 {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}})"
-)
+_header = f"=== Hacker News AI ニュース {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}} ===\\n"
+_content = _header + "\\n\\n" + "\\n\\n---\\n\\n".join(_sections) + f"\\n\\n(Hacker Newsより取得 {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}})"
 _out_dir = os.path.expanduser({_out_dir_kw!r})
 os.makedirs(_out_dir, exist_ok=True)
 _fname = os.path.join(_out_dir, f"AI_News_{{datetime.datetime.now().strftime('%m-%d_%H%M')}}.txt")
@@ -518,6 +553,70 @@ print(_content)
         console.print(f"[dim]🎯 次の推奨ゴール: {final_state.suggested_next_goal}[/dim]")
 
     return summary, final_state
+
+
+def _post_run_learning(
+    agi_core: AGICore,
+    goal: str,
+    domain: str,
+    final_state,
+) -> None:
+    """エージェント実行後の自己改善フェーズ。
+
+    _run_agent() のたびに呼び出し、認知サイクルの学習・省察部分を実行する。
+    AGICore.run_goal() の後半部分を切り出したもの。
+    """
+    success = final_state.is_done and len(getattr(final_state, "failed_steps", [])) == 0
+    perf_score = 1.0 if success else (0.4 if getattr(final_state, "completed_steps", []) else 0.1)
+
+    # --- 学習: few-shot 例と anti-pattern を抽出 ---
+    agi_core.self_improver.analyze_session(final_state)
+    agi_core.self_improver.record_session_performance(
+        session_id=getattr(final_state, "session_id", str(id(final_state))),
+        goal=goal,
+        domain=domain,
+        score=perf_score,
+    )
+    if success:
+        agi_core.identity.successful_goals += 1
+    agi_core.identity.total_goals_processed += 1
+
+    # --- 省察フェーズ (適応的インターバル) ---
+    recent_trend = agi_core.self_improver.get_performance_trend(window=10)
+    if agi_core.reflection_engine.should_reflect(recent_success_rate=recent_trend):
+        console.print("[dim][ReflectionEngine] 自己省察中...[/dim]", flush=True)
+        insights = agi_core.reflection_engine.reflect(agi_core.ltm)
+
+        if insights:
+            ins_strs = [f"[{i.category}] {i.content[:50]}" for i in insights[:3]]
+            console.print(
+                "[dim][省察] " + " / ".join(ins_strs) + "[/dim]"
+            )
+
+        # 戦略的ゴールを MetaCognition に追加
+        strategic_goals = agi_core.reflection_engine.generate_strategic_goals(insights, agi_core.ltm)
+        for sg in strategic_goals:
+            agi_core.meta.goal_queue.add(sg)
+
+        # 自己同一性を更新
+        metrics = agi_core.reflection_engine.compute_growth_metrics(agi_core.ltm)
+        agi_core.identity.update_from_metrics(metrics)
+
+        # 3省察ごとに実験ループ
+        agi_core._reflection_count += 1
+        if agi_core._reflection_count % 3 == 0 and agi_core.llm is not None:
+            console.print("[dim][ExperimentRunner] AutoResearch方式実験を開始...[/dim]")
+            exp_results = agi_core.experiment_runner.run_experiments_from_insights(
+                insights, max_experiments=2
+            )
+            accepted = sum(1 for r in exp_results if r.accepted)
+            if exp_results:
+                console.print(
+                    f"[dim][ExperimentRunner] {len(exp_results)}件実験 / "
+                    f"[green]{accepted}件採用[/green][/dim]"
+                )
+            elif agi_core.llm is not None:
+                agi_core._attempt_self_modification(insights)
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1008,99 @@ def _cmd_self_modify(
         console.print(f"[dim]修正成功率: {success_rate:.0%} ({len(history_data)}件の履歴)[/dim]")
 
 
+def _cmd_experiment(llm: "MistralClient", last_reflection: Dict[str, str]) -> None:
+    """AutoResearch方式の実験ループを手動トリガーする。
+
+    ReflectionEngine の洞察を使って、コード改変→テスト→メトリクス比較→
+    受容/ロールバック の実験サイクルを実行する。
+    """
+    from hermes_agi_gen.agi_core import AGICore
+    from hermes_agi_gen.reflection_engine import Insight
+
+    console.print(Rule("[bold cyan]AutoResearch 方式 実験ループ[/bold cyan]", style="cyan"))
+    console.print("[dim]洞察 → コード改変 → メトリクス比較 → 受容/ロールバック[/dim]\n")
+
+    core = AGICore(llm=llm)
+
+    # ReflectionEngine で洞察を生成
+    with console.status("[yellow]自己省察中...[/yellow]"):
+        insights = core.reflection_engine.reflect(core.ltm)
+
+    if not insights:
+        console.print("[yellow]洞察がありません。まず /run でタスクを実行してください。[/yellow]")
+        return
+
+    # actionable な洞察を表示
+    actionable = [i for i in insights if i.actionable]
+    if not actionable:
+        console.print("[yellow]行動可能な洞察がありません。[/yellow]")
+        for i in insights:
+            console.print(f"  [{i.category}] {i.content[:80]} (確信度: {i.confidence:.0%})")
+        return
+
+    table = Table(title="行動可能な洞察 (実験対象)", border_style="cyan")
+    table.add_column("カテゴリ", style="cyan", width=12)
+    table.add_column("内容")
+    table.add_column("確信度", justify="right", width=8)
+
+    for i in actionable[:5]:
+        cat_color = {"weakness": "red", "gap": "yellow", "opportunity": "green"}.get(i.category, "white")
+        table.add_row(
+            f"[{cat_color}]{i.category}[/{cat_color}]",
+            i.content[:70],
+            f"{i.confidence:.0%}",
+        )
+    console.print(table)
+
+    from rich.prompt import Prompt
+    confirm = Prompt.ask(
+        f"\n{len(actionable)}件の洞察で実験を実行しますか？",
+        choices=["y", "n"],
+        default="n",
+    )
+    if confirm != "y":
+        console.print("[dim]キャンセルしました。[/dim]")
+        return
+
+    console.print("\n[cyan]実験を開始します...[/cyan]")
+    results = core.experiment_runner.run_experiments_from_insights(
+        actionable, max_experiments=3
+    )
+
+    if not results:
+        console.print("[yellow]実験結果なし。[/yellow]")
+        return
+
+    # 結果テーブル
+    result_table = Table(title="実験結果", border_style="green")
+    result_table.add_column("洞察", width=40)
+    result_table.add_column("対象ファイル", width=30)
+    result_table.add_column("テスト", width=8)
+    result_table.add_column("改善", justify="right", width=8)
+    result_table.add_column("判定", width=10)
+
+    for r in results:
+        test_str = "[green]✓[/green]" if r.test_passed else "[red]✗[/red]"
+        imp_color = "green" if r.improvement > 0 else ("yellow" if r.improvement >= -0.01 else "red")
+        status = "[green]採用[/green]" if r.accepted else "[red]ロールバック[/red]"
+        result_table.add_row(
+            r.insight.content[:38],
+            r.patch.file_path if r.patch else "—",
+            test_str,
+            f"[{imp_color}]{r.improvement:+.3f}[/{imp_color}]",
+            status,
+        )
+    console.print(result_table)
+
+    accepted = sum(1 for r in results if r.accepted)
+    console.print(
+        f"\n[bold]実験サマリー:[/bold] {len(results)}件実行 / "
+        f"[green]{accepted}件採用[/green] / "
+        f"[red]{len(results) - accepted}件ロールバック[/red]"
+    )
+    console.print(f"[dim]累計実験履歴: {core.experiment_runner.summary()}[/dim]")
+
+
 def _cmd_perf(improver: SelfImprovementEngine) -> None:
     """パフォーマンス履歴を表示する。"""
     history = improver.get_performance_history(limit=10)
@@ -1056,7 +1248,8 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "例:\n"
-            "  python3 cli.py                  # 自動検出 (Groq→Mistral→Ollama)\n"
+            "  python3 cli.py                  # 自動検出 (Groq→Claude→Ollama)\n"
+            "  python3 cli.py --model claude   # Claude API を使用 (ANTHROPIC_API_KEY 必須)\n"
             "  python3 cli.py --model groq     # Groq API を使用 (GROQ_API_KEY 必須)\n"
             "  python3 cli.py --model qwen3    # Ollama の qwen3 を使用\n"
             "  python3 cli.py --model mistral  # Mistral API を使用 (MISTRAL_API_KEY 必須)\n"
@@ -1081,8 +1274,43 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _build_llm(model: Optional[str]) -> Optional[MistralClient]:
-    """モデル指定からMistralClientを構築する。エラー時はNoneを返す。"""
+def _build_llm(model: Optional[str]):
+    """モデル指定からLLMクライアントを構築する。
+
+    優先順位 (--model 未指定の自動検出):
+      1. GROQ_API_KEY が設定されていれば Groq
+      2. ANTHROPIC_API_KEY が設定されていれば Claude
+      3. それ以外は Ollama
+
+    明示指定:
+      --model groq    → Groq (GROQ_API_KEY 必須)
+      --model claude  → Claude (ANTHROPIC_API_KEY 必須)
+      --model qwen3   → Ollama の qwen3
+    """
+    import os as _os
+
+    # --- 明示指定: claude ---
+    if model == "claude":
+        if not ClaudeClient.is_available():
+            console.print(
+                "[bold red]ANTHROPIC_API_KEY が設定されていません。[/bold red]\n"
+                "[dim].env に ANTHROPIC_API_KEY=sk-ant-... を追加してください。[/dim]"
+            )
+            return None
+        console.print("[green]Anthropic Claude API を使用します。[/green]")
+        return ClaudeClient()
+
+    # --- 自動検出: Groq を最優先 ---
+    if model is None and _os.getenv("GROQ_API_KEY"):
+        console.print("[green]GROQ_API_KEY を検出 — Groq API を使用します。[/green]")
+        return MistralClient(model="groq")
+
+    # --- 自動検出: Anthropic Claude (Groq がない場合) ---
+    if model is None and ClaudeClient.is_available():
+        console.print("[green]ANTHROPIC_API_KEY を検出 — Claude API を使用します。[/green]")
+        return ClaudeClient()
+
+    # --- 明示指定 or Ollama フォールバック ---
     try:
         if model is None:
             return MistralClient()
@@ -1111,18 +1339,23 @@ def main() -> None:
         daemon.run_forever()
         return
 
-    # fast_llm: Groq使用時は軽量モデル、それ以外は同じモデル
-    fast_llm = MistralClient.fast() if args.model in (None, "groq") else llm
+    # fast_llm: Claude使用時はそのまま、Groq使用時は軽量モデル、それ以外は同じ
+    if isinstance(llm, ClaudeClient):
+        fast_llm = ClaudeClient.fast()
+    elif args.model in (None, "groq"):
+        fast_llm = MistralClient.fast()
+    else:
+        fast_llm = llm
 
     db = SessionDB()
     generator = CodeGeneratorAgent(llm=llm, session_db=db)
     reviewer_agent = CodeReviewerAgent(llm=llm, session_db=db)
 
-    # AGIコンポーネント
+    # AGIコアコンポーネント (統合認知サイクル + 自己改善)
     tool_registry = ToolRegistry()
-    self_improver = SelfImprovementEngine(llm=llm)
-    shared_world_model = WorldModel()  # セッション間で世界モデルを引き継ぐ
-    shared_world_model.initialize_from_filesystem(".")  # 起動時にグラウンディング
+    agi_core = AGICore(llm=llm, repo_root=Path("."))
+    self_improver = agi_core.self_improver   # AGICoreのものを共有
+    shared_world_model = agi_core.world_model  # AGICoreの世界モデルを共有
 
     history: List[Dict[str, str]] = []
     last_reflection: Dict[str, str] = {}
@@ -1204,6 +1437,10 @@ def main() -> None:
             target = raw[12:].strip().lower()
             _cmd_self_modify(llm, target, last_reflection)
 
+        # --- AutoResearch方式の実験ループ ---
+        elif raw == "/experiment":
+            _cmd_experiment(llm, last_reflection)
+
         # --- パフォーマンス履歴 ---
         elif raw == "/perf":
             _cmd_perf(self_improver)
@@ -1234,6 +1471,12 @@ def main() -> None:
                                            max_iterations=args.max_turns)
                 if last_state.world_model:
                     shared_world_model = last_state.world_model  # 世界モデルを更新
+                    agi_core.world_model = last_state.world_model
+                # 学習・省察フェーズ
+                try:
+                    _post_run_learning(agi_core, goal, domain, last_state)
+                except Exception as _learn_exc:
+                    console.print(f"[dim][自己改善] エラー: {_learn_exc}[/dim]")
             except Exception as _exc:
                 console.print(f"[bold red]エラーが発生しました:[/bold red] {_exc}")
 
@@ -1349,7 +1592,7 @@ def main() -> None:
         elif raw.startswith("/"):
             _KNOWN_CMDS = [
                 "/quit", "/exit", "/help", "/clear", "/provider", "/status",
-                "/tools", "/daemon", "/schedule", "/self-modify", "/run",
+                "/tools", "/daemon", "/schedule", "/self-modify", "/experiment", "/run",
                 "/orch", "/reflect", "/apply", "/generate", "/review",
             ]
             import difflib
@@ -1416,9 +1659,19 @@ def main() -> None:
                         f"[yellow]タスクを検出しました（domain=[cyan]{domain}[/cyan]）。"
                         f"エージェントを起動します...[/yellow]"
                     )
+                    # few-shot例をステートに注入してから実行
+                    agi_core.self_improver.inject_into_state(
+                        type("_S", (), {"working_memory": {}, "domain": domain, "user_goal": raw})()
+                    )
                     _, last_state = _run_agent(llm, raw, domain, world_model=shared_world_model)
                     if last_state.world_model:
                         shared_world_model = last_state.world_model
+                        agi_core.world_model = last_state.world_model
+                    # 学習・省察フェーズ (自己改善の核心)
+                    try:
+                        _post_run_learning(agi_core, raw, domain, last_state)
+                    except Exception as _learn_exc:
+                        console.print(f"[dim][自己改善] エラー: {_learn_exc}[/dim]")
                 else:
                     history.append({"role": "user", "content": raw})
                     messages = [{"role": "system", "content": _GENERAL_SYSTEM}] + history

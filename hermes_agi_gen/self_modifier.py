@@ -23,7 +23,7 @@ import sqlite3
 if TYPE_CHECKING:
     from .mistral_client import MistralClient
 
-# 自己修正が許可されるファイルのホワイトリスト
+# 自己修正が許可されるファイルのホワイトリスト (Gen 9: 拡張)
 _SAFE_MODIFY_TARGETS = {
     "hermes_agi_gen/planner.py",
     "hermes_agi_gen/reviewer.py",
@@ -32,6 +32,14 @@ _SAFE_MODIFY_TARGETS = {
     "hermes_agi_gen/long_term_memory.py",
     "hermes_agi_gen/world_model.py",
     "hermes_agi_gen/self_improvement.py",
+    # Gen 9: 認知モジュールへの自己修正を許可
+    "hermes_agi_gen/cognitive_roles.py",
+    "hermes_agi_gen/consciousness.py",
+    "hermes_agi_gen/predictive_engine.py",
+    "hermes_agi_gen/reflection_engine.py",
+    "hermes_agi_gen/intrinsic_motivation.py",
+    "hermes_agi_gen/meta_learning.py",
+    "hermes_agi_gen/inner_dialogue.py",
 }
 
 _PATCH_DB_PATH = Path.home() / ".hermes" / "self_modifier.db"
@@ -49,6 +57,27 @@ CREATE TABLE IF NOT EXISTS code_patches (
     performance_delta REAL,
     created_at REAL NOT NULL,
     session_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS learned_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    insight_category TEXT NOT NULL,
+    insight_keywords TEXT NOT NULL,
+    target_file TEXT NOT NULL,
+    patch_template TEXT NOT NULL,
+    success_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS high_risk_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    proposal_json TEXT NOT NULL,
+    reviewed INTEGER DEFAULT 0,
+    created_at REAL NOT NULL
 );
 """
 
@@ -191,8 +220,12 @@ class SelfModifier:
         if not isinstance(data, dict):
             return None
 
-        # risk_level が high の場合は拒否
-        if data.get("risk_level", "low") == "high":
+        # Gen 9: リスク段階制 (low→自動, medium→テスト必須, high→ユーザー確認要求)
+        risk = data.get("risk_level", "low")
+        if risk == "high":
+            # high リスクはログに記録して保留（ユーザー確認を推奨）
+            print(f"[SelfModifier] 高リスク変更を保留: {data.get('rationale', '')[:60]}", flush=True)
+            self._record_high_risk_proposal(file_path, data)
             return None
 
         changes_raw = data.get("changes", [])
@@ -376,3 +409,108 @@ class SelfModifier:
         if row and row["total"] > 0:
             return (row["passed"] or 0) / row["total"]
         return 0.0
+
+    # ------------------------------------------------------------------
+    # Gen 9: 学習済み修正パターン
+    # ------------------------------------------------------------------
+
+    def learn_pattern(self, insight_category: str, keywords: str, target_file: str, patch_template: str) -> None:
+        """成功したパッチパターンを学習する。"""
+        self._conn.execute(
+            """
+            INSERT INTO learned_patterns (insight_category, insight_keywords, target_file, patch_template, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (insight_category, keywords, target_file, patch_template, time.time()),
+        )
+        self._conn.commit()
+
+    def find_similar_pattern(self, insight_content: str) -> Optional[dict]:
+        """類似の成功パターンを検索する。"""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM learned_patterns
+            WHERE success_count > failure_count
+            ORDER BY success_count DESC
+            LIMIT 10
+            """
+        ).fetchall()
+        # キーワードマッチング
+        content_lower = insight_content.lower()
+        for row in rows:
+            keywords = row["insight_keywords"].lower().split(",")
+            if any(kw.strip() in content_lower for kw in keywords):
+                return dict(row)
+        return None
+
+    def record_pattern_outcome(self, pattern_id: int, success: bool) -> None:
+        """パターンの適用結果を記録する。"""
+        col = "success_count" if success else "failure_count"
+        self._conn.execute(
+            f"UPDATE learned_patterns SET {col} = {col} + 1 WHERE id = ?",
+            (pattern_id,),
+        )
+        self._conn.commit()
+
+    def _record_high_risk_proposal(self, file_path: str, data: dict) -> None:
+        """高リスク提案を記録する（後でユーザーが確認可能）。"""
+        import json
+        self._conn.execute(
+            """
+            INSERT INTO high_risk_proposals (file_path, rationale, risk_level, proposal_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (file_path, data.get("rationale", ""), data.get("risk_level", "high"),
+             json.dumps(data, ensure_ascii=False), time.time()),
+        )
+        self._conn.commit()
+
+    def get_pending_high_risk(self) -> list[dict]:
+        """未レビューの高リスク提案を返す。"""
+        rows = self._conn.execute(
+            "SELECT * FROM high_risk_proposals WHERE reviewed = 0 ORDER BY created_at DESC LIMIT 5"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def approve_high_risk(self, proposal_id: int) -> bool:
+        """高リスク提案を承認して適用する。"""
+        import json
+        row = self._conn.execute(
+            "SELECT * FROM high_risk_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+        if not row:
+            return False
+
+        data = json.loads(row["proposal_json"])
+        file_path = row["file_path"]
+
+        # 通常のパッチ生成・適用フローを再実行（risk_levelチェックをバイパス）
+        abs_path = self.repo_root / file_path
+        if not abs_path.exists():
+            return False
+
+        current_code = abs_path.read_text(encoding="utf-8")
+        changes_raw = data.get("changes", [])
+        changes = []
+        for c in changes_raw:
+            if isinstance(c, dict) and c.get("old_code") and c.get("new_code"):
+                if c["old_code"] in current_code:
+                    changes.append(PatchChange(
+                        description=c.get("description", ""),
+                        old_code=c["old_code"],
+                        new_code=c["new_code"],
+                    ))
+        if not changes:
+            return False
+
+        patch = Patch(
+            file_path=file_path, rationale=data.get("rationale", ""),
+            changes=changes, original_content=current_code,
+            risk_level="high", expected_benefit=data.get("expected_benefit", ""),
+        )
+        accepted = self.validate_and_commit(patch)
+        self._conn.execute(
+            "UPDATE high_risk_proposals SET reviewed = 1 WHERE id = ?", (proposal_id,)
+        )
+        self._conn.commit()
+        return accepted

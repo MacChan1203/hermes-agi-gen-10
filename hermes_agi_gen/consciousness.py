@@ -27,6 +27,10 @@ class SignalSource(str, Enum):
     GOAL_MANAGER = "goal_manager"    # ゴール管理
     INNOVATOR = "innovator"          # 創造的解決
     ETHICIST = "ethicist"            # 価値整合
+    # Gen 9: AGI拡張シグナルソース
+    MOTIVATOR = "motivator"          # 内発的動機
+    META_LEARNER = "meta_learner"    # メタ学習戦略
+    DELIBERATOR = "deliberator"      # 内部対話・合意形成
 
 
 @dataclass
@@ -264,4 +268,41 @@ class GlobalWorkspace:
                 urgency=0.95,
                 confidence=0.85,
                 tags=["stuck", "pivot"],
+            ))
+
+    def build_gen9_signals(
+        self,
+        motivation_summary: str = "",
+        meta_learner_summary: str = "",
+        deliberation_result: Optional[str] = None,
+    ) -> None:
+        """Gen 9 追加シグナルを構築してワークスペースに送信する。"""
+        if motivation_summary:
+            self.receive(WorkspaceSignal(
+                source=SignalSource.MOTIVATOR,
+                content=motivation_summary,
+                relevance=0.6,
+                urgency=0.3,
+                confidence=0.7,
+                tags=["motivation", "intrinsic"],
+            ))
+
+        if meta_learner_summary:
+            self.receive(WorkspaceSignal(
+                source=SignalSource.META_LEARNER,
+                content=meta_learner_summary,
+                relevance=0.5,
+                urgency=0.2,
+                confidence=0.8,
+                tags=["meta_learning", "strategy"],
+            ))
+
+        if deliberation_result:
+            self.receive(WorkspaceSignal(
+                source=SignalSource.DELIBERATOR,
+                content=deliberation_result,
+                relevance=0.8,
+                urgency=0.5,
+                confidence=0.75,
+                tags=["deliberation", "consensus"],
             ))

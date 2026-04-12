@@ -4,6 +4,7 @@
 計画前に環境の現在状態を考慮できるようにする。
 
 Gen 7追加: プロアクティブなグラウンディング (initialize_from_filesystem)
+Gen 9追加: 資源認識型プランニング (コスト追跡・複雑度推定)
 """
 from __future__ import annotations
 
@@ -25,6 +26,16 @@ class CausalEffect:
 
 
 @dataclass
+class ResourceCost:
+    """ツール実行の資源コスト記録。"""
+    tool_type: str           # "CMD" / "PYTHON" / "SEARCH" / etc.
+    execution_time: float    # 実行時間 (秒)
+    output_size: int         # 出力バイト数
+    success: bool
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
 class WorldModel:
     """エージェントが保持する環境の内部表現。
 
@@ -35,6 +46,8 @@ class WorldModel:
         known_services: 稼働中のサービス・プロセス情報
         installed_packages: インストール済みPythonパッケージ
         git_state: gitリポジトリの状態
+        resource_history: ツール実行のコスト履歴 (Gen 9)
+        uncertainty_map: 領域ごとの不確実性スコア (Gen 9)
     """
     filesystem: Dict[str, Any] = field(default_factory=dict)
     environment: Dict[str, Any] = field(default_factory=dict)
@@ -42,6 +55,9 @@ class WorldModel:
     known_services: Dict[str, str] = field(default_factory=dict)
     installed_packages: List[str] = field(default_factory=list)
     git_state: Dict[str, Any] = field(default_factory=dict)
+    # Gen 9: 資源認識
+    resource_history: List[ResourceCost] = field(default_factory=list)
+    uncertainty_map: Dict[str, float] = field(default_factory=dict)
 
     def add_causal_effect(self, action: str, effect: str, confidence: float = 1.0) -> None:
         """アクションと結果の因果関係を記録する。"""
@@ -178,3 +194,98 @@ class WorldModel:
         if grounded_at is None:
             return None
         return time.time() - grounded_at
+
+    # ------------------------------------------------------------------
+    # Gen 9: 資源認識型プランニング
+    # ------------------------------------------------------------------
+
+    def record_resource_cost(self, tool_type: str, execution_time: float, output_size: int, success: bool) -> None:
+        """ツール実行のコストを記録する。"""
+        self.resource_history.append(ResourceCost(
+            tool_type=tool_type, execution_time=execution_time,
+            output_size=output_size, success=success,
+        ))
+        if len(self.resource_history) > 500:
+            self.resource_history = self.resource_history[-500:]
+
+    def estimate_tool_cost(self, tool_type: str) -> Dict[str, float]:
+        """過去の実績からツールの予想コストを返す。"""
+        relevant = [r for r in self.resource_history if r.tool_type == tool_type]
+        if not relevant:
+            # デフォルト推定
+            defaults = {
+                "CMD": 2.0, "PYTHON": 5.0, "SEARCH": 8.0,
+                "FETCH": 5.0, "READ": 0.5, "WRITE": 0.5,
+                "CALC": 0.1, "PLAN": 0.1,
+            }
+            return {"avg_time": defaults.get(tool_type, 3.0), "success_rate": 0.7, "samples": 0}
+
+        times = [r.execution_time for r in relevant]
+        successes = sum(1 for r in relevant if r.success)
+        return {
+            "avg_time": sum(times) / len(times),
+            "success_rate": successes / len(relevant),
+            "samples": len(relevant),
+        }
+
+    def estimate_goal_complexity(self, goal: str) -> Dict[str, Any]:
+        """ゴールの複雑度を推定する。"""
+        length_score = min(1.0, len(goal) / 200.0)
+
+        # キーワードベースの複雑度
+        complex_keywords = ["分析", "リファクタ", "統合", "設計", "最適化", "デバッグ",
+                           "analyze", "refactor", "integrate", "design", "optimize", "debug"]
+        simple_keywords = ["表示", "読む", "確認", "計算", "print", "read", "check", "calc"]
+
+        keyword_score = 0.5
+        goal_lower = goal.lower()
+        for kw in complex_keywords:
+            if kw in goal_lower:
+                keyword_score = min(1.0, keyword_score + 0.15)
+        for kw in simple_keywords:
+            if kw in goal_lower:
+                keyword_score = max(0.1, keyword_score - 0.15)
+
+        # 過去の類似タスク実績（因果グラフから）
+        similar_effects = [e for e in self.causal_graph if any(w in e.action.lower() for w in goal_lower.split()[:3])]
+        historical_score = 0.5
+        if similar_effects:
+            historical_score = sum(e.confidence for e in similar_effects) / len(similar_effects)
+
+        complexity = (length_score * 0.2) + (keyword_score * 0.5) + ((1 - historical_score) * 0.3)
+
+        # 推奨 max_iterations
+        if complexity < 0.3:
+            recommended_iterations = 3
+        elif complexity < 0.6:
+            recommended_iterations = 6
+        elif complexity < 0.8:
+            recommended_iterations = 9
+        else:
+            recommended_iterations = 12
+
+        return {
+            "complexity": round(complexity, 2),
+            "length_score": round(length_score, 2),
+            "keyword_score": round(keyword_score, 2),
+            "historical_score": round(historical_score, 2),
+            "recommended_iterations": recommended_iterations,
+        }
+
+    def get_uncertainty_areas(self) -> List[str]:
+        """不確実性が高い領域のリストを返す。"""
+        return [area for area, score in self.uncertainty_map.items() if score > 0.6]
+
+    def update_uncertainty(self, area: str, delta: float) -> None:
+        """領域の不確実性を更新する。"""
+        current = self.uncertainty_map.get(area, 0.5)
+        self.uncertainty_map[area] = max(0.0, min(1.0, current + delta))
+
+    def resource_summary(self) -> str:
+        """資源使用状況のサマリを返す。"""
+        if not self.resource_history:
+            return "資源記録なし"
+        total_time = sum(r.execution_time for r in self.resource_history)
+        total_ops = len(self.resource_history)
+        success_rate = sum(1 for r in self.resource_history if r.success) / total_ops
+        return f"総実行={total_ops}回 総時間={total_time:.1f}秒 成功率={success_rate:.0%}"

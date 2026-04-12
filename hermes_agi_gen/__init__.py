@@ -8,32 +8,45 @@ from .cognitive_roles import CognitiveRole, decompose_into_roles, select_roles_f
 from .consciousness import AttentionMechanism, GlobalWorkspace, SignalSource, WorkspaceSignal
 from .daemon import HermesDaemon
 from .hierarchical_planner import GoalNode, GoalTree, HierarchicalPlanner
+from .inner_dialogue import DeliberationResult, InnerDialogue
+from .intrinsic_motivation import IntrinsicMotivationEngine, MotivationSignal
 from .long_term_memory import LongTermMemory
 from .meta_cognition import GoalQueue, MetaCognition, QueuedGoal
+from .meta_learning import MetaLearner, StrategyRecord, TransferCandidate
 from .mistral_client import MistralClient
 from .orchestrator import AgentOrchestrator
 from .predictive_engine import Prediction, PredictiveEngine
 from .reflection_engine import GrowthMetrics, Insight, ReflectionEngine
+from .experiment_runner import ExperimentMetrics, ExperimentResult, ExperimentRunner
 from .self_improvement import SelfImprovementEngine
 from .self_modifier import SelfModifier
 from .state_store import SessionDB
 from .tool_registry import DynamicTool, ToolRegistry
 from .value_system import CoreValue, ValueAssessment, ValueSystem
-from .world_model import CausalEffect, WorldModel
+from .world_model import CausalEffect, ResourceCost, WorldModel
 
 __all__ = [
-    # Gen 7: AGI Core
+    # Gen 9: AGI Core
     "AGICore",
     "AGIIdentity",
     "GrowthMetrics",
     "Insight",
     "ReflectionEngine",
+    # Gen 9: 新認知モジュール
+    "InnerDialogue",
+    "DeliberationResult",
+    "IntrinsicMotivationEngine",
+    "MotivationSignal",
+    "MetaLearner",
+    "StrategyRecord",
+    "TransferCandidate",
+    "ResourceCost",
     # Core agent
     "AgentMessage",
     "AgentOrchestrator",
     "AgentState",
     "HermesAgentV9",
-    # Gen 6: 新モジュール
+    # Gen 6: 認知モジュール
     "AttentionMechanism",
     "CognitiveRole",
     "CoreValue",
@@ -61,6 +74,9 @@ __all__ = [
     "MetaCognition",
     "MistralClient",
     "QueuedGoal",
+    "ExperimentMetrics",
+    "ExperimentResult",
+    "ExperimentRunner",
     "SelfImprovementEngine",
     "SelfModifier",
     "SessionDB",

@@ -38,6 +38,8 @@ class Executor:
 
     def execute(self, step: str, state: AgentState) -> Dict[str, Any]:
         """ステップ文字列を解析して対応ツールを呼び出す。"""
+        import time as _time
+        _exec_start = _time.time()
         step = step.strip()
 
         # 世界モデルを初期化 (なければ)
@@ -48,6 +50,17 @@ class Executor:
         prediction = state.world_model.predict_outcome(step)
         if prediction:
             state.working_memory["last_world_prediction"] = prediction
+
+        # Gen 9: 実行結果にコスト記録を付加するヘルパー
+        def _record_cost(result: Dict[str, Any], tool_type: str) -> Dict[str, Any]:
+            elapsed = _time.time() - _exec_start
+            output_size = len(result.get("stdout", ""))
+            state.world_model.record_resource_cost(
+                tool_type=tool_type, execution_time=elapsed,
+                output_size=output_size, success=result.get("ok", False),
+            )
+            result["_cost"] = {"time": round(elapsed, 3), "tool": tool_type}
+            return result
 
         if step.upper().startswith("PLAN:"):
             raw = step[5:].strip()
@@ -72,34 +85,35 @@ class Executor:
 
         if step.upper().startswith("CALC:"):
             expr = step[5:].strip()
-            return self._run_calc(expr, state)
+            return _record_cost(self._run_calc(expr, state), "CALC")
 
         if step.upper().startswith("FETCH:"):
             url = step[6:].strip().splitlines()[0].strip()
-            return self._run_fetch(url, state)
+            return _record_cost(self._run_fetch(url, state), "FETCH")
 
         if step.upper().startswith("SEARCH:"):
             query = step[7:].strip()
-            return self._run_search(query, state)
+            return _record_cost(self._run_search(query, state), "SEARCH")
 
         if step.upper().startswith("CMD:"):
             cmd = step[4:].strip().splitlines()[0].strip()
-            return self._run_shell(cmd, state)
+            return _record_cost(self._run_shell(cmd, state), "CMD")
 
         if step.upper().startswith("READ:"):
             filepath = step[5:].strip().splitlines()[0].strip()
-            return self._read_file(filepath, state)
+            return _record_cost(self._read_file(filepath, state), "READ")
 
         if step.upper().startswith("WRITE:"):
-            return self._write_file(step[6:], state)
+            return _record_cost(self._write_file(step[6:], state), "WRITE")
 
         if step.upper().startswith("PYTHON:"):
             code = textwrap.dedent(step[7:]).strip()
-            return self._run_python(code, state)
+            return _record_cost(self._run_python(code, state), "PYTHON")
 
         if step.upper().startswith("DONE:"):
             summary = step[5:].strip()
             state.working_memory["completion_summary"] = summary
+            state.is_done = True  # DONE宣言でエージェントを即座に終了させる
             return {"ok": True, "stdout": summary, "stderr": "", "returncode": 0, "command": None}
 
         if step.upper().startswith("SCHEDULE:"):
@@ -122,28 +136,72 @@ class Executor:
     # CMD: シェル実行
     # ------------------------------------------------------------------
 
+    # パイプ後に許可する安全な読み取り専用コマンド
+    _SAFE_PIPE_CMDS = frozenset([
+        "head", "tail", "sort", "grep", "uniq", "wc", "cut", "awk",
+        "tr", "less", "cat", "tee", "nl", "sed", "fmt", "column",
+    ])
+
     def _run_shell(self, cmd: str, state: AgentState) -> Dict[str, Any]:
-        # セキュリティ: コマンドチェインを禁止 (VULN-001)
-        if any(char in cmd for char in [";", "&&", "||", "|", "`", "$", "(", ")"]):
+        # ~ をホームディレクトリに展開 (shlex.split はチルダを展開しないため)
+        import os as _os
+        _home = _os.path.expanduser("~")
+        cmd = re.sub(r'(?<![a-zA-Z0-9_])~(?=/|$| )', _home, cmd)
+
+        # セキュリティ: 危険なコマンドチェインを禁止 (VULN-001)
+        # `;` `&&` `||` バックティック `$()` は完全禁止
+        # `|` はパイプとして許可 (後続コマンドが安全リストにある場合)
+        _dangerous = [";", "&&", "||", "`"]
+        if any(pat in cmd for pat in _dangerous):
             return {
                 "ok": False,
                 "stdout": "",
-                "stderr": "セキュリティ制限: コマンドに禁止文字 (; && || | ` $ ( )) が含まれています。単一のコマンドのみ実行可能です。",
+                "stderr": f"セキュリティ制限: 危険なコマンドチェイン (; && || `) は使用できません。",
                 "returncode": 1,
                 "command": cmd
             }
+        # $() コマンド置換を禁止
+        if re.search(r'\$\(', cmd):
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": "セキュリティ制限: $() コマンド置換は使用できません。",
+                "returncode": 1,
+                "command": cmd
+            }
+        # パイプを含む場合: shell=True で実行 (パイプ後コマンドが安全リストにあるか確認)
+        _has_pipe = "|" in cmd
+        if _has_pipe:
+            _pipe_parts = [p.strip().split()[0] for p in cmd.split("|")[1:] if p.strip()]
+            _unsafe_parts = [p for p in _pipe_parts if p not in self._SAFE_PIPE_CMDS]
+            if _unsafe_parts:
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": f"セキュリティ制限: パイプ後のコマンド {_unsafe_parts} は許可されていません。",
+                    "returncode": 1,
+                    "command": cmd
+                }
 
         try:
-            # シェルインジェクションを防ぐため、シェル経由ではなくリスト形式で実行するのが望ましいが、
-            # 現状の設計ではコマンド文字列を受け取っている。
-            # 最小限の対策として禁止文字チェックを導入。
-            proc = subprocess.run(
-                shlex.split(cmd),  # shlex.splitでクォートやスペースを正しく処理
-                capture_output=True,
-                text=True,
-                cwd=str(self.repo_root),
-                timeout=_SH_TIMEOUT,
-            )
+            if _has_pipe:
+                # パイプがある場合は shell=True で実行
+                proc = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(self.repo_root),
+                    timeout=_SH_TIMEOUT,
+                )
+            else:
+                proc = subprocess.run(
+                    shlex.split(cmd),  # shlex.splitでクォートやスペースを正しく処理
+                    capture_output=True,
+                    text=True,
+                    cwd=str(self.repo_root),
+                    timeout=_SH_TIMEOUT,
+                )
         except ValueError as e:
             return {"ok": False, "stdout": "", "stderr": f"コマンド解析エラー: {e}", "returncode": -1, "command": cmd}
         except Exception as e:
