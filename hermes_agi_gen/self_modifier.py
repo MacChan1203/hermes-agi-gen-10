@@ -12,7 +12,11 @@ propose → apply → test → accept/rollback の安全なサイクルで
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +26,10 @@ import sqlite3
 
 if TYPE_CHECKING:
     from .mistral_client import MistralClient
+
+from .config import SELF_MODIFIER_MAX_PENDING_HIGH_RISK
+
+logger = logging.getLogger(__name__)
 
 # 自己修正が許可されるファイルのホワイトリスト (Gen 9: 拡張)
 _SAFE_MODIFY_TARGETS = {
@@ -42,7 +50,9 @@ _SAFE_MODIFY_TARGETS = {
     "hermes_agi_gen/inner_dialogue.py",
 }
 
-_PATCH_DB_PATH = Path.home() / ".hermes" / "self_modifier.db"
+from .hermes_constants import get_hermes_home
+
+_PATCH_DB_PATH = get_hermes_home() / "self_modifier.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS code_patches (
@@ -224,7 +234,7 @@ class SelfModifier:
         risk = data.get("risk_level", "low")
         if risk == "high":
             # high リスクはログに記録して保留（ユーザー確認を推奨）
-            print(f"[SelfModifier] 高リスク変更を保留: {data.get('rationale', '')[:60]}", flush=True)
+            logger.warning("[SelfModifier] 高リスク変更を保留: %s", data.get("rationale", "")[:60])
             self._record_high_risk_proposal(file_path, data)
             return None
 
@@ -261,12 +271,67 @@ class SelfModifier:
     # パッチ適用・ロールバック
     # ------------------------------------------------------------------
 
+    def _check_git_clean(self, file_path: str) -> bool:
+        """対象ファイルにコミットされていない変更がないか確認する。
+
+        Returns:
+            クリーンなら True、未コミットの変更があれば False。
+        """
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain", file_path],
+                capture_output=True, text=True, timeout=10,
+                cwd=self.repo_root,
+            )
+            if result.stdout.strip():
+                logger.warning(
+                    "[SelfModifier] %s に未コミットの変更があります。修正を拒否します。",
+                    file_path,
+                )
+                return False
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            # git が使えない環境では警告のみでスキップ
+            logger.warning("[SelfModifier] git status を実行できません。チェックをスキップします。")
+            return True
+
+    def _backup_file(self, patch: Patch) -> Optional[Path]:
+        """パッチ適用前にオリジナルファイルのバックアップを保存する。
+
+        Returns:
+            バックアップファイルのパス、または None。
+        """
+        abs_path = self.repo_root / patch.file_path
+        if not abs_path.exists():
+            return None
+        backup_dir = self.db_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = int(time.time())
+        safe_name = patch.file_path.replace("/", "_").replace("\\", "_")
+        backup_path = backup_dir / f"{safe_name}.{timestamp}.bak"
+        backup_path.write_text(patch.original_content, encoding="utf-8")
+        logger.info("[SelfModifier] バックアップ作成: %s", backup_path)
+        return backup_path
+
     def apply_patch(self, patch: Patch) -> bool:
-        """パッチをファイルに適用する。
+        """パッチをファイルに適用する (アトミック書き込み)。
+
+        適用前に git status チェックとファイルバックアップを行う。
+        一時ファイルに書き込み→検証→リネームでアトミック性を保証する。
+        途中失敗時にファイルが破損しない。
 
         Returns:
             成功したら True
         """
+        import tempfile
+
+        # git clean チェック
+        if not self._check_git_clean(patch.file_path):
+            return False
+
+        # バックアップ作成
+        self._backup_file(patch)
+
         abs_path = self.repo_root / patch.file_path
         content = patch.original_content
 
@@ -275,7 +340,34 @@ class SelfModifier:
                 return False
             content = content.replace(change.old_code, change.new_code, 1)
 
-        abs_path.write_text(content, encoding="utf-8")
+        # アトミック書き込み: 一時ファイル→検証→リネーム
+        try:
+            # 同じディレクトリに一時ファイルを作成 (同一ファイルシステムでの rename を保証)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(abs_path.parent),
+                prefix=f".{abs_path.name}.",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                # 元ファイルのパーミッションを保持
+                if abs_path.exists():
+                    os.chmod(tmp_path, abs_path.stat().st_mode)
+                # アトミックリネーム
+                os.replace(tmp_path, str(abs_path))
+            except Exception:
+                # 失敗時は一時ファイルを削除
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
+        except Exception as exc:
+            logger.error("[SelfModifier] アトミック書き込み失敗: %s — ロールバック", exc)
+            self.rollback(patch)
+            return False
+
         return True
 
     def rollback(self, patch: Patch) -> None:
@@ -288,16 +380,24 @@ class SelfModifier:
     # ------------------------------------------------------------------
 
     def run_tests(self) -> TestResult:
-        """pytest を実行してテスト結果を返す。"""
+        """pytest を実行してテスト結果を返す。
+
+        テスト副作用を防ぐため、一時ディレクトリを --rootdir として使用する。
+        """
         start = time.time()
         try:
-            result = subprocess.run(
-                ["python3", "-m", "pytest", "tests/", "-x", "-q", "--tb=short"],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                cwd=self.repo_root,
-            )
+            with tempfile.TemporaryDirectory(prefix="hermes_test_") as tmp_dir:
+                result = subprocess.run(
+                    [
+                        "python3", "-m", "pytest", "tests/",
+                        "-x", "-q", "--tb=short",
+                        f"--rootdir={tmp_dir}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=self.repo_root,
+                )
             duration = time.time() - start
             return TestResult(
                 passed=result.returncode == 0,
@@ -453,8 +553,30 @@ class SelfModifier:
         self._conn.commit()
 
     def _record_high_risk_proposal(self, file_path: str, data: dict) -> None:
-        """高リスク提案を記録する（後でユーザーが確認可能）。"""
-        import json
+        """高リスク提案を記録する（後でユーザーが確認可能）。
+
+        保留中の提案が上限に達している場合、最も古い提案を削除する。
+        """
+        # 保留中の提案数を確認し、上限に達していれば古いものを削除
+        row = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM high_risk_proposals WHERE reviewed = 0"
+        ).fetchone()
+        if row and row["cnt"] >= SELF_MODIFIER_MAX_PENDING_HIGH_RISK:
+            self._conn.execute(
+                """
+                DELETE FROM high_risk_proposals WHERE id IN (
+                    SELECT id FROM high_risk_proposals
+                    WHERE reviewed = 0
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                )
+                """
+            )
+            logger.info(
+                "[SelfModifier] 保留提案が上限 (%d) に達したため最古の提案を削除しました",
+                SELF_MODIFIER_MAX_PENDING_HIGH_RISK,
+            )
+
         self._conn.execute(
             """
             INSERT INTO high_risk_proposals (file_path, rationale, risk_level, proposal_json, created_at)
@@ -468,13 +590,41 @@ class SelfModifier:
     def get_pending_high_risk(self) -> list[dict]:
         """未レビューの高リスク提案を返す。"""
         rows = self._conn.execute(
-            "SELECT * FROM high_risk_proposals WHERE reviewed = 0 ORDER BY created_at DESC LIMIT 5"
+            "SELECT * FROM high_risk_proposals WHERE reviewed = 0 ORDER BY created_at DESC LIMIT ?",
+            (SELF_MODIFIER_MAX_PENDING_HIGH_RISK,),
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_pending_proposals_summary(self) -> list[dict]:
+        """保留中の高リスク提案の人間が読みやすいサマリーを返す。
+
+        CLIから呼び出して保留中の提案を確認するために使用する。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, file_path, rationale, risk_level, created_at
+            FROM high_risk_proposals
+            WHERE reviewed = 0
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (SELF_MODIFIER_MAX_PENDING_HIGH_RISK,),
+        ).fetchall()
+        summaries = []
+        for row in rows:
+            from datetime import datetime
+            created_dt = datetime.fromtimestamp(row["created_at"])
+            summaries.append({
+                "id": row["id"],
+                "file": row["file_path"],
+                "rationale": row["rationale"][:120],
+                "risk": row["risk_level"],
+                "created": created_dt.strftime("%Y-%m-%d %H:%M"),
+            })
+        return summaries
+
     def approve_high_risk(self, proposal_id: int) -> bool:
         """高リスク提案を承認して適用する。"""
-        import json
         row = self._conn.execute(
             "SELECT * FROM high_risk_proposals WHERE id = ?", (proposal_id,)
         ).fetchone()

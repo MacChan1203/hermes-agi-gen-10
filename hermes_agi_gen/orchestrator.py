@@ -18,11 +18,13 @@ Gen 5 との主な差分:
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .agent_message import AgentMessage
+from .config import ORCHESTRATOR_MAX_CONTEXT_LEN, ORCHESTRATOR_MAX_GOAL_LEN, ORCHESTRATOR_RESULT_TRUNCATE, PLANNER_MAX_PARALLEL, PLANNER_THREAD_TIMEOUT
 from .agent_runner import HermesAgentV9
 from .agent_state import AgentState
 from .cognitive_roles import (
@@ -37,6 +39,8 @@ from .mistral_client import MistralClient
 from .predictive_engine import PredictiveEngine
 from .state_store import SessionDB
 from .value_system import ValueSystem
+
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
 # 合成プロンプト
@@ -135,6 +139,13 @@ class AgentOrchestrator:
         """
         self._self_model["total_runs"] += 1
 
+        # --- Input validation: truncate goal if too long ---
+        if len(goal) > ORCHESTRATOR_MAX_GOAL_LEN:
+            logger.warning(
+                "Goal truncated from %d to %d chars", len(goal), ORCHESTRATOR_MAX_GOAL_LEN
+            )
+            goal = goal[:ORCHESTRATOR_MAX_GOAL_LEN]
+
         self.session_db.create_session(
             self.orchestrator_session_id,
             source="orchestrator_gen6",
@@ -153,10 +164,10 @@ class AgentOrchestrator:
         )
         broadcast = self.workspace.broadcast()
         if broadcast:
-            print(
-                f"[GlobalWorkspace] 注意焦点: [{broadcast.winner.source.value}] "
-                f"{broadcast.winner.content[:60]}",
-                flush=True,
+            logger.info(
+                "[GlobalWorkspace] 注意焦点: [%s] %s",
+                broadcast.winner.source.value,
+                broadcast.winner.content[:60],
             )
 
         # --- Step 2: 倫理評価 ---
@@ -173,10 +184,7 @@ class AgentOrchestrator:
 
         # --- Step 3: ロール構成の選択 ---
         roles = select_roles_for_goal(goal, context)
-        print(
-            f"[AGI] 認知ロール構成: {' → '.join(roles)}",
-            flush=True,
-        )
+        logger.info("[AGI] 認知ロール構成: %s", " → ".join(roles))
 
         # Gen 6: ロール数に応じて実行パスを選択
         # - 1ロール: 単純クエリ → 直接実行（高速）
@@ -214,24 +222,23 @@ class AgentOrchestrator:
             goal=goal,
             context=context,
         )
-        print(
-            f"[PredictiveEngine] 予測: {prediction.predicted_outcome} "
-            f"(確信={prediction.confidence:.0%})",
-            flush=True,
+        logger.info(
+            "[PredictiveEngine] 予測: %s (確信=%.0f%%)",
+            prediction.predicted_outcome,
+            prediction.confidence * 100,
         )
 
         if not prediction.should_proceed:
-            print(
-                f"[PredictiveEngine] 警告: 成功確率={prediction.success_probability:.0%} — "
-                "慎重に実行します",
-                flush=True,
+            logger.warning(
+                "[PredictiveEngine] 警告: 成功確率=%.0f%% — 慎重に実行します",
+                prediction.success_probability * 100,
             )
 
         result = self.run(goal, context)
 
         # 予測を記録
         actual_success = bool(result and len(result) > 50)
-        record = self.predictor.record_outcome(prediction, result[:200], actual_success)
+        record = self.predictor.record_outcome(prediction, result[:ORCHESTRATOR_RESULT_TRUNCATE], actual_success)
 
         return {
             "result": result,
@@ -251,7 +258,7 @@ class AgentOrchestrator:
 
     def _run_single_role(self, goal: str, context: str, role: str) -> str:
         """単純クエリ用の単一ロール直接実行（パイプラインオーバーヘッドなし）。"""
-        print(f"[AGI] 単一ロール実行: {role}", flush=True)
+        logger.info("[AGI] 単一ロール実行: %s", role)
         msg = AgentMessage(
             sender="orchestrator",
             receiver=role,
@@ -277,10 +284,7 @@ class AgentOrchestrator:
         results: List[AgentMessage] = []
 
         for i, role in enumerate(roles, 1):
-            print(
-                f"[Pipeline {i}/{len(roles)}] {role}: 実行中...",
-                flush=True,
-            )
+            logger.info("[Pipeline %d/%d] %s: 実行中...", i, len(roles), role)
 
             # 前のロールの結果をコンテキストに追加
             # sender は常に "orchestrator" なので receiver（ロール名）を使う
@@ -290,6 +294,14 @@ class AgentOrchestrator:
                     f"前のステップ ({prev_result.receiver}) の結果:\n"
                     f"{prev_result.result or '（なし）'}\n\n"
                     + accumulated_context
+                )
+
+            # --- Truncate accumulated context if too long ---
+            if len(accumulated_context) > ORCHESTRATOR_MAX_CONTEXT_LEN:
+                accumulated_context = (
+                    accumulated_context[:2000]
+                    + "\n\n[...truncated...]\n\n"
+                    + accumulated_context[-2000:]
                 )
 
             # タスクを構築
@@ -322,10 +334,7 @@ class AgentOrchestrator:
                 tool_name=role,
             )
 
-            print(
-                f"[Pipeline {i}/{len(roles)}] {role}: 完了 (status={completed.status})",
-                flush=True,
-            )
+            logger.info("[Pipeline %d/%d] %s: 完了 (status=%s)", i, len(roles), role, completed.status)
 
         # 中間ブロードキャスト（全ロール完了後）
         self.workspace.broadcast()
@@ -338,7 +347,7 @@ class AgentOrchestrator:
 
     def _run_hierarchical(self, goal: str, context: str = "") -> str:
         """階層的GoalTreeを使って目標を実行する (gen-5 から継承・強化)。"""
-        print(f"[AGI Orchestrator] 階層的ゴールツリーを生成中...", flush=True)
+        logger.info("[AGI Orchestrator] 階層的ゴールツリーを生成中...")
         assert self.hierarchical_planner is not None
         tree = self.hierarchical_planner.decompose(goal, context=context)
 
@@ -347,7 +356,7 @@ class AgentOrchestrator:
             self.orchestrator_session_id, "assistant",
             f"ゴールツリー: {tree_summary}"
         )
-        print(f"[AGI Orchestrator] {tree_summary}", flush=True)
+        logger.info("[AGI Orchestrator] %s", tree_summary)
 
         def worker_fn(node: GoalNode) -> str:
             # ValueSystem で倫理評価
@@ -360,13 +369,13 @@ class AgentOrchestrator:
                 receiver=node.role,
                 task=node.goal,
                 context="\n".join(
-                    f"[{n.role}の結果] {n.result[:200]}"
+                    f"[{n.role}の結果] {n.result[:ORCHESTRATOR_RESULT_TRUNCATE]}"
                     for n in tree._nodes.values()
                     if n.goal_id in node.depends_on and n.result
                 ),
                 session_id=self.orchestrator_session_id,
             )
-            print(f"  [GoalNode:{node.goal_id}] {node.role}: {node.goal[:60]}", flush=True)
+            logger.info("  [GoalNode:%s] %s: %s", node.goal_id, node.role, node.goal[:60])
             completed = self._run_worker(msg)
             self.session_db.append_message(
                 self.orchestrator_session_id, "tool",
@@ -375,7 +384,7 @@ class AgentOrchestrator:
             )
             return completed.result or ""
 
-        self.hierarchical_planner.execute_tree(tree, worker_fn, max_parallel=3)
+        self.hierarchical_planner.execute_tree(tree, worker_fn, max_parallel=PLANNER_MAX_PARALLEL)
 
         messages = []
         for node in tree._nodes.values():

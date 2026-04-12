@@ -18,7 +18,9 @@ if TYPE_CHECKING:
     from .agent_state import AgentState
     from .mistral_client import MistralClient
 
-_IMPROVEMENT_DB_PATH = Path.home() / ".hermes" / "self_improvement.db"
+from .hermes_constants import get_hermes_home
+
+_IMPROVEMENT_DB_PATH = get_hermes_home() / "self_improvement.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_performance (
@@ -160,9 +162,18 @@ class SelfImprovementEngine:
             )
             if isinstance(data, list):
                 now = time.time()
+                valid_prefixes = ("CMD:", "SEARCH:", "PYTHON:", "FETCH:", "PLAN:", "CALC:", "WRITE:", "READ:")
                 for item in data:
                     if not isinstance(item, dict):
                         continue
+                    # Validate: good_action should reference a known action pattern
+                    good_action = item.get("good_action", "")
+                    if good_action and not any(
+                        good_action.upper().startswith(p) for p in valid_prefixes
+                    ):
+                        # Check if action text matches any completed step
+                        if not any(good_action in s for s in state.completed_steps):
+                            continue  # Skip unverifiable examples
                     self._conn.execute(
                         """
                         INSERT INTO few_shot_examples
@@ -293,12 +304,26 @@ class SelfImprovementEngine:
     # ------------------------------------------------------------------
 
     def get_best_examples(
-        self, domain: str = "general", limit: int = 5
+        self, domain: str = "general", limit: int = 5,
+        domain_match_weight: float = 1.0,
+        cross_domain_weight: float = 0.5,
     ) -> List[Dict[str, Any]]:
         """品質スコア・使用回数でランキングしたfew-shot例を返す。
 
-        ドメイン固有の例が少ない場合、他ドメインから品質スコアを0.7倍に割り引いて補完する。
+        ドメイン固有の例が少ない場合、他ドメインから品質スコアを割り引いて補完する。
         これにより異なるドメインで蓄積した知識を横断的に活用できる。
+
+        Args:
+            domain: 対象ドメイン
+            limit: 返す例の最大数
+            domain_match_weight: 同一ドメインの品質スコア重み (default 1.0)。
+                同一ドメインの例は最も信頼性が高いので通常は 1.0。
+            cross_domain_weight: 異なるドメインの品質スコア重み (default 0.5)。
+                低くすると同一ドメインの例が優先される。高くすると多様な知識が
+                活用されるが、ドメイン固有の知識が汚染されるリスクがある。
+
+        Returns:
+            品質スコア順のfew-shot例リスト
         """
         rows = self._conn.execute(
             """
@@ -311,6 +336,9 @@ class SelfImprovementEngine:
             (domain, limit),
         ).fetchall()
         results = [dict(r) for r in rows]
+        # Apply domain_match_weight to same-domain results
+        for r in results:
+            r["quality_score"] = r["quality_score"] * domain_match_weight
 
         # ドメイン固有例が2件未満の場合、他ドメインから補完 (クロスドメイン転用)
         if len(results) < 2:
@@ -318,13 +346,13 @@ class SelfImprovementEngine:
             other_rows = self._conn.execute(
                 """
                 SELECT goal_pattern, good_action, context, outcome,
-                       quality_score * 0.7 AS quality_score, use_count
+                       quality_score * ? AS quality_score, use_count
                 FROM few_shot_examples
                 WHERE domain != ? AND domain != 'general'
                 ORDER BY quality_score DESC
                 LIMIT ?
                 """,
-                (domain, shortage),
+                (cross_domain_weight, domain, shortage),
             ).fetchall()
             results.extend([dict(r) for r in other_rows])
 

@@ -9,14 +9,22 @@ import hashlib
 import json
 import math
 import sqlite3
+import threading
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import logging
 import requests
 
-DEFAULT_LTM_PATH = Path.home() / ".hermes" / "long_term_memory.db"
+from .config import LTM_EMBEDDING_TIMEOUT, LTM_EMBEDDING_DETECT_TIMEOUT, LTM_MAX_FACTS, LTM_CLEANUP_BATCH
+
+logger = logging.getLogger(__name__)
+
+from .hermes_constants import get_hermes_home
+
+DEFAULT_LTM_PATH = get_hermes_home() / "long_term_memory.db"
 
 # Ollama埋め込みモデル (nomic-embed-textが最良、qwen3はフォールバック)
 _EMBED_MODEL_CANDIDATES = ["nomic-embed-text", "mxbai-embed-large", "all-minilm"]
@@ -76,7 +84,7 @@ class SemanticIndexer:
     def _detect_embed_model(self) -> Optional[str]:
         """利用可能な埋め込みモデルを自動検出する。"""
         try:
-            resp = requests.get(f"{self.ollama_base}/api/tags", timeout=3)
+            resp = requests.get(f"{self.ollama_base}/api/tags", timeout=LTM_EMBEDDING_DETECT_TIMEOUT)
             if resp.status_code == 200:
                 models = [m["name"].split(":")[0] for m in resp.json().get("models", [])]
                 for candidate in _EMBED_MODEL_CANDIDATES:
@@ -95,18 +103,20 @@ class SemanticIndexer:
             self._embed_model = self._detect_embed_model()
             if self._embed_model is None:
                 self._use_ollama = False
+                logger.info("Ollama embedding unavailable, falling back to TF-IDF")
                 return None
 
         try:
             resp = requests.post(
                 f"{self.ollama_base}/api/embeddings",
                 json={"model": self._embed_model, "prompt": text},
-                timeout=10,
+                timeout=LTM_EMBEDDING_TIMEOUT,
             )
             if resp.status_code == 200:
                 return resp.json().get("embedding")
         except Exception:
             self._use_ollama = False
+            logger.info("Ollama embedding unavailable, falling back to TF-IDF")
         return None
 
     @staticmethod
@@ -166,6 +176,8 @@ class LongTermMemory:
         self._migrate()
         self._conn.commit()
         self._indexer = SemanticIndexer()
+        self._learn_count: int = 0
+        self._lock = threading.Lock()  # 全DB操作を保護するスレッドロック
 
     def _migrate(self) -> None:
         """既存DBへのカラム追加マイグレーション。"""
@@ -185,28 +197,69 @@ class LongTermMemory:
         confidence: float = 1.0,
         session_id: Optional[str] = None,
     ) -> None:
-        """知識を記憶する。既存のキーは上書き。埋め込みも保存する。"""
+        """知識を記憶する。既存のキーは上書き。埋め込みも保存する。
+
+        スレッドセーフ: _lock で書き込みを排他制御する。
+        """
         now = time.time()
-        # セマンティック埋め込みを計算
+        # セマンティック埋め込みを計算 (I/O なのでロック外で実行)
         embedding_json: Optional[str] = None
         vec = self._indexer.embed(f"{key}: {value}")
         if vec:
             embedding_json = json.dumps(vec)
 
-        self._conn.execute(
-            """
-            INSERT INTO knowledge(key, value, confidence, session_id, created_at, updated_at, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                confidence = excluded.confidence,
-                session_id = excluded.session_id,
-                updated_at = excluded.updated_at,
-                embedding = COALESCE(excluded.embedding, knowledge.embedding)
-            """,
-            (key, value, confidence, session_id, now, now, embedding_json),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO knowledge(key, value, confidence, session_id, created_at, updated_at, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    confidence = excluded.confidence,
+                    session_id = excluded.session_id,
+                    updated_at = excluded.updated_at,
+                    embedding = COALESCE(excluded.embedding, knowledge.embedding)
+                """,
+                (key, value, confidence, session_id, now, now, embedding_json),
+            )
+            self._conn.commit()
+
+        # Periodic cleanup every 100 learn() calls
+        self._learn_count += 1
+        if self._learn_count % 100 == 0:
+            self.cleanup_old_facts()
+
+    def cleanup_old_facts(self, max_facts: int = LTM_MAX_FACTS) -> int:
+        """最大事実数を超えた古い事実を削除する。
+
+        Args:
+            max_facts: 保持する最大事実数
+
+        Returns:
+            削除された事実の数
+        """
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) as cnt FROM knowledge").fetchone()
+            total = row["cnt"] if row else 0
+            if total <= max_facts:
+                return 0
+
+            to_delete = total - max_facts
+            deleted = 0
+            while deleted < to_delete:
+                batch = min(LTM_CLEANUP_BATCH, to_delete - deleted)
+                self._conn.execute(
+                    """
+                    DELETE FROM knowledge WHERE key IN (
+                        SELECT key FROM knowledge ORDER BY updated_at ASC LIMIT ?
+                    )
+                    """,
+                    (batch,),
+                )
+                deleted += batch
+            self._conn.commit()
+        logger.info("LTM cleanup: deleted %d old facts (total was %d, max %d)", deleted, total, max_facts)
+        return deleted
 
     def recall(self, key: str) -> Optional[str]:
         """キーで記憶を取り出す。"""
@@ -268,11 +321,12 @@ class LongTermMemory:
     ) -> None:
         """ゴールに対する戦略と結果を記録する。"""
         goal_hash = hashlib.md5(goal.encode()).hexdigest()[:8]
-        self._conn.execute(
-            "INSERT INTO strategy_log(goal_hash, goal, strategy, outcome, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (goal_hash, goal, strategy, outcome, session_id, time.time()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO strategy_log(goal_hash, goal, strategy, outcome, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (goal_hash, goal, strategy, outcome, session_id, time.time()),
+            )
+            self._conn.commit()
 
     def recall_strategies(self, goal: str, *, limit: int = 5) -> List[Dict[str, Any]]:
         """類似ゴールでの過去の戦略を取り出す。
@@ -328,18 +382,19 @@ class LongTermMemory:
         """失敗パターンを記録する。同じパターンはカウントアップ。"""
         now = time.time()
         pattern = command[:100]
-        self._conn.execute(
-            """
-            INSERT INTO failure_log(command_pattern, error_type, count, last_session_id, first_seen, last_seen)
-            VALUES (?, ?, 1, ?, ?, ?)
-            ON CONFLICT(command_pattern, error_type) DO UPDATE SET
-                count = count + 1,
-                last_session_id = excluded.last_session_id,
-                last_seen = excluded.last_seen
-            """,
-            (pattern, error_type, session_id, now, now),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO failure_log(command_pattern, error_type, count, last_session_id, first_seen, last_seen)
+                VALUES (?, ?, 1, ?, ?, ?)
+                ON CONFLICT(command_pattern, error_type) DO UPDATE SET
+                    count = count + 1,
+                    last_session_id = excluded.last_session_id,
+                    last_seen = excluded.last_seen
+                """,
+                (pattern, error_type, session_id, now, now),
+            )
+            self._conn.commit()
 
     def get_known_failures(self, limit: int = 10) -> List[Dict[str, Any]]:
         """既知の失敗パターンを頻度順に取り出す。"""

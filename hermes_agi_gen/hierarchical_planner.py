@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -12,6 +13,10 @@ from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .mistral_client import MistralClient
+
+from .config import PLANNER_THREAD_TIMEOUT, PLANNER_MAX_PARALLEL, PLANNER_RESULT_CHARS_PER_NODE
+
+logger = logging.getLogger(__name__)
 
 
 class GoalStatus(str, Enum):
@@ -142,6 +147,11 @@ class GoalTree:
         pending = sum(1 for n in nodes if n.status == GoalStatus.PENDING)
         return f"合計:{total} 完了:{completed} 失敗:{failed} 実行中:{in_progress} 待機:{pending}"
 
+    @property
+    def nodes(self) -> Dict[str, GoalNode]:
+        """ノードマップへの読み取りアクセス。"""
+        return self._nodes
+
 
 _DECOMPOSE_HIERARCHICAL = """\
 あなたはAGIエージェントのタスク分解専門家です。
@@ -177,6 +187,61 @@ class HierarchicalPlanner:
 
     def __init__(self, llm: Optional[MistralClient] = None) -> None:
         self.llm = llm
+
+    # ------------------------------------------------------------------
+    # DAG サイクル検出
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_cycles(tree: GoalTree) -> list[str]:
+        """DFS（白/灰/黒の彩色法）でゴールツリーのサイクルを検出する。
+
+        Returns:
+            検出されたバックエッジのリスト ("from_id -> to_id" 形式)。
+            サイクルがなければ空リスト。
+        """
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: Dict[str, int] = {nid: WHITE for nid in tree.nodes}
+        back_edges: list[str] = []
+
+        def dfs(node_id: str) -> None:
+            color[node_id] = GRAY
+            node = tree.nodes.get(node_id)
+            if node is None:
+                color[node_id] = BLACK
+                return
+            # depends_on は "この node が依存する先" なので、
+            # グラフ的には node_id → dep_id の辺と見なす
+            for dep_id in node.depends_on:
+                if dep_id not in color:
+                    continue
+                if color[dep_id] == GRAY:
+                    back_edges.append(f"{node_id} -> {dep_id}")
+                elif color[dep_id] == WHITE:
+                    dfs(dep_id)
+            color[node_id] = BLACK
+
+        for nid in tree.nodes:
+            if color[nid] == WHITE:
+                dfs(nid)
+
+        return back_edges
+
+    @staticmethod
+    def _remove_back_edges(tree: GoalTree, back_edges: list[str]) -> None:
+        """検出されたバックエッジの依存関係を除去する。"""
+        for edge in back_edges:
+            parts = edge.split(" -> ")
+            if len(parts) != 2:
+                continue
+            from_id, to_id = parts
+            node = tree.nodes.get(from_id)
+            if node and to_id in node.depends_on:
+                node.depends_on.remove(to_id)
+                logger.warning(
+                    "サイクル検出: %s → %s のバックエッジ依存を除去しました",
+                    from_id, to_id,
+                )
 
     def decompose(self, goal: str, context: str = "") -> GoalTree:
         """ゴールをGoalTreeに分解する。"""
@@ -228,13 +293,18 @@ class HierarchicalPlanner:
         for node, old_deps in nodes_data:
             node.depends_on = [id_map.get(d, d) for d in old_deps if d in id_map]
 
+        # DAG サイクル検出・除去
+        back_edges = self._detect_cycles(tree)
+        if back_edges:
+            self._remove_back_edges(tree, back_edges)
+
         return tree
 
     def execute_tree(
         self,
         tree: GoalTree,
         worker_fn: Callable[[GoalNode], str],
-        max_parallel: int = 3,
+        max_parallel: int = PLANNER_MAX_PARALLEL,
     ) -> str:
         """GoalTreeを実行する。並列ノードはスレッドで並列実行する。
 
@@ -263,14 +333,18 @@ class HierarchicalPlanner:
                 try:
                     result = worker_fn(node)
                     tree.mark_completed(node.goal_id, result)
-                    results.append(f"[{node.role}] {node.goal[:50]}: {result[:100]}")
+                    results.append(
+                        f"[{node.role}] {node.goal[:50]}: "
+                        f"{result[:PLANNER_RESULT_CHARS_PER_NODE]}"
+                    )
                 except Exception as e:
                     tree.mark_failed(node.goal_id, str(e))
                     results.append(f"[{node.role}][失敗] {node.goal[:50]}: {e}")
             else:
-                # 並列実行
+                # 並列実行 — Lock で thread_results への書き込みを保護
                 threads = []
                 thread_results: Dict[str, Any] = {}
+                results_lock = threading.Lock()
 
                 for node in batch:
                     node.status = GoalStatus.IN_PROGRESS
@@ -278,9 +352,11 @@ class HierarchicalPlanner:
                 def run_node(n: GoalNode) -> None:
                     try:
                         r = worker_fn(n)
-                        thread_results[n.goal_id] = ("ok", r)
+                        with results_lock:
+                            thread_results[n.goal_id] = ("ok", r)
                     except Exception as e:
-                        thread_results[n.goal_id] = ("err", str(e))
+                        with results_lock:
+                            thread_results[n.goal_id] = ("err", str(e))
 
                 for node in batch:
                     t = threading.Thread(target=run_node, args=(node,), daemon=True)
@@ -288,13 +364,17 @@ class HierarchicalPlanner:
                     t.start()
 
                 for node, t in threads:
-                    t.join(timeout=120)  # 2分タイムアウト
+                    t.join(timeout=PLANNER_THREAD_TIMEOUT)
 
                 for node in batch:
-                    status, val = thread_results.get(node.goal_id, ("err", "タイムアウト"))
+                    with results_lock:
+                        status, val = thread_results.get(node.goal_id, ("err", "タイムアウト"))
                     if status == "ok":
                         tree.mark_completed(node.goal_id, val)
-                        results.append(f"[{node.role}][並列] {node.goal[:50]}: {val[:100]}")
+                        results.append(
+                            f"[{node.role}][並列] {node.goal[:50]}: "
+                            f"{val[:PLANNER_RESULT_CHARS_PER_NODE]}"
+                        )
                     else:
                         tree.mark_failed(node.goal_id, val)
                         results.append(f"[{node.role}][並列失敗] {node.goal[:50]}: {val}")

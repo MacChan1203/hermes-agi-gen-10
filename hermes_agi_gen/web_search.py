@@ -5,17 +5,19 @@ ddgs ライブラリ (pip install ddgs) を優先使用。
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
+import threading
+import time
 from typing import Dict, List
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
-logger = logging.getLogger(__name__)
+from .config import WEB_SEARCH_TIMEOUT, WEB_SEARCH_MAX_RESULTS, WEB_SEARCH_RATE_LIMIT_SEC
 
-_TIMEOUT = 15
-_DEFAULT_MAX = 5
+logger = logging.getLogger(__name__)
 
 _HEADERS = {
     "User-Agent": (
@@ -30,9 +32,28 @@ _HEADERS = {
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 
+# Rate limiting state
+_last_search_time: float = 0.0
+_rate_limit_lock = threading.Lock()
 
-def _strip_tags(html: str) -> str:
-    return _SPACE_RE.sub(" ", _TAG_RE.sub("", html)).strip()
+
+def _strip_tags(text: str) -> str:
+    """HTMLタグを除去し、HTMLエンティティをデコードする。"""
+    text = html.unescape(text)
+    return _SPACE_RE.sub(" ", _TAG_RE.sub("", text)).strip()
+
+
+def _enforce_rate_limit() -> None:
+    """検索間の最小間隔を保証する (スレッドセーフ)。"""
+    global _last_search_time
+    with _rate_limit_lock:
+        now = time.time()
+        elapsed = now - _last_search_time
+        if _last_search_time > 0 and elapsed < WEB_SEARCH_RATE_LIMIT_SEC:
+            wait = WEB_SEARCH_RATE_LIMIT_SEC - elapsed
+            logger.debug("Rate limiting: waiting %.1f seconds", wait)
+            time.sleep(wait)
+        _last_search_time = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +68,9 @@ def _search_via_ddgs(query: str, max_results: int) -> List[Dict[str, str]] | Non
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
                 results.append({
-                    "title": r.get("title", ""),
+                    "title": html.unescape(r.get("title", "")),
                     "url": r.get("href", ""),
-                    "snippet": r.get("body", ""),
+                    "snippet": html.unescape(r.get("body", "")),
                 })
         return results
     except ImportError:
@@ -79,24 +100,41 @@ def _search_via_html(query: str, max_results: int) -> List[Dict[str, str]]:
             "https://html.duckduckgo.com/html/",
             params={"q": query, "kl": "jp-jp"},
             headers=_HEADERS,
-            timeout=_TIMEOUT,
+            timeout=WEB_SEARCH_TIMEOUT,
         )
         resp.raise_for_status()
     except Exception as exc:
         logger.error("web_search HTML エラー: %s", exc)
         return [{"title": "検索エラー", "url": "", "snippet": str(exc)}]
 
-    html = resp.text
+    raw_html = resp.text
+
+    # Primary parsing strategy
     title_blocks = re.findall(
         r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-        html,
+        raw_html,
         re.DOTALL,
     )
     snippet_blocks = re.findall(
         r'class="result__snippet"[^>]*>(.*?)</a>',
-        html,
+        raw_html,
         re.DOTALL,
     )
+
+    # Fallback parsing strategy if primary yields nothing
+    if not title_blocks:
+        title_blocks = re.findall(
+            r'<a[^>]+class="[^"]*result[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+            raw_html,
+            re.DOTALL,
+        )
+    if not snippet_blocks:
+        snippet_blocks = re.findall(
+            r'class="[^"]*snippet[^"]*"[^>]*>(.*?)</(?:a|div|span)>',
+            raw_html,
+            re.DOTALL,
+        )
+
     results: List[Dict[str, str]] = []
     for i, (url, raw_title) in enumerate(title_blocks[:max_results]):
         snippet_raw = snippet_blocks[i] if i < len(snippet_blocks) else ""
@@ -112,13 +150,15 @@ def _search_via_html(query: str, max_results: int) -> List[Dict[str, str]]:
 # 公開 API
 # ---------------------------------------------------------------------------
 
-def search(query: str, max_results: int = _DEFAULT_MAX) -> List[Dict[str, str]]:
+def search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> List[Dict[str, str]]:
     """DuckDuckGo で検索し、結果リストを返す。
 
     Returns:
         各要素が {"title": str, "url": str, "snippet": str} の list。
         エラー時は [{"title": "検索エラー", "url": "", "snippet": エラー内容}]。
     """
+    _enforce_rate_limit()
+
     # ddgs ライブラリを優先
     results = _search_via_ddgs(query, max_results)
 
@@ -139,7 +179,7 @@ def fetch_url(url: str, max_chars: int = 6000) -> Dict[str, str]:
         {"url": str, "content": str, "type": "json"|"html"|"text", "error": str(optional)}
     """
     try:
-        resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+        resp = requests.get(url, headers=_HEADERS, timeout=WEB_SEARCH_TIMEOUT)
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         if "json" in content_type or url.endswith(".json"):

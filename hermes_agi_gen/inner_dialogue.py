@@ -11,9 +11,20 @@ AGI的観点:
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from .config import (
+    DELIBERATION_CONFIDENCE_THRESHOLD,
+    DELIBERATION_ETHICS_THRESHOLD,
+    DELIBERATION_COMPLEXITY_DIVISOR,
+    DELIBERATION_DANGEROUS_KEYWORDS,
+    DELIBERATION_COMPLEXITY_THRESHOLD,
+    DELIBERATION_HISTORY_MAX_SIZE,
+    DELIBERATION_FEEDBACK_EMA_ALPHA,
+)
 
 if TYPE_CHECKING:
     from .consciousness import GlobalWorkspace, WorkspaceSignal
@@ -112,6 +123,40 @@ class InnerDialogue:
         self.llm = llm
         self._deliberation_count = 0
         self._history: List[DeliberationResult] = []
+        self._deliberation_quality: float = 0.5  # EMA of dialogue usefulness
+
+    # ------------------------------------------------------------------
+    # フィードバックループ
+    # ------------------------------------------------------------------
+
+    def record_outcome(
+        self, goal: str, deliberation_was_used: bool, success: bool,
+    ) -> None:
+        """対話の有用性をEMAで追跡し、発動判定を自己調整する。
+
+        4パターン:
+        - 対話なし + 成功: quality変化なし（対話は不要だった）
+        - 対話あり + 成功: quality上昇（対話が役立った）
+        - 対話あり + 失敗: quality低下（対話が役立たなかった）
+        - 対話なし + 失敗: quality微上昇（対話すべきだったかも）
+        """
+        alpha = DELIBERATION_FEEDBACK_EMA_ALPHA
+
+        if not deliberation_was_used and success:
+            # 対話なしで成功 — 対話は不要だった、quality据え置き
+            return
+        elif deliberation_was_used and success:
+            signal = 1.0
+        elif deliberation_was_used and not success:
+            signal = 0.0
+        else:
+            # 対話なしで失敗 — 対話していれば成功したかも
+            signal = 1.0
+            alpha = alpha * 0.5  # 控えめに上昇
+
+        self._deliberation_quality = (
+            (1 - alpha) * self._deliberation_quality + alpha * signal
+        )
 
     # ------------------------------------------------------------------
     # 発動判定
@@ -136,17 +181,29 @@ class InnerDialogue:
         if is_self_modification:
             return True
 
+        # --- 品質に基づく閾値調整 ---
+        # 対話が有用(>0.7)なら閾値を下げて積極的に発動
+        # 対話が無用(<0.3)なら閾値を上げて控えめに
+        quality_adjustment = 0.0
+        if self._deliberation_quality > 0.7:
+            quality_adjustment = 0.1   # 閾値を緩和（発動しやすく）
+        elif self._deliberation_quality < 0.3:
+            quality_adjustment = -0.1  # 閾値を厳格化（発動しにくく）
+
+        adjusted_confidence_threshold = DELIBERATION_CONFIDENCE_THRESHOLD + quality_adjustment
+        adjusted_ethics_threshold = DELIBERATION_ETHICS_THRESHOLD - quality_adjustment
+
         # 予測確信度が低い（不確実性が高い）
-        if prediction_confidence < 0.4:
+        if prediction_confidence < adjusted_confidence_threshold:
             return True
 
         # 倫理スコアが高い（リスクがある）
-        if ethics_score > 0.5:
+        if ethics_score > adjusted_ethics_threshold:
             return True
 
         # ゴールが複雑（長い or 複数の動詞を含む）
-        goal_complexity = len(goal) / 50.0  # 50文字で1.0
-        if goal_complexity > 2.0:
+        goal_complexity = len(goal) / float(DELIBERATION_COMPLEXITY_DIVISOR)
+        if goal_complexity > DELIBERATION_COMPLEXITY_THRESHOLD:
             return True
 
         return False
@@ -193,10 +250,15 @@ class InnerDialogue:
                 confidence=min(1.0, max(0.0, strategist_response.get("consensus", 0.5))),
             ))
 
-        # 結論を構成
+        # 結論を構成 — 合意度は全ロールの確信度の平均から算出
         refined_goal = (strategist_response or {}).get("refined_goal", goal)
-        consensus = (strategist_response or {}).get("consensus", 0.5)
         should_proceed = (strategist_response or {}).get("should_proceed", True)
+
+        # 全ロールの確信度を集めて平均を合意度とする
+        role_confidences = []
+        for utt in utterances:
+            role_confidences.append(utt.confidence)
+        consensus = sum(role_confidences) / len(role_confidences) if role_confidences else 0.5
 
         key_concerns = []
         if critic_response and isinstance(critic_response.get("risks"), list):
@@ -217,8 +279,8 @@ class InnerDialogue:
 
         self._deliberation_count += 1
         self._history.append(result)
-        if len(self._history) > 50:
-            self._history = self._history[-50:]
+        if len(self._history) > DELIBERATION_HISTORY_MAX_SIZE:
+            self._history = self._history[-DELIBERATION_HISTORY_MAX_SIZE:]
 
         return result
 
@@ -230,12 +292,15 @@ class InnerDialogue:
         """特定の認知ロールにLLMで意見を生成させる。"""
         prompt = _ROLE_PROMPTS[role].format(goal=goal, context=context or "なし")
         try:
-            return self.llm.chat_json(
+            result = self.llm.chat_json(
                 [{"role": "user", "content": prompt}],
                 temperature=0.4,
                 max_tokens=512,
             )
-        except Exception:
+            if not isinstance(result, dict):
+                return None
+            return result
+        except (json.JSONDecodeError, TypeError, ValueError, KeyError, OSError):
             return None
 
     def _invoke_strategist(
@@ -250,12 +315,15 @@ class InnerDialogue:
             ethicist_opinion=ethicist_opinion,
         )
         try:
-            return self.llm.chat_json(
+            result = self.llm.chat_json(
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=512,
             )
-        except Exception:
+            if not isinstance(result, dict):
+                return None
+            return result
+        except (json.JSONDecodeError, TypeError, ValueError, KeyError, OSError):
             return None
 
     # ------------------------------------------------------------------
@@ -267,10 +335,10 @@ class InnerDialogue:
         concerns = []
         should_proceed = True
 
-        # 簡易リスク検出
-        dangerous_keywords = ["削除", "rm ", "drop", "force", "reset", "format"]
-        for kw in dangerous_keywords:
-            if kw in goal.lower():
+        # 簡易リスク検出（設定ファイルのキーワードリストを使用）
+        goal_lower = goal.lower()
+        for kw in DELIBERATION_DANGEROUS_KEYWORDS:
+            if kw in goal_lower:
                 concerns.append(f"危険なキーワード検出: {kw}")
                 should_proceed = False
 
@@ -294,5 +362,6 @@ class InnerDialogue:
             avg_consensus = sum(r.consensus_level for r in self._history) / len(self._history)
         return (
             f"[InnerDialogue] 対話回数={self._deliberation_count} "
-            f"平均合意度={avg_consensus:.0%}"
+            f"平均合意度={avg_consensus:.0%} "
+            f"対話品質={self._deliberation_quality:.0%}"
         )

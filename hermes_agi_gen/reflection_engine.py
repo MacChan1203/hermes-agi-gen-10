@@ -14,9 +14,29 @@ AGI的観点: 単に経験を記録するだけでなく、経験から「洞察
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from .config import (
+    REFLECTION_DEFAULT_INTERVAL,
+    REFLECTION_INSIGHT_SIGNATURE_LEN,
+    REFLECTION_PERSISTENT_THRESHOLD,
+    REFLECTION_MIN_GOALS_FOR_RATE,
+    REFLECTION_STRUGGLING_INTERVAL,
+    REFLECTION_SUCCESS_INTERVAL,
+    REFLECTION_STRUGGLING_RATE,
+    REFLECTION_SUCCESS_RATE,
+    REFLECTION_METRICS_SAMPLE_SIZE,
+    REFLECTION_HIGH_SUCCESS_THRESHOLD,
+    REFLECTION_FACTS_PATTERN_LIMIT,
+    REFLECTION_RESOLVED_TTL,
+    REFLECTION_RESOLVED_CLEANUP_INTERVAL,
+)
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .long_term_memory import LongTermMemory
@@ -158,13 +178,15 @@ class ReflectionEngine:
     def __init__(
         self,
         llm: Optional[Any] = None,
-        reflection_interval: int = 5,
+        reflection_interval: int = REFLECTION_DEFAULT_INTERVAL,
     ) -> None:
         self.llm = llm
         self.reflection_interval = reflection_interval
         self._goal_counter: int = 0
+        self._reflection_count: int = 0
         self._last_reflection_time: float = 0.0
         self._reflection_history: List[Dict[str, Any]] = []
+        self._resolved_issues: Dict[str, float] = {}  # signature → resolved_time
 
     # ------------------------------------------------------------------
     # Public: 省察サイクル
@@ -181,15 +203,33 @@ class ReflectionEngine:
         """
         self._goal_counter += 1
         if recent_success_rate is not None:
-            if recent_success_rate < 0.3:
-                interval = 3
-            elif recent_success_rate > 0.75:
-                interval = 8
+            if recent_success_rate < REFLECTION_STRUGGLING_RATE:
+                interval = REFLECTION_STRUGGLING_INTERVAL
+            elif recent_success_rate > REFLECTION_SUCCESS_RATE:
+                interval = REFLECTION_SUCCESS_INTERVAL
             else:
                 interval = self.reflection_interval
         else:
             interval = self.reflection_interval
         return self._goal_counter % interval == 0
+
+    def mark_resolved(self, signature: str) -> None:
+        """持続的課題を解決済みとしてマークする。"""
+        self._resolved_issues[signature] = time.time()
+
+    def _cleanup_resolved_issues(self) -> None:
+        """TTLを超過した解決済み課題エントリを削除する。"""
+        now = time.time()
+        expired = [
+            sig for sig, resolved_time in self._resolved_issues.items()
+            if now - resolved_time > REFLECTION_RESOLVED_TTL
+        ]
+        for sig in expired:
+            del self._resolved_issues[sig]
+        if expired:
+            logger.info(
+                "[ReflectionEngine] 解決済み課題を%d件クリーンアップ", len(expired)
+            )
 
     def reflect(self, ltm: "LongTermMemory") -> List[Insight]:
         """LTMを分析して洞察リストを生成する。
@@ -197,7 +237,13 @@ class ReflectionEngine:
         Returns:
             Insight のリスト
         """
-        print("[ReflectionEngine] 自己省察を開始...", flush=True)
+        self._reflection_count += 1
+
+        # 定期的に解決済み課題をクリーンアップ
+        if self._reflection_count % REFLECTION_RESOLVED_CLEANUP_INTERVAL == 0:
+            self._cleanup_resolved_issues()
+
+        logger.info("[ReflectionEngine] 自己省察を開始...")
 
         # LTMからデータを収集
         strategies = ltm.recall_strategies("", limit=20)
@@ -213,7 +259,7 @@ class ReflectionEngine:
             try:
                 llm_insights = self._llm_reflection(strategies, failures, recent_facts, ltm)
             except Exception as e:
-                print(f"[ReflectionEngine] LLM省察エラー: {e}", flush=True)
+                logger.warning("[ReflectionEngine] LLM省察エラー: %s", e)
 
         insights = rule_insights + llm_insights
 
@@ -225,9 +271,8 @@ class ReflectionEngine:
         # LTMに省察記録を保存
         self._save_reflection(ltm, insights)
 
-        print(
-            f"[ReflectionEngine] 省察完了: {len(insights)}件の洞察を生成",
-            flush=True,
+        logger.info(
+            "[ReflectionEngine] 省察完了: %d件の洞察を生成", len(insights)
         )
         return insights
 
@@ -248,7 +293,7 @@ class ReflectionEngine:
             try:
                 llm_goals = self._llm_goal_generation(insights, ltm)
             except Exception as e:
-                print(f"[ReflectionEngine] LLMゴール生成エラー: {e}", flush=True)
+                logger.warning("[ReflectionEngine] LLMゴール生成エラー: %s", e)
 
         all_goals = rule_goals + llm_goals
         # 重複排除
@@ -265,7 +310,7 @@ class ReflectionEngine:
         """AGIの成長指標を計算する。"""
         strategies = ltm.recall_strategies("", limit=100)
         failures = ltm.get_known_failures(limit=100)
-        recent = ltm.recall_recent(limit=200)
+        recent = ltm.recall_recent(limit=REFLECTION_METRICS_SAMPLE_SIZE)
 
         success_count = sum(1 for s in strategies if s.get("outcome") == "success")
         fail_count = len(failures)
@@ -312,6 +357,11 @@ class ReflectionEngine:
     # 持続的課題の検出
     # ------------------------------------------------------------------
 
+    def _normalize_signature(self, text: str) -> str:
+        """シグネチャ計算用にテキストを正規化する。"""
+        normalized = re.sub(r'\s+', ' ', text.strip())
+        return normalized[:REFLECTION_INSIGHT_SIGNATURE_LEN]
+
     def _mark_persistent_insights(
         self,
         insights: List[Insight],
@@ -321,19 +371,26 @@ class ReflectionEngine:
 
         同じ洞察が2回以上連続して現れた場合、確信度を高めてラベルを付与する。
         これにより、一度見つかったが対処されていない問題を見落とさないようにする。
+        解決済みの課題 (24時間以内に mark_resolved された) はスキップする。
         """
         recent_reflections = self.get_recent_reflections(ltm, limit=3)
-        # 過去の洞察内容の先頭30文字でシグネチャセットを構築
+        # 過去の洞察内容の正規化シグネチャでセットを構築
         past_signatures: set[str] = set()
         for record in recent_reflections:
             for past in record.get("insights", []):
-                sig = past.get("content", "")[:30]
+                sig = self._normalize_signature(past.get("content", ""))
                 if sig:
                     past_signatures.add(sig)
 
+        now = time.time()
         marked: List[Insight] = []
         for insight in insights:
-            sig = insight.content[:30]
+            sig = self._normalize_signature(insight.content)
+            # Skip if this issue was resolved less than 24h ago
+            resolved_time = self._resolved_issues.get(sig)
+            if resolved_time is not None and (now - resolved_time) < REFLECTION_RESOLVED_TTL:
+                marked.append(insight)
+                continue
             if sig in past_signatures:
                 # 繰り返し検出: 確信度を上げ、内容に「[持続的課題]」を付与
                 upgraded = Insight(
@@ -365,9 +422,9 @@ class ReflectionEngine:
         # 成功率の分析
         success_count = sum(1 for s in strategies if s.get("outcome") == "success")
         total = len(strategies)
-        if total > 0:
+        if total >= REFLECTION_MIN_GOALS_FOR_RATE:
             rate = success_count / total
-            if rate >= 0.7:
+            if rate >= REFLECTION_HIGH_SUCCESS_THRESHOLD:
                 insights.append(Insight(
                     category="strength",
                     content=f"成功率が高い ({rate:.0%}) — 戦略が効果的に機能している",
@@ -401,7 +458,7 @@ class ReflectionEngine:
                 ))
 
         # 知識ベースの成長
-        if len(facts) > 50:
+        if len(facts) > REFLECTION_FACTS_PATTERN_LIMIT:
             insights.append(Insight(
                 category="strength",
                 content=f"豊富な経験データを保有 ({len(facts)}件) — 過去の知識を活用できる",
@@ -497,30 +554,30 @@ class ReflectionEngine:
 
             if insight.category == "gap":
                 goals.append(QueuedGoal(
-                    goal=f"繰り返しエラーへの対策を調査・実装する: {insight.content[:60]}",
+                    goal=f"繰り返しエラーへの対策を調査・実装する: {insight.content[:100]}",
                     priority_score=0.7,
                     source="reflection",
-                    rationale=insight.content,
+                    rationale=f"[洞察] {insight.content} (確信度={insight.confidence:.0%}, 根拠={insight.source})",
                     domain="self_improvement",
                     estimated_value=0.8,
                     estimated_difficulty=0.5,
                 ))
             elif insight.category == "weakness":
                 goals.append(QueuedGoal(
-                    goal=f"弱点を改善するための戦略を立案する: {insight.content[:60]}",
+                    goal=f"弱点を改善するための戦略を立案する: {insight.content[:100]}",
                     priority_score=0.6,
                     source="reflection",
-                    rationale=insight.content,
+                    rationale=f"[洞察] {insight.content} (確信度={insight.confidence:.0%}, 根拠={insight.source})",
                     domain="self_improvement",
                     estimated_value=0.7,
                     estimated_difficulty=0.6,
                 ))
             elif insight.category == "opportunity":
                 goals.append(QueuedGoal(
-                    goal=f"改善機会を活かす: {insight.content[:60]}",
+                    goal=f"改善機会を活かす: {insight.content[:100]}",
                     priority_score=0.5,
                     source="reflection",
-                    rationale=insight.content,
+                    rationale=f"[洞察] {insight.content} (確信度={insight.confidence:.0%}, 根拠={insight.source})",
                     domain="general",
                     estimated_value=0.6,
                     estimated_difficulty=0.4,

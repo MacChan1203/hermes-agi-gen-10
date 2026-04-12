@@ -27,6 +27,8 @@ Hermesの認知アーキテクチャに翻訳する。
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -38,7 +40,20 @@ if TYPE_CHECKING:
     from .reflection_engine import Insight
     from .self_modifier import Patch
 
-_EXPERIMENT_DB_PATH = Path.home() / ".hermes" / "experiments.db"
+from .config import (
+    EXPERIMENT_DIVERSITY_SCALE,
+    EXPERIMENT_KNOWLEDGE_SCALE,
+    EXPERIMENT_WEIGHT_ACCURACY,
+    EXPERIMENT_WEIGHT_BREADTH,
+    EXPERIMENT_WEIGHT_DIVERSITY,
+    EXPERIMENT_WEIGHT_SUCCESS,
+)
+
+logger = logging.getLogger(__name__)
+
+from .hermes_constants import get_hermes_home
+
+_EXPERIMENT_DB_PATH = get_hermes_home() / "experiments.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (
@@ -108,10 +123,10 @@ class ExperimentMetrics:
         Hermes では「高いほど良い」方向で統一する。
         """
         return (
-            self.success_rate * 0.45
-            + self.prediction_accuracy * 0.35
-            + min(1.0, self.knowledge_breadth / 100) * 0.10
-            + min(1.0, self.strategy_diversity / 20) * 0.10
+            self.success_rate * EXPERIMENT_WEIGHT_SUCCESS
+            + self.prediction_accuracy * EXPERIMENT_WEIGHT_ACCURACY
+            + min(1.0, self.knowledge_breadth / EXPERIMENT_KNOWLEDGE_SCALE) * EXPERIMENT_WEIGHT_BREADTH
+            + min(1.0, self.strategy_diversity / EXPERIMENT_DIVERSITY_SCALE) * EXPERIMENT_WEIGHT_DIVERSITY
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -217,18 +232,16 @@ class ExperimentRunner:
         start_time = time.time()
         self._experiment_count += 1
 
-        print(
-            f"\n[ExperimentRunner] 実験 #{self._experiment_count} 開始",
-            flush=True,
+        logger.info(
+            f"[ExperimentRunner] 実験 #{self._experiment_count} 開始"
         )
-        print(
-            f"  洞察: [{insight.category}] {insight.content[:80]}",
-            flush=True,
+        logger.info(
+            f"  洞察: [{insight.category}] {insight.content[:80]}"
         )
 
         # ── フェーズ1: ベースラインメトリクス計測 ──
         metrics_before = self._compute_current_metrics()
-        print(f"  ベースライン: {metrics_before.summary()}", flush=True)
+        logger.info(f"  ベースライン: {metrics_before.summary()}")
 
         # タイムアウトチェック用ヘルパー
         def timed_out() -> bool:
@@ -238,18 +251,18 @@ class ExperimentRunner:
         patch = self._propose_patch_for_insight(insight)
 
         if patch is None:
-            print("  パッチ提案なし — 実験スキップ", flush=True)
+            logger.info("  パッチ提案なし — 実験スキップ")
             return self._make_result(
                 insight, None, metrics_before, metrics_before,
                 accepted=False, test_passed=False,
                 start_time=start_time,
             )
 
-        print(f"  パッチ提案: {patch.file_path} — {patch.rationale[:60]}", flush=True)
+        logger.info(f"  パッチ提案: {patch.file_path} — {patch.rationale[:60]}")
 
         # ── フェーズ3: パッチ適用 ──
         if timed_out():
-            print("  タイムアウト — パッチ適用をスキップ", flush=True)
+            logger.warning("  タイムアウト — パッチ適用をスキップ")
             return self._make_result(
                 insight, patch, metrics_before, metrics_before,
                 accepted=False, test_passed=False,
@@ -258,7 +271,17 @@ class ExperimentRunner:
 
         applied = self.agi_core.self_modifier.apply_patch(patch)
         if not applied:
-            print("  パッチ適用失敗", flush=True)
+            logger.warning("  パッチ適用失敗")
+            return self._make_result(
+                insight, patch, metrics_before, metrics_before,
+                accepted=False, test_passed=False,
+                start_time=start_time,
+            )
+
+        # Periodic timeout check after patch application
+        if timed_out():
+            self.agi_core.self_modifier.rollback(patch)
+            logger.warning("  タイムアウト（パッチ適用後）— ロールバック")
             return self._make_result(
                 insight, patch, metrics_before, metrics_before,
                 accepted=False, test_passed=False,
@@ -268,7 +291,7 @@ class ExperimentRunner:
         # ── フェーズ4: テスト実行 ──
         if timed_out():
             self.agi_core.self_modifier.rollback(patch)
-            print("  タイムアウト — ロールバック", flush=True)
+            logger.warning("  タイムアウト — ロールバック")
             return self._make_result(
                 insight, patch, metrics_before, metrics_before,
                 accepted=False, test_passed=False,
@@ -276,10 +299,20 @@ class ExperimentRunner:
             )
 
         test_result = self.agi_core.self_modifier.run_tests()
-        print(
+
+        # Periodic timeout check after test execution
+        if timed_out():
+            self.agi_core.self_modifier.rollback(patch)
+            logger.warning("  タイムアウト（テスト後）— ロールバック")
+            return self._make_result(
+                insight, patch, metrics_before, metrics_before,
+                accepted=False, test_passed=False,
+                start_time=start_time,
+            )
+
+        logger.info(
             f"  テスト: {'✓ パス' if test_result.passed else '✗ 失敗'} "
-            f"({test_result.duration:.1f}秒)",
-            flush=True,
+            f"({test_result.duration:.1f}秒)"
         )
 
         if not test_result.passed:
@@ -292,11 +325,20 @@ class ExperimentRunner:
             )
 
         # ── フェーズ5: パッチ後メトリクス計測 ──
+        if timed_out():
+            self.agi_core.self_modifier.rollback(patch)
+            logger.warning("  タイムアウト（メトリクス計測前）— ロールバック")
+            return self._make_result(
+                insight, patch, metrics_before, metrics_before,
+                accepted=False, test_passed=True,
+                start_time=start_time,
+            )
+
         metrics_after = self._compute_current_metrics()
         improvement = metrics_after.score() - metrics_before.score()
 
-        print(f"  パッチ後:  {metrics_after.summary()}", flush=True)
-        print(f"  改善度:    {improvement:+.3f}", flush=True)
+        logger.info(f"  パッチ後:  {metrics_after.summary()}")
+        logger.info(f"  改善度:    {improvement:+.3f}")
 
         # ── フェーズ6: 受容判定 ──
         # AutoResearchと同様: スコアが改善 (または横ばい) なら採用
@@ -304,17 +346,17 @@ class ExperimentRunner:
 
         if accepted:
             self._record_success_to_ltm(insight, patch, improvement)
-            print(f"  ✓ 採用 — {patch.file_path} を更新", flush=True)
+            logger.info(f"  ✓ 採用 — {patch.file_path} を更新")
         else:
             self.agi_core.self_modifier.rollback(patch)
-            print(f"  ✗ ロールバック — スコア改善なし ({improvement:+.3f})", flush=True)
+            logger.warning(f"  ✗ ロールバック — スコア改善なし ({improvement:+.3f})")
 
         result = self._make_result(
             insight, patch, metrics_before, metrics_after,
             accepted=accepted, test_passed=True,
             start_time=start_time,
         )
-        print(result.summary(), flush=True)
+        logger.info(result.summary())
         return result
 
     def run_experiments_from_insights(
@@ -346,13 +388,12 @@ class ExperimentRunner:
         )[:max_experiments]
 
         if not candidates:
-            print("[ExperimentRunner] 実験対象の洞察なし", flush=True)
+            logger.info("[ExperimentRunner] 実験対象の洞察なし")
             return []
 
-        print(
-            f"\n[ExperimentRunner] {len(candidates)} 件の洞察で実験開始 "
-            f"(最大 {self.experiment_timeout}秒/実験)",
-            flush=True,
+        logger.info(
+            f"[ExperimentRunner] {len(candidates)} 件の洞察で実験開始 "
+            f"(最大 {self.experiment_timeout}秒/実験)"
         )
 
         results: List[ExperimentResult] = []
@@ -361,9 +402,8 @@ class ExperimentRunner:
             results.append(result)
 
         accepted_count = sum(1 for r in results if r.accepted)
-        print(
-            f"\n[ExperimentRunner] 実験完了: {len(results)}件実行 / {accepted_count}件採用",
-            flush=True,
+        logger.info(
+            f"[ExperimentRunner] 実験完了: {len(results)}件実行 / {accepted_count}件採用"
         )
         return results
 
@@ -445,13 +485,24 @@ class ExperimentRunner:
 
         AutoResearchでいう「エージェントが train.py のどこを変えるか」の決定に相当。
         """
-        # ターゲットファイルの決定
+        # ターゲットファイルの決定 (word-boundary matching)
         target = "hermes_agi_gen/self_improvement.py"  # デフォルト
-        content_lower = insight.content.lower()
+        content_normalized = insight.content.lower()
         for keyword, filepath in _INSIGHT_TO_TARGET.items():
-            if keyword.lower() in content_lower:
-                target = filepath
-                break
+            keyword_lower = keyword.lower()
+            # Use word-boundary matching to avoid substring false positives
+            # For CJK characters, simple 'in' is used since \b doesn't work for them
+            if any(ord(c) > 0x2FFF for c in keyword_lower):
+                # CJK keyword: substring match is appropriate
+                if keyword_lower in content_normalized:
+                    target = filepath
+                    break
+            else:
+                # ASCII/Latin keyword: use word-boundary regex
+                pattern = r'\b' + re.escape(keyword_lower) + r'\b'
+                if re.search(pattern, content_normalized):
+                    target = filepath
+                    break
 
         # SelfModifierへの分析文を構築
         analysis = (
@@ -468,7 +519,7 @@ class ExperimentRunner:
             f"保守的かつ具体的な変更のみ提案してください。"
         )
 
-        print(f"  ターゲット: {target}", flush=True)
+        logger.info(f"  ターゲット: {target}")
         return self.agi_core.self_modifier.propose_change(target, analysis)
 
     # ------------------------------------------------------------------

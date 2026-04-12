@@ -9,22 +9,293 @@
 """
 from __future__ import annotations
 
+import ast
+import math
+import operator
 import subprocess
 import sys
 import textwrap
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+try:
+    from typing import TypedDict
+except ImportError:
+    from typing_extensions import TypedDict
+
+
+class ExecutorResult(TypedDict, total=False):
+    """Executor の全メソッドが返す統一結果型。"""
+    ok: bool
+    stdout: str
+    stderr: str
+    returncode: int
+    command: Optional[str]
+    _cost: Dict[str, Any]  # tool_type, time
+
+from .config import (
+    EXECUTOR_MAX_OUTPUT,
+    EXECUTOR_SHELL_TIMEOUT,
+    EXECUTOR_PYTHON_TIMEOUT,
+    EXECUTOR_MAX_WRITE_SIZE,
+)
 from .memory import remember_successful_command, set_environment_info
 from .agent_state import AgentState
 from .world_model import WorldModel
 from .tool_registry import ToolRegistry
 
-_MAX_OUTPUT = 8000   # stdout/stderr の最大文字数
-_PY_TIMEOUT = 90     # Python 実行タイムアウト (秒)
-_SH_TIMEOUT = 30     # シェル実行タイムアウト (秒)
+# --- Module-level compiled regex patterns ---
+_RE_TILDE = re.compile(r'(?<![a-zA-Z0-9_])~(?=/|$| )')
+_RE_CMD_SUBSTITUTION = re.compile(r'\$\(')
+
+# Python sandbox: 許可リスト方式
+# インポート可能なモジュール (安全と判断されたもののみ)
+_ALLOWED_IMPORT_MODULES = frozenset({
+    "json", "math", "re", "string", "textwrap", "collections",
+    "itertools", "functools", "operator", "copy", "pprint",
+    "datetime", "time", "calendar", "decimal", "fractions",
+    "statistics", "random", "hashlib", "hmac", "base64",
+    "csv", "io", "enum", "dataclasses", "typing", "abc",
+    "unicodedata", "difflib", "bisect", "heapq",
+})
+
+# 許可する組み込み関数呼び出し
+_ALLOWED_BUILTINS = frozenset({
+    "print", "len", "range", "enumerate", "zip", "map", "filter",
+    "sorted", "reversed", "list", "dict", "set", "tuple", "frozenset",
+    "str", "int", "float", "bool", "complex", "bytes", "bytearray",
+    "type", "isinstance", "issubclass", "hasattr",
+    "abs", "round", "min", "max", "sum", "pow", "divmod",
+    "any", "all", "hex", "oct", "bin", "ord", "chr", "repr",
+    "format", "hash", "id", "input", "iter", "next",
+    "open",  # open は別途モード検査で制御
+})
+
+# 禁止する dunder 属性アクセス
+_DANGEROUS_ATTRS = frozenset({
+    "__class__", "__bases__", "__subclasses__", "__mro__",
+    "__globals__", "__builtins__", "__code__", "__import__",
+    "__qualname__", "__module__", "__dict__",
+})
+
+
+# --- Safe math expression evaluator (replaces eval for CALC) ---
+class _SafeMathEvaluator(ast.NodeVisitor):
+    """AST-based evaluator that only allows numeric literals, basic operators,
+    and a whitelist of math functions."""
+
+    _ALLOWED_FUNCS: dict = {
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "asin": math.asin, "acos": math.acos, "atan": math.atan,
+        "atan2": math.atan2,
+        "sqrt": math.sqrt, "log": math.log, "log2": math.log2,
+        "log10": math.log10, "exp": math.exp,
+        "ceil": math.ceil, "floor": math.floor,
+        "degrees": math.degrees, "radians": math.radians,
+        "factorial": math.factorial, "gcd": math.gcd,
+        "abs": abs, "round": round, "min": min, "max": max,
+        "sum": sum, "pow": pow, "int": int, "float": float,
+        "len": len, "range": range, "list": list, "divmod": divmod,
+    }
+
+    _ALLOWED_CONSTANTS: dict = {
+        "pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf,
+        "True": True, "False": False,
+    }
+
+    _BIN_OPS = {
+        ast.Add: operator.add, ast.Sub: operator.sub,
+        ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+        ast.Pow: operator.pow, ast.BitAnd: operator.and_,
+        ast.BitOr: operator.or_, ast.BitXor: operator.xor,
+        ast.LShift: operator.lshift, ast.RShift: operator.rshift,
+    }
+
+    _UNARY_OPS = {
+        ast.UAdd: operator.pos, ast.USub: operator.neg,
+        ast.Invert: operator.invert,
+    }
+
+    _CMP_OPS = {
+        ast.Eq: operator.eq, ast.NotEq: operator.ne,
+        ast.Lt: operator.lt, ast.LtE: operator.le,
+        ast.Gt: operator.gt, ast.GtE: operator.ge,
+    }
+
+    def evaluate(self, expr: str) -> Any:
+        tree = ast.parse(expr, mode="eval")
+        return self.visit(tree.body)
+
+    def visit_Expression(self, node: ast.Expression) -> Any:
+        return self.visit(node.body)
+
+    def visit_Constant(self, node: ast.Constant) -> Any:
+        if isinstance(node.value, (int, float, complex, bool)):
+            return node.value
+        raise ValueError(f"許可されていないリテラル: {node.value!r}")
+
+    def visit_Num(self, node: ast.Num) -> Any:  # Python 3.7 compat
+        return node.n
+
+    def visit_Name(self, node: ast.Name) -> Any:
+        if node.id in self._ALLOWED_CONSTANTS:
+            return self._ALLOWED_CONSTANTS[node.id]
+        raise ValueError(f"許可されていない名前: {node.id}")
+
+    def visit_BinOp(self, node: ast.BinOp) -> Any:
+        op = self._BIN_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"許可されていない演算子: {type(node.op).__name__}")
+        return op(self.visit(node.left), self.visit(node.right))
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
+        op = self._UNARY_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"許可されていない単項演算子: {type(node.op).__name__}")
+        return op(self.visit(node.operand))
+
+    def visit_Compare(self, node: ast.Compare) -> Any:
+        left = self.visit(node.left)
+        for op_node, comparator in zip(node.ops, node.comparators):
+            op = self._CMP_OPS.get(type(op_node))
+            if op is None:
+                raise ValueError(f"許可されていない比較演算子: {type(op_node).__name__}")
+            right = self.visit(comparator)
+            if not op(left, right):
+                return False
+            left = right
+        return True
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> Any:
+        if isinstance(node.op, ast.And):
+            result = True
+            for val in node.values:
+                result = self.visit(val)
+                if not result:
+                    return result
+            return result
+        elif isinstance(node.op, ast.Or):
+            result = False
+            for val in node.values:
+                result = self.visit(val)
+                if result:
+                    return result
+            return result
+        raise ValueError(f"許可されていないブール演算子: {type(node.op).__name__}")
+
+    def visit_IfExp(self, node: ast.IfExp) -> Any:
+        if self.visit(node.test):
+            return self.visit(node.body)
+        return self.visit(node.orelse)
+
+    def visit_Call(self, node: ast.Call) -> Any:
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("メソッド呼び出しは許可されていません")
+        func_name = node.func.id
+        if func_name not in self._ALLOWED_FUNCS:
+            raise ValueError(f"許可されていない関数: {func_name}")
+        func = self._ALLOWED_FUNCS[func_name]
+        args = [self.visit(a) for a in node.args]
+        return func(*args)
+
+    def visit_List(self, node: ast.List) -> Any:
+        return [self.visit(elt) for elt in node.elts]
+
+    def visit_Tuple(self, node: ast.Tuple) -> Any:
+        return tuple(self.visit(elt) for elt in node.elts)
+
+    def generic_visit(self, node: ast.AST) -> Any:
+        raise ValueError(f"許可されていない構文: {type(node).__name__}")
+
+
+_safe_math_evaluator = _SafeMathEvaluator()
+
+
+# --- AST-based Python safety checker (allowlist approach) ---
+def _is_python_safe(code: str) -> tuple[bool, str]:
+    """許可リスト方式で Python コードの安全性を検証する。
+
+    - インポートは _ALLOWED_IMPORT_MODULES のみ許可
+    - 関数呼び出しは _ALLOWED_BUILTINS + ユーザー定義関数のみ許可
+    - dunder 属性アクセスは全面禁止
+    - open() は読み取りモードのみ許可
+
+    Returns (True, "") if safe, or (False, reason) if dangerous.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return True, ""
+
+    # ユーザー定義の関数・クラス名を収集 (呼び出し許可用)
+    _user_defined: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _user_defined.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            _user_defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    _user_defined.add(target.id)
+
+    for node in ast.walk(tree):
+        # --- インポート: 許可リストのみ通す ---
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top not in _ALLOWED_IMPORT_MODULES:
+                    return False, "blocked by security policy"
+
+        elif isinstance(node, ast.ImportFrom):
+            # 相対インポート (from . import X) は全面禁止
+            if node.module is None:
+                return False, "blocked by security policy"
+            top = node.module.split(".")[0]
+            if top not in _ALLOWED_IMPORT_MODULES:
+                return False, "blocked by security policy"
+            # from X import * は禁止
+            if any(alias.name == "*" for alias in node.names):
+                return False, "blocked by security policy"
+
+        # --- 関数呼び出し: 許可リスト + ユーザー定義のみ ---
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                name = func.id
+                if name == "open":
+                    # open() は読み取りモードのみ許可
+                    is_read = False
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                        mode = node.args[1].value
+                        if isinstance(mode, str) and set(mode) <= {"r", "b", "t"}:
+                            is_read = True
+                    for kw in node.keywords:
+                        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                            mode = kw.value.value
+                            if isinstance(mode, str) and set(mode) <= {"r", "b", "t"}:
+                                is_read = True
+                    if not is_read:
+                        return False, "blocked by security policy"
+                elif name not in _ALLOWED_BUILTINS and name not in _user_defined:
+                    return False, "blocked by security policy"
+            # メソッド呼び出し (.method()) — 属性部分を検査
+            elif isinstance(func, ast.Attribute):
+                if func.attr.startswith("__") and func.attr.endswith("__"):
+                    return False, "blocked by security policy"
+
+        # --- dunder 属性アクセス: 全面禁止 ---
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _DANGEROUS_ATTRS:
+                return False, "blocked by security policy"
+            # 未知の dunder も禁止 (安全側に倒す)
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return False, "blocked by security policy"
+
+    return True, ""
 
 
 class Executor:
@@ -36,7 +307,7 @@ class Executor:
     # Public
     # ------------------------------------------------------------------
 
-    def execute(self, step: str, state: AgentState) -> Dict[str, Any]:
+    def execute(self, step: str, state: AgentState) -> ExecutorResult:
         """ステップ文字列を解析して対応ツールを呼び出す。"""
         import time as _time
         _exec_start = _time.time()
@@ -52,7 +323,7 @@ class Executor:
             state.working_memory["last_world_prediction"] = prediction
 
         # Gen 9: 実行結果にコスト記録を付加するヘルパー
-        def _record_cost(result: Dict[str, Any], tool_type: str) -> Dict[str, Any]:
+        def _record_cost(result: ExecutorResult, tool_type: str) -> ExecutorResult:
             elapsed = _time.time() - _exec_start
             output_size = len(result.get("stdout", ""))
             state.world_model.record_resource_cost(
@@ -137,16 +408,16 @@ class Executor:
     # ------------------------------------------------------------------
 
     # パイプ後に許可する安全な読み取り専用コマンド
+    # awk / sed は除外 — 任意コード実行が可能なため
     _SAFE_PIPE_CMDS = frozenset([
-        "head", "tail", "sort", "grep", "uniq", "wc", "cut", "awk",
-        "tr", "less", "cat", "tee", "nl", "sed", "fmt", "column",
+        "grep", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "tee", "cat",
     ])
 
-    def _run_shell(self, cmd: str, state: AgentState) -> Dict[str, Any]:
+    def _run_shell(self, cmd: str, state: AgentState) -> ExecutorResult:
         # ~ をホームディレクトリに展開 (shlex.split はチルダを展開しないため)
         import os as _os
         _home = _os.path.expanduser("~")
-        cmd = re.sub(r'(?<![a-zA-Z0-9_])~(?=/|$| )', _home, cmd)
+        cmd = _RE_TILDE.sub(_home, cmd)
 
         # セキュリティ: 危険なコマンドチェインを禁止 (VULN-001)
         # `;` `&&` `||` バックティック `$()` は完全禁止
@@ -156,59 +427,106 @@ class Executor:
             return {
                 "ok": False,
                 "stdout": "",
-                "stderr": f"セキュリティ制限: 危険なコマンドチェイン (; && || `) は使用できません。",
+                "stderr": "セキュリティ制限: blocked by security policy",
                 "returncode": 1,
-                "command": cmd
+                "command": None
             }
         # $() コマンド置換を禁止
-        if re.search(r'\$\(', cmd):
+        if _RE_CMD_SUBSTITUTION.search(cmd):
             return {
                 "ok": False,
                 "stdout": "",
-                "stderr": "セキュリティ制限: $() コマンド置換は使用できません。",
+                "stderr": "セキュリティ制限: blocked by security policy",
                 "returncode": 1,
-                "command": cmd
+                "command": None
             }
-        # パイプを含む場合: shell=True で実行 (パイプ後コマンドが安全リストにあるか確認)
+        # パイプを含む場合: shell=True を使わず、subprocess でパイプチェーンを構築
         _has_pipe = "|" in cmd
         if _has_pipe:
-            _pipe_parts = [p.strip().split()[0] for p in cmd.split("|")[1:] if p.strip()]
-            _unsafe_parts = [p for p in _pipe_parts if p not in self._SAFE_PIPE_CMDS]
-            if _unsafe_parts:
-                return {
-                    "ok": False,
-                    "stdout": "",
-                    "stderr": f"セキュリティ制限: パイプ後のコマンド {_unsafe_parts} は許可されていません。",
-                    "returncode": 1,
-                    "command": cmd
-                }
+            _pipe_segments = [s.strip() for s in cmd.split("|")]
+            # 先頭以外のコマンドが安全リストにあるか確認
+            for seg in _pipe_segments[1:]:
+                if not seg:
+                    continue
+                try:
+                    tokens = shlex.split(seg)
+                except ValueError:
+                    tokens = seg.split()
+                if not tokens:
+                    continue
+                # コマンド名のみ (パスは basename で判定)
+                import os as _os_inner
+                cmd_name = _os_inner.path.basename(tokens[0])
+                if cmd_name not in self._SAFE_PIPE_CMDS:
+                    return {
+                        "ok": False,
+                        "stdout": "",
+                        "stderr": "セキュリティ制限: blocked by security policy",
+                        "returncode": 1,
+                        "command": None
+                    }
 
         try:
             if _has_pipe:
-                # パイプがある場合は shell=True で実行
-                proc = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    cwd=str(self.repo_root),
-                    timeout=_SH_TIMEOUT,
-                )
+                # shell=True を使わないパイプ実装
+                _pipe_segments = [s.strip() for s in cmd.split("|")]
+                prev_proc = None
+                procs = []
+                for i, seg in enumerate(_pipe_segments):
+                    try:
+                        args = shlex.split(seg)
+                    except ValueError:
+                        args = seg.split()
+                    stdin = prev_proc.stdout if prev_proc else None
+                    p = subprocess.Popen(
+                        args,
+                        stdin=stdin,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        cwd=str(self.repo_root),
+                    )
+                    if prev_proc and prev_proc.stdout:
+                        prev_proc.stdout.close()
+                    procs.append(p)
+                    prev_proc = p
+                # 最終プロセスの出力を取得
+                last = procs[-1]
+                try:
+                    stdout_data, stderr_data = last.communicate(timeout=EXECUTOR_SHELL_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    for p in procs:
+                        p.kill()
+                    last.communicate()
+                    return {"ok": False, "stdout": "", "stderr": "タイムアウト", "returncode": -1, "command": None}
+                # 先行プロセスを待機
+                for p in procs[:-1]:
+                    p.wait()
+                proc_returncode = last.returncode
+                proc_stdout = stdout_data or ""
+                proc_stderr = stderr_data or ""
+                # proc 互換オブジェクトを作成
+                class _PipeResult:
+                    pass
+                proc = _PipeResult()
+                proc.returncode = proc_returncode
+                proc.stdout = proc_stdout
+                proc.stderr = proc_stderr
             else:
                 proc = subprocess.run(
-                    shlex.split(cmd),  # shlex.splitでクォートやスペースを正しく処理
+                    shlex.split(cmd),
                     capture_output=True,
                     text=True,
                     cwd=str(self.repo_root),
-                    timeout=_SH_TIMEOUT,
+                    timeout=EXECUTOR_SHELL_TIMEOUT,
                 )
         except ValueError as e:
-            return {"ok": False, "stdout": "", "stderr": f"コマンド解析エラー: {e}", "returncode": -1, "command": cmd}
+            return {"ok": False, "stdout": "", "stderr": f"コマンド解析エラー: {e}", "returncode": -1, "command": None}
         except Exception as e:
-            return {"ok": False, "stdout": "", "stderr": f"実行エラー: {e}", "returncode": -1, "command": cmd}
+            return {"ok": False, "stdout": "", "stderr": f"実行エラー: {e}", "returncode": -1, "command": None}
 
-        stdout = (proc.stdout or "")[:_MAX_OUTPUT]
-        stderr = (proc.stderr or "")[:_MAX_OUTPUT]
+        stdout = (proc.stdout or "")[:EXECUTOR_MAX_OUTPUT]
+        stderr = (proc.stderr or "")[:EXECUTOR_MAX_OUTPUT]
 
         if proc.returncode == 0:
             remember_successful_command(state, cmd)
@@ -234,47 +552,23 @@ class Executor:
         return {"ok": proc.returncode == 0, "stdout": stdout, "stderr": stderr, "returncode": proc.returncode, "command": cmd}
 
     # ------------------------------------------------------------------
-    # CALC: 数式計算
+    # CALC: 数式計算 (AST-based safe evaluator, no eval())
     # ------------------------------------------------------------------
 
-    _CALC_NS: dict = {}  # クラス変数として遅延初期化
-
-    @staticmethod
-    def _build_calc_ns() -> dict:
-        import math
-        return {
-            "__builtins__": {},
-            # 組み込み
-            "abs": abs, "round": round, "min": min, "max": max,
-            "sum": sum, "pow": pow, "divmod": divmod, "len": len,
-            "range": range, "list": list, "int": int, "float": float,
-            # math
-            "sqrt": math.sqrt, "ceil": math.ceil, "floor": math.floor,
-            "log": math.log, "log2": math.log2, "log10": math.log10,
-            "exp": math.exp,
-            "sin": math.sin, "cos": math.cos, "tan": math.tan,
-            "asin": math.asin, "acos": math.acos, "atan": math.atan,
-            "atan2": math.atan2,
-            "degrees": math.degrees, "radians": math.radians,
-            "factorial": math.factorial, "gcd": math.gcd,
-            "pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf,
-        }
-
-    def _run_calc(self, expr: str, state: AgentState) -> Dict[str, Any]:
-        # セキュリティ: eval() エスケープを防止 (VULN-004)
-        if "__" in expr or "." in expr:
-            return {
-                "ok": False,
-                "stdout": "",
-                "stderr": "セキュリティ制限: 式に禁止文字 (__ または .) が含まれています。",
-                "returncode": 1,
-                "command": f"CALC: {expr}"
-            }
-
-        if not Executor._CALC_NS:
-            Executor._CALC_NS = self._build_calc_ns()
+    def _run_calc(self, expr: str, state: AgentState) -> ExecutorResult:
+        # First try ast.literal_eval for simple numeric expressions
         try:
-            result = eval(expr, Executor._CALC_NS)  # noqa: S307
+            result = ast.literal_eval(expr)
+            if isinstance(result, (int, float, complex, bool, list, tuple)):
+                text = f"{expr} = {result}"
+                remember_successful_command(state, f"CALC: {expr[:60]}")
+                return {"ok": True, "stdout": text, "stderr": "", "returncode": 0, "command": f"CALC: {expr}"}
+        except (ValueError, SyntaxError):
+            pass
+
+        # Fall back to safe AST-based math evaluator
+        try:
+            result = _safe_math_evaluator.evaluate(expr)
             text = f"{expr} = {result}"
             remember_successful_command(state, f"CALC: {expr[:60]}")
             return {"ok": True, "stdout": text, "stderr": "", "returncode": 0, "command": f"CALC: {expr}"}
@@ -286,7 +580,7 @@ class Executor:
     # SEARCH: ウェブ検索
     # ------------------------------------------------------------------
 
-    def _run_search(self, query: str, state: AgentState) -> Dict[str, Any]:
+    def _run_search(self, query: str, state: AgentState) -> ExecutorResult:
         from .web_search import format_results, search
 
         results = search(query, max_results=5)
@@ -310,7 +604,7 @@ class Executor:
     # FETCH: URL コンテンツ取得
     # ------------------------------------------------------------------
 
-    def _run_fetch(self, url: str, state: AgentState) -> Dict[str, Any]:
+    def _run_fetch(self, url: str, state: AgentState) -> ExecutorResult:
         from .web_search import fetch_url
 
         result = fetch_url(url)
@@ -334,19 +628,20 @@ class Executor:
     # READ: ファイル読み込み
     # ------------------------------------------------------------------
 
-    def _read_file(self, filepath: str, state: AgentState) -> Dict[str, Any]:
+    def _read_file(self, filepath: str, state: AgentState) -> ExecutorResult:
         path = (self.repo_root / filepath).resolve()
-        # セキュリティ: repo_root の外は読まない
+        # セキュリティ: repo_root の外は読まない (symlink を追跡した後に検証)
+        resolved_root = self.repo_root.resolve()
         try:
-            path.relative_to(self.repo_root)
+            path.resolve().relative_to(resolved_root)
         except ValueError:
-            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: {filepath} はリポジトリ外です", "returncode": 1, "command": f"READ: {filepath}"}
+            return {"ok": False, "stdout": "", "stderr": "アクセス拒否: blocked by security policy", "returncode": 1, "command": None}
 
         if not path.exists():
             return {"ok": False, "stdout": "", "stderr": f"ファイルが見つかりません: {filepath}", "returncode": 1, "command": f"READ: {filepath}"}
 
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")[:_MAX_OUTPUT]
+            content = path.read_text(encoding="utf-8", errors="replace")[:EXECUTOR_MAX_OUTPUT]
             remember_successful_command(state, f"READ: {filepath}")
             return {"ok": True, "stdout": content, "stderr": "", "returncode": 0, "command": f"READ: {filepath}"}
         except Exception as e:
@@ -356,7 +651,7 @@ class Executor:
     # WRITE: ファイル書き込み
     # ------------------------------------------------------------------
 
-    def _write_file(self, spec: str, state: AgentState) -> Dict[str, Any]:
+    def _write_file(self, spec: str, state: AgentState) -> ExecutorResult:
         """フォーマット: <filepath>\n<content>\n[EOF]"""
         lines = spec.strip().splitlines()
         if not lines:
@@ -369,26 +664,38 @@ class Executor:
             content_lines = content_lines[:-1]
         content = "\n".join(content_lines)
 
+        # サイズ制限チェック
+        if len(content.encode("utf-8")) > EXECUTOR_MAX_WRITE_SIZE:
+            return {
+                "ok": False, "stdout": "",
+                "stderr": f"セキュリティ制限: 書き込みサイズが上限 ({EXECUTOR_MAX_WRITE_SIZE} bytes) を超えています",
+                "returncode": 1, "command": None,
+            }
+
         # パス解決: ~/... は絶対パスに展開、それ以外は repo_root 基準
         home = Path.home()
         expanded = filepath.replace("~", str(home), 1) if filepath.startswith("~") else filepath
         path = Path(expanded).resolve() if Path(expanded).is_absolute() else (self.repo_root / expanded).resolve()
 
-        # セキュリティ: repo_root 内 または ホームディレクトリ内のみ許可。システムパスは禁止
+        # セキュリティ: symlink を追跡した後の正規パスで検証
+        resolved_path = path.resolve()
+        resolved_root = self.repo_root.resolve()
+        resolved_home = home.resolve()
+
         allowed = False
         try:
-            path.relative_to(self.repo_root)
+            resolved_path.relative_to(resolved_root)
             allowed = True
         except ValueError:
             pass
         if not allowed:
             try:
-                path.relative_to(home)
+                resolved_path.relative_to(resolved_home)
                 allowed = True
             except ValueError:
                 pass
         if not allowed:
-            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: {filepath} はホームディレクトリ外です", "returncode": 1, "command": f"WRITE: {filepath}"}
+            return {"ok": False, "stdout": "", "stderr": "アクセス拒否: blocked by security policy", "returncode": 1, "command": None}
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -402,24 +709,20 @@ class Executor:
     # PYTHON: Python コード実行
     # ------------------------------------------------------------------
 
-    def _run_python(self, code: str, state: AgentState) -> Dict[str, Any]:
-        # セキュリティ: 危険なインポートを禁止 (VULN-002)
-        dangerous_patterns = [
-            r"import\s+os", r"from\s+os",
-            r"import\s+subprocess", r"from\s+subprocess",
-            r"import\s+sys", r"from\s+sys",
-            r"import\s+shutil", r"from\s+shutil",
-            r"eval\(", r"exec\(", r"__import__"
-        ]
-        for pattern in dangerous_patterns:
-            if re.search(pattern, code):
-                return {
-                    "ok": False,
-                    "stdout": "",
-                    "stderr": f"セキュリティ制限: 禁止されたコードパターンが検出されました ({pattern})",
-                    "returncode": 1,
-                    "command": "PYTHON:"
-                }
+    def _run_python(self, code: str, state: AgentState) -> ExecutorResult:
+        # Primary gate: AST-based analysis
+        is_safe, reason = _is_python_safe(code)
+        if not is_safe:
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": f"セキュリティ制限: {reason}",
+                "returncode": 1,
+                "command": "PYTHON:"
+            }
+
+        # Note: AST-based allowlist (_is_python_safe) が主ゲート。
+        # 旧ブロックリスト方式 (_PY_DANGER_PATTERNS) は許可リスト方式に置換済みのため削除。
 
         try:
             proc = subprocess.run(
@@ -427,13 +730,13 @@ class Executor:
                 capture_output=True,
                 text=True,
                 cwd=str(self.repo_root),
-                timeout=_PY_TIMEOUT,
+                timeout=EXECUTOR_PYTHON_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            return {"ok": False, "stdout": "", "stderr": f"Python タイムアウト ({_PY_TIMEOUT}秒)", "returncode": -1, "command": "PYTHON:"}
+            return {"ok": False, "stdout": "", "stderr": f"Python タイムアウト ({EXECUTOR_PYTHON_TIMEOUT}秒)", "returncode": -1, "command": "PYTHON:"}
 
-        stdout = (proc.stdout or "")[:_MAX_OUTPUT]
-        stderr = (proc.stderr or "")[:_MAX_OUTPUT]
+        stdout = (proc.stdout or "")[:EXECUTOR_MAX_OUTPUT]
+        stderr = (proc.stderr or "")[:EXECUTOR_MAX_OUTPUT]
 
         if proc.returncode == 0:
             remember_successful_command(state, f"PYTHON: {code[:60]}")
@@ -444,7 +747,7 @@ class Executor:
     # SCHEDULE: GoalQueueにゴールを追加
     # ------------------------------------------------------------------
 
-    def _schedule_goal(self, args: str, state: AgentState) -> Dict[str, Any]:
+    def _schedule_goal(self, args: str, state: AgentState) -> ExecutorResult:
         """SCHEDULE: <goal> でGoalQueueに目標を追加する。デーモンが自動処理する。
 
         書式:
@@ -490,7 +793,7 @@ class Executor:
     # SCHEDULE_AT: 時刻指定スケジュール
     # ------------------------------------------------------------------
 
-    def _schedule_at(self, args: str, state: AgentState) -> Dict[str, Any]:
+    def _schedule_at(self, args: str, state: AgentState) -> ExecutorResult:
         """SCHEDULE_AT: <trigger> <goal> で時刻指定スケジュールを登録する。
 
         書式:
@@ -558,7 +861,7 @@ class Executor:
     # レガシー静的ステップ（後方互換）
     # ------------------------------------------------------------------
 
-    def _legacy_execute(self, step: str, state: AgentState) -> Dict[str, Any]:
+    def _legacy_execute(self, step: str, state: AgentState) -> ExecutorResult:
         python_bin = sys.executable
         legacy_map = {
             "Inspect project structure": f'pwd && {python_bin} --version && ls -la && find . -maxdepth 2 -not -path "*/__pycache__/*" | sort | head -100',

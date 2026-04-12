@@ -1,30 +1,25 @@
 """Hermes AGI Gen 共有定数。"""
+from __future__ import annotations
 
-# Mistral / Ollama
+import os
+from pathlib import Path
+
+
+def get_hermes_home() -> Path:
+    """HERMES_HOME ディレクトリを返す。
+
+    環境変数 HERMES_HOME が設定されていればそれを使い、
+    未設定なら ~/.hermes にフォールバックする。
+    ディレクトリが存在しなければ自動作成する。
+    """
+    home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
+# Ollama (ローカル gemma4:e4b 専用)
 OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
-MISTRAL_API_BASE_URL = "https://api.mistral.ai/v1"
-DEFAULT_MISTRAL_MODEL = "mistral"
-
-# Anthropic Claude (最優先バックエンド)
-CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-6"
-CLAUDE_FAST_MODEL = "claude-haiku-4-5-20251001"
-ANTHROPIC_API_BASE = "https://api.anthropic.com"
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
-OPENROUTER_CHAT_URL = f"{OPENROUTER_BASE_URL}/chat/completions"
-
-AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
-AI_GATEWAY_MODELS_URL = f"{AI_GATEWAY_BASE_URL}/models"
-AI_GATEWAY_CHAT_URL = f"{AI_GATEWAY_BASE_URL}/chat/completions"
-
-NOUS_API_BASE_URL = "https://inference-api.nousresearch.com/v1"
-NOUS_API_CHAT_URL = f"{NOUS_API_BASE_URL}/chat/completions"
-
-# Groq (無料ティア・OpenAI互換・高速)
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"   # スマートモデル（計画・回答生成）
-GROQ_FAST_MODEL = "llama-3.1-8b-instant"          # 高速モデル（分類・軽量タスク）
+DEFAULT_MODEL = "gemma4:e4b"
 
 # ドメイン別エージェント設定
 DOMAIN_CONFIG: dict[str, dict] = {

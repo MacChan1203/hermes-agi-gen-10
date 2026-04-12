@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state2.db"
+from .config import STATE_STORE_MAX_SESSIONS, STATE_STORE_CLEANUP_INTERVAL
+
+from .hermes_constants import get_hermes_home
+
+DEFAULT_DB_PATH = get_hermes_home() / "state2.db"
 SCHEMA_VERSION = 1
 
 SCHEMA_SQL = """
@@ -57,6 +62,27 @@ END;
 """
 
 
+def _sanitize_fts_query(query: str) -> str:
+    """FTS5 MATCH クエリ用に特殊文字をエスケープ・除去する。
+
+    FTS5の演算子 (AND, OR, NOT, NEAR, *, ^, ") をエスケープし、
+    SQL インジェクションを防止する。
+    """
+    if not query or not query.strip():
+        return '""'
+    # FTS5特殊文字を除去: * ^ " ( ) : + -
+    sanitized = re.sub(r'[*^"():+\-]', " ", query)
+    # 連続空白を正規化
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    if not sanitized:
+        return '""'
+    # FTS5キーワード (AND, OR, NOT, NEAR) をリテラルとして扱うため
+    # 各トークンをダブルクォートで囲む
+    _fts_keywords = frozenset({"AND", "OR", "NOT", "NEAR"})
+    tokens = sanitized.split()
+    return " ".join(f'"{t}"' for t in tokens if t)
+
+
 class SessionDB:
     """SQLite + FTS5 の軽量セッション保存。"""
 
@@ -69,6 +95,7 @@ class SessionDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        self._session_counter = 0  # クリーンアップ間隔カウンタ
 
     def _init_schema(self) -> None:
         cur = self._conn.cursor()
@@ -87,6 +114,9 @@ class SessionDB:
                 (session_id, source, user_id, model, title, time.time(), json.dumps(metadata or {}, ensure_ascii=False), session_id),
             )
             self._conn.commit()
+            self._session_counter += 1
+            if self._session_counter % STATE_STORE_CLEANUP_INTERVAL == 0:
+                self._auto_cleanup()
 
     def append_message(self, session_id: str, role: str, content: str, *, tool_name: str | None = None, finish_reason: str | None = None) -> None:
         with self._lock:
@@ -103,12 +133,37 @@ class SessionDB:
             self._conn.commit()
 
     def search_messages(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        sanitized = _sanitize_fts_query(query)
         cur = self._conn.cursor()
         cur.execute(
             "SELECT m.session_id, m.role, m.content, m.timestamp FROM messages_fts f JOIN messages m ON m.id = f.rowid WHERE messages_fts MATCH ? ORDER BY m.timestamp DESC LIMIT ?",
-            (query, limit),
+            (sanitized, limit),
         )
         return [dict(row) for row in cur.fetchall()]
+
+    def _auto_cleanup(self) -> None:
+        """最大セッション数を超えた古いセッションを自動削除する。"""
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM sessions")
+            total = cur.fetchone()[0]
+            if total <= STATE_STORE_MAX_SESSIONS:
+                return
+            excess = total - STATE_STORE_MAX_SESSIONS
+            # 古いセッションのIDを取得
+            cur.execute(
+                "SELECT id FROM sessions ORDER BY started_at ASC LIMIT ?",
+                (excess,),
+            )
+            old_ids = [row[0] for row in cur.fetchall()]
+            if not old_ids:
+                return
+            placeholders = ",".join("?" for _ in old_ids)
+            cur.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", old_ids)
+            cur.execute(f"DELETE FROM sessions WHERE id IN ({placeholders})", old_ids)
+            self._conn.commit()
+        except Exception:
+            pass
 
 
 

@@ -19,6 +19,25 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from .config import (
+    MOTIVATION_WEIGHT_CURIOSITY,
+    MOTIVATION_WEIGHT_COMPETENCE,
+    MOTIVATION_WEIGHT_ENTROPY,
+    MOTIVATION_WEIGHT_SOCIAL,
+    MOTIVATION_WEIGHT_HOMEOSTASIS,
+    MOTIVATION_HOMEOSTASIS_THRESHOLD,
+    MOTIVATION_RECENT_FACTS_WINDOW,
+    MOTIVATION_WEIGHT_ADAPTATION_RATE,
+    MOTIVATION_COMPETENCE_THRESHOLD,
+    MOTIVATION_EXPLORATION_BOOST,
+    MOTIVATION_MAX_EXPLORATION_HISTORY,
+    MOTIVATION_SUCCESS_REWARD_THRESHOLD,
+    MOTIVATION_WEIGHT_MIN,
+    MOTIVATION_WEIGHT_MAX,
+    MOTIVATION_HYSTERESIS_ZONE,
+    DREAM_DOMAINS,
+)
+
 if TYPE_CHECKING:
     from .long_term_memory import LongTermMemory
     from .meta_cognition import QueuedGoal
@@ -75,16 +94,17 @@ class IntrinsicMotivationEngine:
     AGIが「退屈」せず、常に自己改善と探索を続けるための中核モジュール。
     """
 
-    def __init__(self, llm: Optional[Any] = None) -> None:
+    def __init__(self, llm: Optional[Any] = None, domains: Optional[List[str]] = None) -> None:
         self.llm = llm
         self._last_activation: Dict[str, float] = {}  # モジュール名→最終活性化時刻
         self._exploration_history: List[str] = []      # 探索済みドメイン
+        self._domains: List[str] = domains if domains is not None else list(DREAM_DOMAINS)
         self._drive_weights = {
-            "curiosity": 0.30,
-            "competence": 0.25,
-            "entropy": 0.20,
-            "homeostasis": 0.10,
-            "social": 0.15,
+            "curiosity": MOTIVATION_WEIGHT_CURIOSITY,
+            "competence": MOTIVATION_WEIGHT_COMPETENCE,
+            "entropy": MOTIVATION_WEIGHT_ENTROPY,
+            "homeostasis": MOTIVATION_WEIGHT_HOMEOSTASIS,
+            "social": MOTIVATION_WEIGHT_SOCIAL,
         }
 
     # ------------------------------------------------------------------
@@ -167,11 +187,11 @@ class IntrinsicMotivationEngine:
         if ltm and not gaps:
             try:
                 known_domains = set()
-                facts = ltm.recall_recent(limit=50)
+                facts = ltm.recall_recent(limit=MOTIVATION_RECENT_FACTS_WINDOW)
                 for fact in facts:
                     if isinstance(fact, dict):
                         known_domains.add(fact.get("domain", "general"))
-                all_domains = {"coding", "system", "web", "data", "security", "testing", "devops"}
+                all_domains = set(self._domains)
                 gaps = list(all_domains - known_domains)
             except Exception:
                 pass
@@ -184,7 +204,7 @@ class IntrinsicMotivationEngine:
             strength = self._drive_weights["curiosity"]
             # 未探索ドメインほど強い好奇心
             if gap not in self._exploration_history:
-                strength = min(1.0, strength * 1.5)
+                strength = min(1.0, strength * MOTIVATION_EXPLORATION_BOOST)
 
             signals.append(MotivationSignal(
                 source="curiosity",
@@ -211,7 +231,7 @@ class IntrinsicMotivationEngine:
         # 最も弱い能力を特定
         weakest = sorted(assessment.items(), key=lambda x: x[1])
         for capability, score in weakest[:2]:
-            if score < 0.7:  # 閾値以下の能力のみ
+            if score < MOTIVATION_COMPETENCE_THRESHOLD:  # 閾値以下の能力のみ
                 strength = self._drive_weights["competence"] * (1.0 - score)
                 template = random.choice(_COMPETENCE_TEMPLATES)
                 signals.append(MotivationSignal(
@@ -261,7 +281,7 @@ class IntrinsicMotivationEngine:
             return signals
 
         now = time.time()
-        dormant_threshold = 3600  # 1時間以上未使用
+        dormant_threshold = MOTIVATION_HOMEOSTASIS_THRESHOLD
 
         for module, last_used in module_last_used.items():
             dormant_time = now - last_used
@@ -308,9 +328,56 @@ class IntrinsicMotivationEngine:
         """探索済みドメインを記録する。"""
         if domain not in self._exploration_history:
             self._exploration_history.append(domain)
-            # 最大50件
-            if len(self._exploration_history) > 50:
-                self._exploration_history = self._exploration_history[-50:]
+            # 最大件数制限
+            if len(self._exploration_history) > MOTIVATION_MAX_EXPLORATION_HISTORY:
+                self._exploration_history = self._exploration_history[-MOTIVATION_MAX_EXPLORATION_HISTORY:]
+
+    def record_goal_outcome(self, drive_source: str, reward: float) -> None:
+        """ゴール実行結果に基づいてドライブ重みを適応的に調整する。
+
+        Args:
+            drive_source: 動機源 ("curiosity", "competence", etc.)
+            reward: 実行結果の報酬 (0.0〜1.0)
+        """
+        if drive_source not in self._drive_weights:
+            return
+
+        # ヒステリシス: 報酬が閾値付近(不感帯)の場合は調整をスキップ
+        half_zone = MOTIVATION_HYSTERESIS_ZONE / 2
+        if (MOTIVATION_SUCCESS_REWARD_THRESHOLD - half_zone
+                <= reward
+                <= MOTIVATION_SUCCESS_REWARD_THRESHOLD + half_zone):
+            return
+
+        rate = MOTIVATION_WEIGHT_ADAPTATION_RATE
+        if reward > MOTIVATION_SUCCESS_REWARD_THRESHOLD + half_zone:
+            # 明確な成功: この動機源の重みを微増
+            self._drive_weights[drive_source] += rate
+        else:
+            # 明確な失敗: この動機源の重みを微減
+            self._drive_weights[drive_source] -= rate
+
+        # 個別の重みを上下限にクランプ
+        self._drive_weights[drive_source] = max(
+            MOTIVATION_WEIGHT_MIN,
+            min(MOTIVATION_WEIGHT_MAX, self._drive_weights[drive_source]),
+        )
+
+        # 重みを正規化して合計1.0に
+        self._normalize_weights()
+
+    def _normalize_weights(self) -> None:
+        """ドライブ重みを正規化して合計1.0にする。"""
+        total = sum(self._drive_weights.values())
+        if total > 0:
+            for key in self._drive_weights:
+                self._drive_weights[key] /= total
+            # 正規化後に下限を下回った重みを再クランプ
+            for key in self._drive_weights:
+                self._drive_weights[key] = max(
+                    MOTIVATION_WEIGHT_MIN,
+                    min(MOTIVATION_WEIGHT_MAX, self._drive_weights[key]),
+                )
 
     def record_module_activation(self, module_name: str) -> None:
         """モジュール活性化を記録する。"""

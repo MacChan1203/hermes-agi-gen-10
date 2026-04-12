@@ -5,14 +5,19 @@
 """
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import sqlite3
+import threading
 import time
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-_REGISTRY_PATH = Path.home() / ".hermes" / "tool_registry.db"
+from .hermes_constants import get_hermes_home
+
+_REGISTRY_PATH = get_hermes_home() / "tool_registry.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tools (
@@ -27,6 +32,82 @@ CREATE TABLE IF NOT EXISTS tools (
     session_id TEXT
 );
 """
+
+
+def _compute_code_hash(code: str) -> str:
+    """コードのSHA-256ハッシュを計算する。"""
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+# 禁止モジュール・関数 (AST解析用)
+_FORBIDDEN_MODULES = frozenset({
+    "os", "subprocess", "sys", "shutil", "ctypes", "socket",
+    "http", "urllib", "requests", "signal", "multiprocessing",
+    "threading", "importlib", "code", "codeop", "compileall",
+    "runpy", "webbrowser", "tempfile", "glob", "pathlib",
+    "pickle", "marshal", "shelve",
+})
+_FORBIDDEN_NAMES = frozenset({
+    "eval", "exec", "__import__", "compile", "globals", "locals",
+    "getattr", "setattr", "delattr", "open", "breakpoint",
+})
+_FORBIDDEN_ATTRS = frozenset({
+    "__subclasses__", "__class__", "__bases__", "__mro__",
+    "__globals__", "__code__", "__builtins__",
+})
+
+
+def _is_tool_code_safe(code: str) -> Tuple[bool, str]:
+    """ASTを解析してツールコードの安全性を検証する。
+
+    Returns:
+        (is_safe, reason) — 安全ならば (True, ""), 危険なら (False, 理由)
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, f"構文エラー: {e}"
+
+    for node in ast.walk(tree):
+        # import X / import X as Y
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in _FORBIDDEN_MODULES:
+                    return False, f"禁止モジュールのインポート: {alias.name}"
+
+        # from X import Y — 相対インポートも検出
+        if isinstance(node, ast.ImportFrom):
+            # 相対インポート (from . import X) は全面禁止
+            if node.module is None:
+                return False, "相対インポートは禁止されています"
+            top = node.module.split(".")[0]
+            if top in _FORBIDDEN_MODULES:
+                return False, f"禁止モジュールのインポート: {node.module}"
+            # from X import * は禁止
+            if any(alias.name == "*" for alias in node.names):
+                return False, "ワイルドカードインポートは禁止されています"
+
+        # 危険な関数呼び出し: eval(), exec(), __import__(), etc.
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in _FORBIDDEN_NAMES:
+                return False, f"禁止関数の呼び出し: {func.id}()"
+            if isinstance(func, ast.Attribute) and func.attr in _FORBIDDEN_NAMES:
+                return False, f"禁止関数の呼び出し: .{func.attr}()"
+
+        # 危険な属性アクセス: __subclasses__, __class__, etc.
+        if isinstance(node, ast.Attribute):
+            if node.attr in _FORBIDDEN_ATTRS:
+                return False, f"禁止属性へのアクセス: .{node.attr}"
+
+        # 危険な名前参照
+        if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
+            # 呼び出し以外でも参照自体を禁止 (変数への代入経由のバイパス防止)
+            if isinstance(node.ctx, ast.Load):
+                return False, f"禁止名への参照: {node.id}"
+
+    return True, ""
 
 
 class DynamicTool:
@@ -44,33 +125,40 @@ class DynamicTool:
         self.code = code
         self.invocation_prefix = invocation_prefix.upper().rstrip(":")
         self._fn: Optional[Callable] = None
+        self._code_hash: str = _compute_code_hash(code)
+        self._lock = threading.Lock()
 
     def compile(self) -> bool:
-        """ツールコードをコンパイルして実行可能にする。"""
-        # セキュリティ: 危険なパターンをチェック (VULN-003)
-        dangerous_patterns = [
-            r"import\s+os", r"from\s+os",
-            r"import\s+subprocess", r"from\s+subprocess",
-            r"import\s+sys", r"from\s+sys",
-            r"import\s+shutil", r"from\s+shutil",
-            r"eval\(", r"exec\(", r"__import__",
-            r"__subclasses__", r"__class__"
-        ]
-        for pattern in dangerous_patterns:
-            if re.search(pattern, self.code):
+        """ツールコードをコンパイルして実行可能にする。
+
+        スレッドセーフ: ロックで保護し、exec 直前にハッシュを再検証する。
+        """
+        with self._lock:
+            # セキュリティ: コード整合性を検証 (ハッシュチェック)
+            current_hash = _compute_code_hash(self.code)
+            if current_hash != self._code_hash:
                 return False
 
-        try:
-            ns: Dict[str, Any] = {"__builtins__": {}} # 組み込みを制限
-            exec(self.code, ns)  # noqa: S102
-            # main関数またはツール名の関数を探す
-            fn = ns.get("main") or ns.get(self.name) or ns.get("run") or ns.get("execute")
-            if callable(fn):
-                self._fn = fn
-                return True
-        except Exception:
-            pass
-        return False
+            # セキュリティ: AST解析による危険パターン検出
+            is_safe, reason = _is_tool_code_safe(self.code)
+            if not is_safe:
+                return False
+
+            # exec 直前にハッシュを再検証 (TOCTOU 防御)
+            final_hash = _compute_code_hash(self.code)
+            if final_hash != self._code_hash:
+                return False
+
+            try:
+                ns: Dict[str, Any] = {"__builtins__": {}}
+                exec(self.code, ns)  # noqa: S102
+                fn = ns.get("main") or ns.get(self.name) or ns.get("run") or ns.get("execute")
+                if callable(fn):
+                    self._fn = fn
+                    return True
+            except Exception:
+                pass
+            return False
 
     def invoke(self, args: str) -> Dict[str, Any]:
         """ツールを実行する。"""
@@ -137,7 +225,12 @@ class ToolRegistry:
         *,
         session_id: Optional[str] = None,
     ) -> bool:
-        """新しいツールを登録する。コンパイル失敗時はFalseを返す。"""
+        """新しいツールを登録する。安全性検証またはコンパイル失敗時はFalseを返す。"""
+        # 登録時にAST安全性検証 (実行前に拒否)
+        is_safe, reason = _is_tool_code_safe(code)
+        if not is_safe:
+            return False
+
         tool = DynamicTool(name=name, description=description, code=code, invocation_prefix=invocation_prefix)
 
         # コンパイルテスト

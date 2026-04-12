@@ -10,10 +10,7 @@
   /improve - 自己改善レポートの表示
 
 使い方:
-  python3 cli.py                    # 自動検出 (Groq→Mistral→Ollama)
-  python3 cli.py --model groq       # Groq を明示指定
-  python3 cli.py --model qwen3      # Ollama のモデルを指定
-  python3 cli.py --model mistral    # Mistral API を指定
+  python3 cli.py                    # Ollama gemma4:e4b を使用
 """
 from __future__ import annotations
 
@@ -36,7 +33,6 @@ from rich.table import Table
 
 from hermes_agi_gen import AgentOrchestrator, AgentState, HermesAgentV9
 from hermes_agi_gen.agi_core import AGICore
-from hermes_agi_gen.claude_client import ClaudeClient
 from hermes_agi_gen.code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from hermes_agi_gen.daemon import HermesDaemon
 from hermes_agi_gen.hermes_constants import DOMAIN_CONFIG
@@ -306,17 +302,6 @@ def _extract_schedule_trigger(message: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _provider_label(llm) -> str:
-    if isinstance(llm, ClaudeClient):
-        return f"[bold green]Claude (Anthropic)[/bold green] ({llm.model})"
-    url = getattr(llm, "base_url", "")
-    if "anthropic" in url:
-        return f"[bold green]Claude[/bold green] ({llm.model})"
-    if "groq" in url:
-        return f"[bold yellow]Groq[/bold yellow] ({llm.model})"
-    if "mistral" in url:
-        return f"[bold blue]Mistral[/bold blue] ({llm.model})"
-    if "openrouter" in url:
-        return f"[bold magenta]OpenRouter[/bold magenta] ({llm.model})"
     return f"[bold white]Ollama[/bold white] ({llm.model})"
 
 
@@ -391,7 +376,7 @@ def _run_agent(
             _out_dir_kw = _m.group(0).rstrip("/")
         if not _out_dir_kw:
             _out_dir_kw = "~/Desktop/AI_News"
-        _groq_model = llm.model if "groq" in getattr(llm, "base_url", "") else "llama-3.1-8b-instant"
+        _ollama_model = "gemma4:e4b"
         # ゴールから長さ・詳細指示を抽出してスクリプトに注入
         # 数値(字/文字)があればそれを使い、なければユーザーの表現をそのまま使う
         _num_m = re.search(r'(\d+)\s*[字文]', goal)
@@ -437,9 +422,7 @@ for _u, _tit in _targets:
     _tit_clean = re.sub(r"&#x27;", "'", _tit).strip()
     _body = _fetch_body(_u)
     _articles.append({{"title": _tit_clean, "url": _u, "body": _body}})
-# 3. Anthropic/Groq APIで翻訳・要約
-_anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-_groq_key = os.environ.get("GROQ_API_KEY", "")
+# 3. Ollama (gemma4:e4b) で翻訳・要約
 _sections = []
 for _i, _a in enumerate(_articles):
     _body_snip = _a["body"][:2000] if _a["body"] else "(本文取得不可)"
@@ -450,41 +433,23 @@ for _i, _a in enumerate(_articles):
         '{{"title_ja":"翻訳タイトル","summary_ja":"日本語要約"}}'
     )
     _title_ja, _summary_ja = _a["title"], "(翻訳なし)"
-    if _anthropic_key:
-        try:
-            _resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={{"x-api-key": _anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}},
-                json={{"model": "claude-haiku-4-5-20251001", "max_tokens": {_max_tokens},
-                      "messages": [{{"role": "user", "content": _prompt}}]}},
-                timeout=60,
-            )
-            _resp.raise_for_status()
-            _raw = _resp.json()["content"][0]["text"]
-            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
-            if _m:
-                _d = json.loads(_m.group())
-                _title_ja = _d.get("title_ja", _title_ja)
-                _summary_ja = _d.get("summary_ja", _summary_ja)
-        except Exception as _e:
-            _summary_ja = f"(翻訳エラー: {{_e}})"
-    elif _groq_key:
-        try:
-            _gr = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={{"Authorization": f"Bearer {{_groq_key}}", "Content-Type": "application/json"}},
-                json={{"model": {_groq_model!r}, "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": {_max_tokens}}},
-                timeout=60,
-            )
-            _gr.raise_for_status()
-            _raw = _gr.json()["choices"][0]["message"]["content"]
-            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
-            if _m:
-                _d = json.loads(_m.group())
-                _title_ja = _d.get("title_ja", _title_ja)
-                _summary_ja = _d.get("summary_ja", _summary_ja)
-        except Exception as _e:
-            _summary_ja = f"(翻訳エラー: {{_e}})"
+    try:
+        _gr = requests.post(
+            "http://127.0.0.1:11434/v1/chat/completions",
+            headers={{"Content-Type": "application/json"}},
+            json={{"model": {_ollama_model!r}, "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": {_max_tokens}}},
+            timeout=180,
+        )
+        _gr.raise_for_status()
+        _raw = _gr.json()["choices"][0]["message"]["content"]
+        _raw = re.sub(r"<think>.*?</think>", "", _raw, flags=re.DOTALL).strip()
+        _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
+        if _m:
+            _d = json.loads(_m.group())
+            _title_ja = _d.get("title_ja", _title_ja)
+            _summary_ja = _d.get("summary_ja", _summary_ja)
+    except Exception as _e:
+        _summary_ja = f"(翻訳エラー: {{_e}})"
     _sections.append(f"## 記事{{_i+1}}: {{_title_ja}}\\n原題: {{_a['title']}}\\n出典: {{_a['url']}}\\n\\n{{_summary_ja}}")
 # 4. ファイル保存
 _header = f"=== Hacker News AI ニュース {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}} ===\\n"
@@ -522,9 +487,7 @@ for _sid in _ids[:{_hn_count}]:
         except Exception:
             pass
     _articles.append({{"title": _title, "url": _url, "body": _body}})
-# 2. 翻訳 (Anthropic > Groq > Ollama)
-_anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-_groq_key = os.environ.get("GROQ_API_KEY", "")
+# 2. 翻訳 (Ollama gemma4:e4b)
 for _a in _articles:
     _body_snip = _a["body"][:2000] if _a["body"] else "(本文なし)"
     _prompt = (
@@ -534,41 +497,23 @@ for _a in _articles:
         '{{"title_ja":"日本語タイトル","summary_ja":"日本語の詳しい要約(300字以上)"}}'
     )
     _title_ja, _summary_ja = _a["title"], _a["body"][:500] if _a["body"] else "(内容取得不可)"
-    if _anthropic_key:
-        try:
-            _resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={{"x-api-key": _anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}},
-                json={{"model": "claude-haiku-4-5-20251001", "max_tokens": 1500,
-                      "messages": [{{"role": "user", "content": _prompt}}]}},
-                timeout=60,
-            )
-            _resp.raise_for_status()
-            _raw = _resp.json()["content"][0]["text"]
-            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
-            if _m:
-                _d = json.loads(_m.group())
-                _title_ja = _d.get("title_ja", _title_ja)
-                _summary_ja = _d.get("summary_ja", _summary_ja)
-        except Exception as _e:
-            _summary_ja = f"(翻訳エラー: {{_e}})"
-    elif _groq_key:
-        try:
-            _gr = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={{"Authorization": f"Bearer {{_groq_key}}", "Content-Type": "application/json"}},
-                json={{"model": "llama-3.1-8b-instant", "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": 1500}},
-                timeout=60,
-            )
-            _gr.raise_for_status()
-            _raw = _gr.json()["choices"][0]["message"]["content"]
-            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
-            if _m:
-                _d = json.loads(_m.group())
-                _title_ja = _d.get("title_ja", _title_ja)
-                _summary_ja = _d.get("summary_ja", _summary_ja)
-        except Exception as _e:
-            _summary_ja = f"(翻訳エラー: {{_e}})"
+    try:
+        _gr = requests.post(
+            "http://127.0.0.1:11434/v1/chat/completions",
+            headers={{"Content-Type": "application/json"}},
+            json={{"model": "gemma4:e4b", "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": 1500}},
+            timeout=180,
+        )
+        _gr.raise_for_status()
+        _raw = _gr.json()["choices"][0]["message"]["content"]
+        _raw = re.sub(r"<think>.*?</think>", "", _raw, flags=re.DOTALL).strip()
+        _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
+        if _m:
+            _d = json.loads(_m.group())
+            _title_ja = _d.get("title_ja", _title_ja)
+            _summary_ja = _d.get("summary_ja", _summary_ja)
+    except Exception as _e:
+        _summary_ja = f"(翻訳エラー: {{_e}})"
     print(f"\\n===== {{_title_ja}} =====")
     print(f"原題: {{_a['title']}}")
     print(f"出典: {{_a['url']}}")
@@ -1317,7 +1262,6 @@ def _run_scheduled_job(llm: MistralClient, job: "ScheduledJob", con: Console) ->
     def _execute() -> None:
         try:
             con.print(f"[cyan][スケジューラ] 実行開始: {job.goal[:80]}[/cyan]")
-            _time.sleep(5)  # Groqレートリミット回避: 直前のAPI呼び出しから間隔を空ける
             summary, _ = _run_agent(
                 llm=llm,
                 goal=job.goal,
@@ -1349,17 +1293,8 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "例:\n"
-            "  python3 cli.py                  # 自動検出 (Groq→Claude→Ollama)\n"
-            "  python3 cli.py --model claude   # Claude API を使用 (ANTHROPIC_API_KEY 必須)\n"
-            "  python3 cli.py --model groq     # Groq API を使用 (GROQ_API_KEY 必須)\n"
-            "  python3 cli.py --model qwen3    # Ollama の qwen3 を使用\n"
-            "  python3 cli.py --model mistral  # Mistral API を使用 (MISTRAL_API_KEY 必須)\n"
+            "  python3 cli.py                  # Ollama gemma4:e4b を使用\n"
         ),
-    )
-    parser.add_argument(
-        "--model", "-m",
-        default=None,
-        help="使用するモデル。'groq'/'mistral' はバックエンド指定、それ以外はOllamaモデル名",
     )
     parser.add_argument(
         "--max-turns", "-n",
@@ -1376,55 +1311,15 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build_llm(model: Optional[str]):
-    """モデル指定からLLMクライアントを構築する。
-
-    優先順位 (--model 未指定の自動検出):
-      1. GROQ_API_KEY が設定されていれば Groq
-      2. ANTHROPIC_API_KEY が設定されていれば Claude
-      3. それ以外は Ollama
-
-    明示指定:
-      --model groq    → Groq (GROQ_API_KEY 必須)
-      --model claude  → Claude (ANTHROPIC_API_KEY 必須)
-      --model qwen3   → Ollama の qwen3
-    """
-    import os as _os
-
-    # --- 明示指定: claude ---
-    if model == "claude":
-        if not ClaudeClient.is_available():
-            console.print(
-                "[bold red]ANTHROPIC_API_KEY が設定されていません。[/bold red]\n"
-                "[dim].env に ANTHROPIC_API_KEY=sk-ant-... を追加してください。[/dim]"
-            )
-            return None
-        console.print("[green]Anthropic Claude API を使用します。[/green]")
-        return ClaudeClient()
-
-    # --- 自動検出: Groq を最優先 ---
-    if model is None and _os.getenv("GROQ_API_KEY"):
-        console.print("[green]GROQ_API_KEY を検出 — Groq API を使用します。[/green]")
-        return MistralClient(model="groq")
-
-    # --- 自動検出: Anthropic Claude (Groq がない場合) ---
-    if model is None and ClaudeClient.is_available():
-        console.print("[green]ANTHROPIC_API_KEY を検出 — Claude API を使用します。[/green]")
-        return ClaudeClient()
-
-    # --- 明示指定 or Ollama フォールバック ---
-    try:
-        if model is None:
-            return MistralClient()
-        return MistralClient(model=model)
-    except ValueError as e:
-        console.print(f"\n[bold red][設定エラー][/bold red] {e}")
-        return None
+    """Ollama gemma4:e4b 専用のLLMクライアントを構築する。"""
+    console.print("[green]Ollama (gemma4:e4b) を使用します。[/green]")
+    return MistralClient()
 
 
 def main() -> None:
     args = _parse_args()
 
-    llm = _build_llm(args.model)
+    llm = _build_llm(None)
     if llm is None:
         sys.exit(1)
 
@@ -1440,13 +1335,7 @@ def main() -> None:
         daemon.run_forever()
         return
 
-    # fast_llm: Claude使用時はそのまま、Groq使用時は軽量モデル、それ以外は同じ
-    if isinstance(llm, ClaudeClient):
-        fast_llm = ClaudeClient.fast()
-    elif args.model in (None, "groq"):
-        fast_llm = MistralClient.fast()
-    else:
-        fast_llm = llm
+    fast_llm = MistralClient.fast()
 
     db = SessionDB()
     generator = CodeGeneratorAgent(llm=llm, session_db=db)

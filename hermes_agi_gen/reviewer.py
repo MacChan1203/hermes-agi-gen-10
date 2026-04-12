@@ -4,9 +4,15 @@
 """
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .agent_state import AgentState
+from .config import (
+    REVIEWER_STATIC_CONFIDENCE_PASS,
+    REVIEWER_STATIC_CONFIDENCE_PARTIAL,
+    REVIEWER_STATIC_CONFIDENCE_FAIL,
+)
 from .errors import classify_error, should_retry_error_type, should_retry_step
 from .memory import remember_failure
 
@@ -26,10 +32,14 @@ _CONFIDENCE_BLOCK_THRESHOLD = 0.4  # 40%未満: ブロック推奨
 
 
 def _assess_risk(step: str) -> str:
-    """ステップのリスクレベルを評価する。"""
-    step_lower = step.lower()
-    if any(pattern in step_lower for pattern in _DESTRUCTIVE_PATTERNS):
-        return "critical"
+    """ステップのリスクレベルを評価する。
+
+    単語境界マッチングを使用し、"rm -rf" が "form-rfid" 等に
+    誤マッチしないようにする。
+    """
+    for pattern in _DESTRUCTIVE_PATTERNS:
+        if re.search(r'\b' + re.escape(pattern) + r'\b', step, re.IGNORECASE):
+            return "critical"
     if step.upper().startswith(("WRITE:", "CMD:")):
         return "medium"
     if step.upper().startswith(("READ:", "SEARCH:", "CALC:", "ANSWER:")):
@@ -86,9 +96,11 @@ class Reviewer:
         self,
         llm: Optional[MistralClient] = None,
         role: str = "worker",
+        ltm: Optional[Any] = None,
     ) -> None:
         self.llm = llm
         self.role = role
+        self.ltm = ltm  # LongTermMemory (リカバリ戦略の履歴検索用)
 
     # ------------------------------------------------------------------
     # Public
@@ -229,17 +241,35 @@ class Reviewer:
     # 静的評価 (LLM なし fallback)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_goal_completion_step(step: str) -> bool:
+        """ステップがゴール達成を示すかどうかを動的に判定する。
+
+        特定の文字列にハードコードせず、結果/要約/回答を示すインジケータで判定。
+        """
+        step_upper = step.upper()
+        # ANSWER: や DONE: プレフィックスは明確なゴール達成
+        if step_upper.startswith(("ANSWER:", "DONE:")):
+            return True
+        # 「まとめ」「総括」「結果」「提案」などの要約・結論キーワードを含む場合
+        completion_indicators = [
+            "summarize", "summary", "findings", "結果", "総括", "まとめ",
+            "conclude", "conclusion", "propose", "提案", "報告",
+        ]
+        step_lower = step.lower()
+        return any(indicator in step_lower for indicator in completion_indicators)
+
     def _static_evaluate(self, step: str, result: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
         if result["ok"]:
             is_answer = step.upper().startswith("ANSWER:")
             is_plan = step.upper().startswith("PLAN:")
-            is_final = step == "Summarize findings and propose next upgrade"
+            is_final = self._is_goal_completion_step(step)
 
             summary = result.get("stdout", "") if (is_answer or is_plan) else self._success_summary(step)
             hints = [] if (is_answer or is_plan) else self._improvement_hints(step)
 
             # 静的信頼度: ANSWER/PLANは高め、その他は中程度
-            confidence = 0.9 if (is_answer or is_plan) else 0.75
+            confidence = REVIEWER_STATIC_CONFIDENCE_PASS if (is_answer or is_plan) else REVIEWER_STATIC_CONFIDENCE_PARTIAL
 
             review: Dict[str, Any] = {
                 "status": "success",
@@ -259,6 +289,36 @@ class Reviewer:
 
         return self._static_failure_review(step, result, state)
 
+    def _lookup_ltm_recovery(self, error_type: str) -> Optional[str]:
+        """LTMから過去に成功したリカバリ戦略を検索する。
+
+        Returns:
+            過去に成功した戦略があればその文字列、なければ None。
+        """
+        if self.ltm is None:
+            return None
+        try:
+            if hasattr(self.ltm, "recall_strategies"):
+                strategies = self.ltm.recall_strategies(
+                    f"recovery:{error_type}", limit=3
+                )
+                for s in strategies:
+                    val = s.get("value", "")
+                    if val:
+                        return val
+            # フォールバック: recall_similar で検索
+            if hasattr(self.ltm, "recall_similar"):
+                similar = self.ltm.recall_similar(
+                    f"successful recovery for {error_type}", limit=3
+                )
+                for s in similar:
+                    val = s.get("value", "")
+                    if "recovery" in s.get("key", "").lower() and val:
+                        return val
+        except Exception:
+            pass
+        return None
+
     def _static_failure_review(self, step: str, result: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
         stderr = result.get("stderr", "")
         error_type = classify_error(stderr)
@@ -266,6 +326,10 @@ class Reviewer:
         remember_failure(state, step, error_type, stderr)
         error_history = state.working_memory.get("error_history", [])
 
+        # まず LTM から過去に成功したリカバリ戦略を検索
+        ltm_recovery = self._lookup_ltm_recovery(error_type)
+
+        # 静的フォールバックマップ
         recovery_map = {
             "missing_command": "Check installed commands and PATH",
             "permission_error": "Inspect file permissions",
@@ -276,13 +340,13 @@ class Reviewer:
             "unknown_error": "Inspect project structure",
         }
 
-        recovery_action = recovery_map.get(error_type, "Inspect project structure")
+        recovery_action = ltm_recovery or recovery_map.get(error_type, "Inspect project structure")
 
         can_retry_same_step = should_retry_step(step, state.failed_steps)
         can_retry_same_error = should_retry_error_type(error_type, error_history)
 
         if not can_retry_same_step or not can_retry_same_error:
-            recovery_action = "Summarize findings and propose next upgrade"
+            recovery_action = "ANSWER: リトライ上限に到達。調査結果を報告します。"
 
         return {
             "status": "failed",
@@ -295,7 +359,7 @@ class Reviewer:
                 f"失敗分類: {error_type}",
                 f"次は {recovery_action} を試す",
             ],
-            "confidence": 0.2,
+            "confidence": REVIEWER_STATIC_CONFIDENCE_FAIL,
             "risk_level": _assess_risk(step),
         }
 

@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import time
@@ -23,9 +24,13 @@ from typing import List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from .meta_cognition import GoalQueue
 
+from .config import SCHEDULER_MAX_JOBS
+
 logger = logging.getLogger(__name__)
 
-_HERMES_DIR = Path.home() / ".hermes"
+from .hermes_constants import get_hermes_home
+
+_HERMES_DIR = get_hermes_home()
 _SCHEDULE_FILE = _HERMES_DIR / "scheduler.json"
 
 _WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -213,7 +218,16 @@ class JobScheduler:
         priority: float = 0.6,
         job_id: Optional[str] = None,
     ) -> ScheduledJob:
-        """ジョブを追加して保存する。"""
+        """ジョブを追加して保存する。
+
+        Raises:
+            RuntimeError: ジョブ数が SCHEDULER_MAX_JOBS に達している場合。
+        """
+        if len(self._jobs) >= SCHEDULER_MAX_JOBS:
+            raise RuntimeError(
+                f"ジョブ数が上限 ({SCHEDULER_MAX_JOBS}) に達しています。"
+                " 不要なジョブを削除してから追加してください。"
+            )
         job = ScheduledJob(
             id=job_id or str(uuid.uuid4())[:8],
             goal=goal,
@@ -320,19 +334,39 @@ class JobScheduler:
             logger.warning("スケジューラー再読み込みエラー: %s", exc)
 
     def save(self) -> None:
+        """ジョブリストをJSONファイルに保存する (flock で排他ロック)。"""
         try:
             data = [j.to_dict() for j in self._jobs]
-            _SCHEDULE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            content = json.dumps(data, ensure_ascii=False, indent=2)
+            with open(_SCHEDULE_FILE, "w", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(content)
+                    f.flush()
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception as exc:
             logger.warning("スケジューラー保存エラー: %s", exc)
 
     def load(self) -> None:
+        """JSONファイルからジョブリストを読み込む (flock で共有ロック)。
+
+        ロック保持中にファイル読み込み・JSON解析・ジョブ構築を全て行い、
+        TOCTOU 競合を防止する。
+        """
         if not _SCHEDULE_FILE.exists():
             return
         try:
-            self._last_mtime = _SCHEDULE_FILE.stat().st_mtime
-            data = json.loads(_SCHEDULE_FILE.read_text(encoding="utf-8"))
-            self._jobs = [ScheduledJob.from_dict(d) for d in data]
+            with open(_SCHEDULE_FILE, "r", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    raw = f.read()
+                    # ロック保持中に解析まで完了させる (TOCTOU 防止)
+                    data = json.loads(raw)
+                    self._jobs = [ScheduledJob.from_dict(d) for d in data]
+                    self._last_mtime = _SCHEDULE_FILE.stat().st_mtime
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception as exc:
             logger.warning("スケジューラーロードエラー: %s", exc)
 

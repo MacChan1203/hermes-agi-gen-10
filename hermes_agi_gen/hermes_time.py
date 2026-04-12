@@ -26,7 +26,8 @@ def _resolve_timezone_name() -> str:
 
     try:
         import yaml
-        hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+        from .hermes_constants import get_hermes_home
+        hermes_home = get_hermes_home()
         config_path = hermes_home / "config.yaml"
         if config_path.exists():
             with open(config_path, "r", encoding="utf-8") as f:

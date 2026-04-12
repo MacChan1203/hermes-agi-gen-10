@@ -17,8 +17,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .config import (
+    UCB1_EXPLORATION_CONSTANT,
+    META_LEARNING_EPISODE_WINDOW,
+    META_EXPLORATION_RATE_MIN,
+    META_EXPLORATION_RATE_MAX,
+    META_TRANSFER_BASE_CONFIDENCE,
+    META_MIN_TRIALS_FOR_TRANSFER,
+    META_MAX_TRANSFER_CANDIDATES,
+    META_TRANSFER_HISTORY_WINDOW,
+    META_MIN_SAMPLES_FOR_ADJUSTMENT,
+    META_TRANSFER_DECAY_FACTOR,
+    UCB1_DECAY_RATE,
+    UCB1_DECAY_MIN,
+    DOMAIN_SEMANTIC_VECTORS,
+    DOMAIN_VECTOR_MIN_USES,
+    DOMAIN_VECTOR_STRATEGY_NAMES,
+)
 
-_META_LEARNING_DB = Path.home() / ".hermes" / "meta_learning.db"
+
+from .hermes_constants import get_hermes_home
+
+_META_LEARNING_DB = get_hermes_home() / "meta_learning.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS strategies (
@@ -109,9 +129,11 @@ class MetaLearner:
         self._ensure_default_strategies()
 
         # 適応的学習パラメータ
-        self._exploration_rate = self._load_param("exploration_rate", 1.5)
-        self._transfer_threshold = self._load_param("transfer_threshold", 0.6)
+        self._exploration_rate = self._load_param("exploration_rate", UCB1_EXPLORATION_CONSTANT)
+        self._transfer_threshold = self._load_param("transfer_threshold", META_TRANSFER_BASE_CONFIDENCE)
         self._learning_rate = self._load_param("learning_rate", 0.1)
+        self._transfer_success_history: List[bool] = []  # 転移成功/失敗の履歴
+        self._learned_vectors: Dict[str, List[float]] = {}  # ドメイン → 学習済みベクトル
 
     # ------------------------------------------------------------------
     # 戦略登録
@@ -177,17 +199,27 @@ class MetaLearner:
         total_uses = sum(r["total_uses"] for r in rows)
         C = self._exploration_rate
 
+        # UCB1 探索定数の自然減衰: 経験が蓄積されるにつれ活用を重視する
+        if total_uses > 0:
+            self._exploration_rate = max(
+                UCB1_DECAY_MIN,
+                self._exploration_rate * (UCB1_DECAY_RATE ** total_uses),
+            )
+            C = self._exploration_rate
+
         best = None
         best_ucb = -1.0
 
         for r in rows:
-            n = max(r["total_uses"], 1)
             avg = r["avg_reward"]
 
-            if total_uses == 0:
-                ucb = avg + C  # 未使用戦略にボーナス
+            if r["total_uses"] == 0:
+                # 未試行の戦略には無限大の探索ボーナスを与える
+                ucb = float('inf')
+            elif total_uses == 0:
+                ucb = avg + C  # 全体未使用時のフォールバック
             else:
-                ucb = avg + C * math.sqrt(math.log(max(total_uses, 1)) / n)
+                ucb = avg + C * math.sqrt(math.log(max(total_uses, 1)) / r["total_uses"])
 
             rec = StrategyRecord(
                 name=r["name"],
@@ -229,11 +261,20 @@ class MetaLearner:
             (strategy_name, domain, goal, reward, context, now),
         )
 
-        # 戦略統計更新
+        # 戦略統計更新: ドメイン固有レコードを優先し、なければ作成する
+        # 1. まずドメイン固有レコードを探す
         row = self._conn.execute(
-            "SELECT total_uses, total_reward, successes FROM strategies WHERE name = ? AND (domain = ? OR domain = 'general') LIMIT 1",
+            "SELECT total_uses, total_reward, successes FROM strategies WHERE name = ? AND domain = ?",
             (strategy_name, domain),
         ).fetchone()
+
+        if row is None and domain != "general":
+            # ドメイン固有レコードがない場合、general から複製して作成
+            self.register_strategy(strategy_name, domain)
+            row = self._conn.execute(
+                "SELECT total_uses, total_reward, successes FROM strategies WHERE name = ? AND domain = ?",
+                (strategy_name, domain),
+            ).fetchone()
 
         if row:
             new_uses = row["total_uses"] + 1
@@ -245,26 +286,37 @@ class MetaLearner:
                 """
                 UPDATE strategies
                 SET total_uses = ?, total_reward = ?, successes = ?, avg_reward = ?, last_used_at = ?
-                WHERE name = ? AND (domain = ? OR domain = 'general')
+                WHERE name = ? AND domain = ?
                 """,
                 (new_uses, new_reward, new_successes, new_avg, now, strategy_name, domain),
             )
-        else:
-            # 新規ドメイン用に戦略を複製登録
-            self.register_strategy(strategy_name, domain)
-            self._conn.execute(
-                """
-                UPDATE strategies
-                SET total_uses = 1, total_reward = ?, successes = ?, avg_reward = ?, last_used_at = ?
-                WHERE name = ? AND domain = ?
-                """,
-                (reward, 1 if reward >= 0.5 else 0, reward, now, strategy_name, domain),
-            )
+
+        # general の統計も同時に更新 (全体統計として)
+        if domain != "general":
+            gen_row = self._conn.execute(
+                "SELECT total_uses, total_reward, successes FROM strategies WHERE name = ? AND domain = 'general'",
+                (strategy_name,),
+            ).fetchone()
+            if gen_row:
+                gu = gen_row["total_uses"] + 1
+                gr = gen_row["total_reward"] + reward
+                gs = gen_row["successes"] + (1 if reward >= 0.5 else 0)
+                self._conn.execute(
+                    "UPDATE strategies SET total_uses=?, total_reward=?, successes=?, avg_reward=?, last_used_at=? WHERE name=? AND domain='general'",
+                    (gu, gr, gs, gr / gu, now, strategy_name),
+                )
 
         self._conn.commit()
 
         # 学習率を適応的に調整
         self._adapt_learning_params()
+
+        # ドメインベクトルを定期的に再学習 (10エピソードごと)
+        episode_count = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM strategy_episodes"
+        ).fetchone()["cnt"]
+        if episode_count % 10 == 0:
+            self.learn_domain_vectors()
 
     # ------------------------------------------------------------------
     # 転移学習
@@ -275,8 +327,8 @@ class MetaLearner:
         # ターゲットドメインにまだ十分なデータがない戦略を探す
         target_strategies = set()
         rows = self._conn.execute(
-            "SELECT name FROM strategies WHERE domain = ? AND total_uses >= 3",
-            (target_domain,),
+            "SELECT name FROM strategies WHERE domain = ? AND total_uses >= ?",
+            (target_domain, META_MIN_TRIALS_FOR_TRANSFER),
         ).fetchall()
         target_strategies = {r["name"] for r in rows}
 
@@ -287,11 +339,11 @@ class MetaLearner:
             SELECT name, domain, avg_reward, total_uses
             FROM strategies
             WHERE domain != ? AND domain != 'general'
-              AND total_uses >= 3 AND avg_reward >= ?
+              AND total_uses >= ? AND avg_reward >= ?
             ORDER BY avg_reward DESC
             LIMIT 10
             """,
-            (target_domain, self._transfer_threshold),
+            (target_domain, META_MIN_TRIALS_FOR_TRANSFER, self._transfer_threshold),
         ).fetchall()
 
         for r in rows:
@@ -301,10 +353,13 @@ class MetaLearner:
                     "SELECT avg_reward FROM strategies WHERE name = ? AND domain = 'general'",
                     (r["name"],),
                 ).fetchone()
-                general_score = general_row["avg_reward"] if general_row else 0.5
+                general_score = general_row["avg_reward"] if general_row else META_TRANSFER_BASE_CONFIDENCE
 
-                # 転移確信度: ソース成功率 × 汎用での成功率
-                confidence = r["avg_reward"] * general_score
+                # ドメイン類似度: ソースとターゲットで共通の成功戦略の割合
+                domain_similarity = self._compute_domain_similarity(r["domain"], target_domain)
+
+                # 転移確信度: ソース成功率 × 汎用成功率 × ドメイン類似度
+                confidence = r["avg_reward"] * general_score * domain_similarity
 
                 candidates.append(TransferCandidate(
                     strategy_name=r["name"],
@@ -315,7 +370,7 @@ class MetaLearner:
                 ))
 
         candidates.sort(key=lambda c: c.transfer_confidence, reverse=True)
-        return candidates[:5]
+        return candidates[:META_MAX_TRANSFER_CANDIDATES]
 
     def apply_transfer(self, candidate: TransferCandidate) -> None:
         """転移候補をターゲットドメインに登録する。"""
@@ -325,15 +380,87 @@ class MetaLearner:
             f"[転移] {candidate.source_domain}から (確信度={candidate.transfer_confidence:.0%})",
         )
 
+    def _compute_domain_similarity(self, source_domain: str, target_domain: str) -> float:
+        """ソースとターゲットドメインの類似度を算出する。
+
+        1. 学習済みベクトル (実績データから自動生成) を最優先
+        2. config の手動ベクトルにフォールバック
+        3. ベクトルが存在しない場合は Jaccard 類似度にフォールバック
+        """
+        # 学習済みベクトル → config フォールバックの順で取得
+        src_vec = self.get_domain_vector(source_domain)
+        tgt_vec = self.get_domain_vector(target_domain)
+        if src_vec and tgt_vec:
+            dot = sum(a * b for a, b in zip(src_vec, tgt_vec))
+            norm_s = math.sqrt(sum(a * a for a in src_vec))
+            norm_t = math.sqrt(sum(b * b for b in tgt_vec))
+            if norm_s > 0 and norm_t > 0:
+                cosine = dot / (norm_s * norm_t)
+                return max(0.3, cosine)
+
+        # フォールバック: Jaccard 類似度 (共通成功戦略)
+        source_rows = self._conn.execute(
+            "SELECT name FROM strategies WHERE domain = ? AND successes > 0",
+            (source_domain,),
+        ).fetchall()
+        target_rows = self._conn.execute(
+            "SELECT name FROM strategies WHERE domain = ? AND successes > 0",
+            (target_domain,),
+        ).fetchall()
+
+        source_strategies = {r["name"] for r in source_rows}
+        target_strategies = {r["name"] for r in target_rows}
+
+        union = source_strategies | target_strategies
+        if not union:
+            return 0.5
+
+        intersection = source_strategies & target_strategies
+        return max(0.3, len(intersection) / len(union))
+
+    def record_transfer_outcome(self, success: bool) -> None:
+        """転移学習の成否を記録し、閾値を適応的に調整する。"""
+        self._transfer_success_history.append(success)
+
+        # 履歴を上限(WINDOW * 2)に制限し、古いものを刈り込む
+        max_history = META_TRANSFER_HISTORY_WINDOW * 2
+        if len(self._transfer_success_history) > max_history:
+            self._transfer_success_history = self._transfer_success_history[-max_history:]
+
+        # 直近WINDOW件で判断
+        recent = self._transfer_success_history[-META_TRANSFER_HISTORY_WINDOW:]
+        if len(recent) < META_MIN_SAMPLES_FOR_ADJUSTMENT:
+            return
+
+        # 指数減衰重み付き成功率: 最新エントリほど高い重み
+        weighted_successes = sum(
+            META_TRANSFER_DECAY_FACTOR ** i * (1.0 if s else 0.0)
+            for i, s in enumerate(reversed(recent))
+        )
+        total_weight = sum(
+            META_TRANSFER_DECAY_FACTOR ** i
+            for i in range(len(recent))
+        )
+        success_rate = weighted_successes / total_weight
+
+        if success_rate > 0.6:
+            # 成功率が高い: 閾値を下げて転移を促進
+            self._transfer_threshold = max(0.3, self._transfer_threshold - 0.05)
+        elif success_rate < 0.4:
+            # 失敗率が高い: 閾値を上げて転移を慎重に
+            self._transfer_threshold = min(0.8, self._transfer_threshold + 0.05)
+        self._save_param("transfer_threshold", self._transfer_threshold)
+
     # ------------------------------------------------------------------
     # 適応的学習パラメータ
     # ------------------------------------------------------------------
 
     def _adapt_learning_params(self) -> None:
         """最近の改善率から学習パラメータを動的調整する。"""
-        # 最近20エピソードの報酬推移を取得
+        # 最近のエピソードの報酬推移を取得
         rows = self._conn.execute(
-            "SELECT reward FROM strategy_episodes ORDER BY created_at DESC LIMIT 20"
+            "SELECT reward FROM strategy_episodes ORDER BY created_at DESC LIMIT ?",
+            (META_LEARNING_EPISODE_WINDOW,),
         ).fetchall()
 
         if len(rows) < 5:
@@ -343,6 +470,8 @@ class MetaLearner:
         recent_half = rewards[:len(rewards)//2]
         older_half = rewards[len(rewards)//2:]
 
+        if not recent_half or not older_half:
+            return
         recent_avg = sum(recent_half) / len(recent_half)
         older_avg = sum(older_half) / len(older_half)
 
@@ -350,10 +479,10 @@ class MetaLearner:
 
         if improvement > 0.1:
             # 改善中: 活用を強化（探索率を下げる）
-            self._exploration_rate = max(0.5, self._exploration_rate * 0.95)
+            self._exploration_rate = max(META_EXPLORATION_RATE_MIN, self._exploration_rate * 0.95)
         elif improvement < -0.1:
             # 悪化中: 探索を強化
-            self._exploration_rate = min(3.0, self._exploration_rate * 1.1)
+            self._exploration_rate = min(META_EXPLORATION_RATE_MAX, self._exploration_rate * 1.1)
 
         self._save_param("exploration_rate", self._exploration_rate)
 
@@ -405,9 +534,89 @@ class MetaLearner:
         episode_row = self._conn.execute(
             "SELECT COUNT(*) as cnt FROM strategy_episodes"
         ).fetchone()
+        learned = len(self._learned_vectors)
         return (
             f"[MetaLearner] 戦略数={total_row['cnt']} "
             f"総使用={total_row['uses'] or 0} "
             f"エピソード={episode_row['cnt']} "
-            f"探索率={self._exploration_rate:.2f}"
+            f"探索率={self._exploration_rate:.2f} "
+            f"学習済みドメインベクトル={learned}"
         )
+
+    # ------------------------------------------------------------------
+    # ドメインベクトル自動学習
+    # ------------------------------------------------------------------
+
+    def learn_domain_vectors(self) -> Dict[str, List[float]]:
+        """実績データからドメイン意味ベクトルを自動生成する。
+
+        各ドメインについて、既定の戦略 (DOMAIN_VECTOR_STRATEGY_NAMES) ごとの
+        avg_reward を要素としたベクトルを構築する。
+
+        データが十分なドメイン (total_uses >= DOMAIN_VECTOR_MIN_USES) のみ生成し、
+        不十分なドメインは config のフォールバックベクトルを維持する。
+
+        Returns:
+            学習済み + フォールバックのマージ済みベクトル辞書
+        """
+        strategy_names = DOMAIN_VECTOR_STRATEGY_NAMES
+        dim = len(strategy_names)
+
+        # 全ドメインの一覧を取得
+        domain_rows = self._conn.execute(
+            "SELECT DISTINCT domain FROM strategies WHERE domain != 'general'"
+        ).fetchall()
+        domains = [r["domain"] for r in domain_rows]
+
+        learned: Dict[str, List[float]] = {}
+        for domain in domains:
+            # ドメインの総使用回数を確認
+            usage_row = self._conn.execute(
+                "SELECT SUM(total_uses) as total FROM strategies WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+            total_uses = usage_row["total"] or 0
+
+            if total_uses < DOMAIN_VECTOR_MIN_USES:
+                continue  # データ不足 → フォールバック
+
+            # 各戦略の avg_reward をベクトルの各次元に
+            vec: List[float] = []
+            for strat_name in strategy_names:
+                row = self._conn.execute(
+                    "SELECT avg_reward FROM strategies WHERE name = ? AND domain = ?",
+                    (strat_name, domain),
+                ).fetchone()
+                if row:
+                    vec.append(max(0.0, min(1.0, row["avg_reward"])))
+                else:
+                    # ドメインにこの戦略がない場合、general の値を使用
+                    gen_row = self._conn.execute(
+                        "SELECT avg_reward FROM strategies WHERE name = ? AND domain = 'general'",
+                        (strat_name,),
+                    ).fetchone()
+                    vec.append(gen_row["avg_reward"] if gen_row else 0.5)
+
+            learned[domain] = vec
+
+        # general ドメインのベクトルも生成
+        gen_vec: List[float] = []
+        for strat_name in strategy_names:
+            row = self._conn.execute(
+                "SELECT avg_reward FROM strategies WHERE name = ? AND domain = 'general'",
+                (strat_name,),
+            ).fetchone()
+            gen_vec.append(row["avg_reward"] if row else 0.5)
+        learned["general"] = gen_vec
+
+        # キャッシュ更新
+        self._learned_vectors = learned
+        return learned
+
+    def get_domain_vector(self, domain: str) -> Optional[List[float]]:
+        """ドメインのベクトルを返す (学習済み優先、フォールバック付き)。"""
+        # 学習済みベクトルを優先
+        if domain in self._learned_vectors:
+            return self._learned_vectors[domain]
+        # config のフォールバック
+        return DOMAIN_SEMANTIC_VECTORS.get(domain)

@@ -1,8 +1,7 @@
-from .agi_core import AGICore, AGIIdentity
+from .agi_core import AGICore, AGIIdentity, RunGoalResult
 from .agent_message import AgentMessage
 from .agent_runner import HermesAgentV9
 from .agent_state import AgentState
-from .claude_client import ClaudeClient
 from .code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from .cognitive_roles import CognitiveRole, decompose_into_roles, select_roles_for_goal
 from .consciousness import AttentionMechanism, GlobalWorkspace, SignalSource, WorkspaceSignal
@@ -29,6 +28,7 @@ __all__ = [
     # Gen 9: AGI Core
     "AGICore",
     "AGIIdentity",
+    "RunGoalResult",
     "GrowthMetrics",
     "Insight",
     "ReflectionEngine",
@@ -61,7 +61,6 @@ __all__ = [
     "select_roles_for_goal",
     # Infrastructure
     "CausalEffect",
-    "ClaudeClient",
     "CodeGeneratorAgent",
     "CodeReviewerAgent",
     "DynamicTool",

@@ -19,6 +19,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -27,6 +28,12 @@ if TYPE_CHECKING:
 
 from .agent_runner import HermesAgentV9
 from .agent_state import AgentState
+from .config import (
+    DAEMON_DAILY_BUDGET,
+    DAEMON_IDLE_EXPLORE_SEC,
+    DAEMON_REGROUND_INTERVAL,
+    DAEMON_CURIOSITY_THRESHOLD,
+)
 from .hermes_constants import DOMAIN_CONFIG
 from .long_term_memory import LongTermMemory
 from .meta_cognition import GoalQueue, MetaCognition, QueuedGoal
@@ -37,44 +44,87 @@ from .world_model import WorldModel
 
 logger = logging.getLogger(__name__)
 
-_HERMES_DIR = Path.home() / ".hermes"
+from .hermes_constants import get_hermes_home
+
+_HERMES_DIR = get_hermes_home()
 _PID_FILE = _HERMES_DIR / "daemon.pid"
 _LOG_FILE = _HERMES_DIR / "daemon.log"
+_BUDGET_COUNTER_FILE = _HERMES_DIR / "daemon_budget.json"
 _HEARTBEAT_KEY = "daemon_heartbeat"
-_BUDGET_KEY = "daemon_daily_budget"
-
-# デフォルト設定
-_DEFAULT_IDLE_SECONDS = 300        # キューが空のときのアイドル待機時間
-_DEFAULT_MAX_DAILY_GOALS = 50      # 1日あたりの最大ゴール実行数
-_DEFAULT_CURIOSITY_THRESHOLD = 0.4 # 好奇心ゴールを実行する最低スコア
 
 
 class DailyBudgetGuard:
-    """1日あたりのAPI使用量を制限する。コスト爆発を防ぐ。"""
+    """1日あたりのAPI使用量を制限する。コスト爆発を防ぐ。
 
-    def __init__(self, ltm: LongTermMemory, max_daily: int = _DEFAULT_MAX_DAILY_GOALS) -> None:
-        self.ltm = ltm
+    日付ごとのカウンタをJSONファイルで管理する (LTMスキャンを排除)。
+    """
+
+    def __init__(self, max_daily: int = DAEMON_DAILY_BUDGET) -> None:
         self.max_daily = max_daily
+        self._counter_file = _BUDGET_COUNTER_FILE
 
     def _today_key(self) -> str:
-        from datetime import date
-        return f"{_BUDGET_KEY}_{date.today().isoformat()}"
+        return date.today().isoformat()
+
+    def _load_counters(self) -> dict:
+        """カウンタファイルを読み込む。"""
+        if not self._counter_file.exists():
+            return {}
+        try:
+            return json.loads(self._counter_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_counters(self, counters: dict) -> None:
+        """カウンタファイルに書き出す。古い日付のエントリは削除する。"""
+        today = self._today_key()
+        cleaned = {k: v for k, v in counters.items() if k == today}
+        try:
+            self._counter_file.write_text(
+                json.dumps(cleaned, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warning("予算カウンタ保存エラー: %s", exc)
 
     def get_used(self) -> int:
-        key = self._today_key()
-        facts = self.ltm.recall_recent(limit=100)
-        for f in facts:
-            if f["key"] == key:
-                try:
-                    return int(f["value"])
-                except (ValueError, TypeError):
-                    return 0
-        return 0
+        counters = self._load_counters()
+        return counters.get(self._today_key(), 0)
 
     def increment(self) -> int:
-        count = self.get_used() + 1
-        self.ltm.learn(self._today_key(), str(count))
-        return count
+        """カウンタをアトミックにインクリメントする。
+
+        ファイルロックで読み→書きの競合を防止する。
+        """
+        import fcntl
+        self._counter_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self._counter_file, "a+", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    raw = f.read()
+                    counters = json.loads(raw) if raw.strip() else {}
+                    key = self._today_key()
+                    count = counters.get(key, 0) + 1
+                    counters[key] = count
+                    # 今日以外のエントリを削除
+                    cleaned = {k: v for k, v in counters.items() if k == key}
+                    f.seek(0)
+                    f.truncate()
+                    f.write(json.dumps(cleaned, ensure_ascii=False))
+                    f.flush()
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            return count
+        except Exception as exc:
+            logger.warning("予算カウンタ更新エラー: %s — フォールバック", exc)
+            # フォールバック: 非ロック版
+            counters = self._load_counters()
+            key = self._today_key()
+            count = counters.get(key, 0) + 1
+            counters[key] = count
+            self._save_counters(counters)
+            return count
 
     def is_exhausted(self) -> bool:
         return self.get_used() >= self.max_daily
@@ -94,9 +144,9 @@ class HermesDaemon:
     def __init__(
         self,
         llm: Optional[Any] = None,
-        idle_seconds: int = _DEFAULT_IDLE_SECONDS,
-        max_daily_goals: int = _DEFAULT_MAX_DAILY_GOALS,
-        curiosity_threshold: float = _DEFAULT_CURIOSITY_THRESHOLD,
+        idle_seconds: int = DAEMON_IDLE_EXPLORE_SEC,
+        max_daily_goals: int = DAEMON_DAILY_BUDGET,
+        curiosity_threshold: float = DAEMON_CURIOSITY_THRESHOLD,
     ) -> None:
         _HERMES_DIR.mkdir(parents=True, exist_ok=True)
         self.llm = llm
@@ -104,7 +154,7 @@ class HermesDaemon:
         self.ltm = LongTermMemory()
         self.meta = MetaCognition(llm=llm)
         self.self_improver = SelfImprovementEngine(llm=llm)
-        self.budget = DailyBudgetGuard(self.ltm, max_daily_goals)
+        self.budget = DailyBudgetGuard(max_daily=max_daily_goals)
         self.curiosity_threshold = curiosity_threshold
         self.scheduler = JobScheduler()
         self.reflection_engine = ReflectionEngine(
@@ -121,14 +171,14 @@ class HermesDaemon:
 
     def _setup_file_logger(self) -> None:
         """デーモン専用のファイルロガーを設定する。"""
-        file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
-        file_handler.setLevel(logging.INFO)
+        self._file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+        self._file_handler.setLevel(logging.INFO)
         formatter = logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        self._file_handler.setFormatter(formatter)
+        logger.addHandler(self._file_handler)
         logger.setLevel(logging.INFO)
 
     # ------------------------------------------------------------------
@@ -145,15 +195,10 @@ class HermesDaemon:
         self.world_model.initialize_from_filesystem(".")
         logger.info("世界モデルをグラウンディング済み")
 
-        logger.info("=== Hermes AGI デーモン起動 ===")
-        logger.info("PIDファイル: %s", _PID_FILE)
-        logger.info("ログファイル: %s", _LOG_FILE)
-        logger.info("GoalQueue: %d件ロード済み", self.meta.goal_queue.size())
-
-        print(f"[デーモン] 起動しました (PID={os.getpid()})")
-        print(f"[デーモン] GoalQueue: {self.meta.goal_queue.size()}件")
-        print(f"[デーモン] 本日の残り予算: {self.budget.remaining()}件")
-        print("[デーモン] Ctrl+C で停止")
+        logger.info("[デーモン] 起動しました (PID=%d)", os.getpid())
+        logger.info("[デーモン] GoalQueue: %d件", self.meta.goal_queue.size())
+        logger.info("[デーモン] 本日の残り予算: %d件", self.budget.remaining())
+        logger.info("[デーモン] PID=%s, ログ=%s", _PID_FILE, _LOG_FILE)
 
         while not self._stop_event.is_set():
             try:
@@ -173,8 +218,7 @@ class HermesDaemon:
         triggered = self.scheduler.tick(self.meta.goal_queue)
         if triggered:
             for job in triggered:
-                logger.info("スケジューラー発火 → GoalQueue: [%s] %s", job.id, job.goal[:60])
-                print(f"[スケジューラー] ジョブ発火: [{job.id}] {job.goal[:60]}")
+                logger.info("[スケジューラー] ジョブ発火: [%s] %s", job.id, job.goal[:60])
             self._save_state()
 
         if self.budget.is_exhausted():
@@ -199,19 +243,18 @@ class HermesDaemon:
         self._process_one_goal(goal)
 
         # 省察タイミングチェック: N ゴールごとに能動的省察を実行
-        if self.reflection_engine.should_reflect():
+        if hasattr(self.reflection_engine, 'should_reflect') and self.reflection_engine.should_reflect():
             self._run_reflection_cycle()
 
     def _process_one_goal(self, goal: QueuedGoal) -> None:
         """GoalQueueからポップしたゴールを実行する。"""
         logger.info(
-            "ゴール処理開始 [%s / score=%.2f]: %s",
-            goal.source, goal.composite_score, goal.goal[:80],
+            "[デーモン] ゴール実行 [%s / score=%.2f]: %s",
+            goal.source, goal.composite_score, goal.goal[:70],
         )
-        print(f"\n[デーモン] ゴール実行: {goal.goal[:70]}")
 
         used = self.budget.increment()
-        logger.info("本日 %d/%d ゴール消費", used, self.budget.max_daily)
+        logger.info("[デーモン] 本日 %d/%d ゴール消費", used, self.budget.max_daily)
 
         try:
             agent = HermesAgentV9(
@@ -248,11 +291,7 @@ class HermesDaemon:
                 score=score,
             )
 
-            logger.info(
-                "ゴール完了 [score=%.0f%%]: %s",
-                score * 100, goal.goal[:60],
-            )
-            print(f"[デーモン] 完了 (成功率: {score:.0%}): {goal.goal[:60]}")
+            logger.info("[デーモン] 完了 (成功率: %.0f%%): %s", score * 100, goal.goal[:60])
 
             # GoalQueueを保存 (次ゴールが追加されている可能性)
             self._save_state()
@@ -262,12 +301,11 @@ class HermesDaemon:
 
     def _run_reflection_cycle(self) -> None:
         """能動的自己省察サイクル: LTMを分析して洞察と新ゴールを生成する。"""
-        logger.info("[ReflectionCycle] 自己省察を開始します...")
-        print("\n[デーモン] 自己省察フェーズ...", flush=True)
+        logger.info("[デーモン] 自己省察フェーズ...")
 
         try:
             # 世界モデルが古ければ再グラウンディング
-            if self.world_model.needs_regrounding(max_age_seconds=600):
+            if self.world_model.needs_regrounding(max_age_seconds=DAEMON_REGROUND_INTERVAL):
                 self.world_model.initialize_from_filesystem(".")
                 logger.info("[ReflectionCycle] 世界モデルを再グラウンディング")
 
@@ -278,17 +316,10 @@ class HermesDaemon:
             strategic_goals = self.reflection_engine.generate_strategic_goals(insights, self.ltm)
             for goal in strategic_goals:
                 self.meta.goal_queue.add(goal)
-                logger.info(
-                    "[ReflectionCycle] 戦略的ゴールを追加: [score=%.2f] %s",
-                    goal.composite_score, goal.goal[:60],
-                )
-                print(f"[省察] 新ゴール: {goal.goal[:60]}", flush=True)
+                logger.info("[デーモン] 省察→新ゴール: %s", goal.goal[:60])
 
             self._save_state()
-            logger.info(
-                "[ReflectionCycle] 完了: %d洞察, %d新ゴール",
-                len(insights), len(strategic_goals),
-            )
+            logger.info("[デーモン] 省察完了: %d洞察, %d新ゴール", len(insights), len(strategic_goals))
         except Exception as exc:
             logger.error("[ReflectionCycle] エラー: %s", exc, exc_info=True)
 
@@ -297,7 +328,7 @@ class HermesDaemon:
         if self.llm is None:
             return
 
-        logger.info("好奇心探索: 新しいゴールを生成します。")
+        logger.info("[デーモン] 好奇心探索: 新しいゴールを生成します。")
 
         # ダミーステートで好奇心ゴールを生成
         dummy_state = AgentState(
@@ -314,11 +345,7 @@ class HermesDaemon:
         # 閾値以上のゴールのみキューに残す
         best = self.meta.goal_queue.peek_best()
         if best and best.priority_score >= self.curiosity_threshold:
-            logger.info(
-                "好奇心ゴールを追加: [score=%.2f] %s",
-                best.composite_score, best.goal[:60],
-            )
-            print(f"[デーモン] 好奇心ゴール: {best.goal[:60]}")
+            logger.info("[デーモン] 好奇心ゴール: %s (score=%.2f)", best.goal[:60], best.composite_score)
         else:
             # スコアが低いゴールは捨てる
             while self.meta.goal_queue.size() > 0:
@@ -375,25 +402,42 @@ class HermesDaemon:
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
         """シグナル受信時にクリーンシャットダウンを開始する。"""
-        logger.info("シグナル %d を受信。シャットダウンします。", signum)
-        print(f"\n[デーモン] シグナル {signum} を受信。停止します...")
+        logger.info("[デーモン] シグナル %d を受信。停止します...", signum)
         self._stop_event.set()
 
     def _shutdown(self) -> None:
         """クリーンシャットダウン処理。"""
-        logger.info("デーモンをシャットダウンします。状態を保存中...")
-        print("[デーモン] 状態を保存中...")
+        logger.info("[デーモン] 状態を保存中...")
         self._save_state()
         self._remove_pid()
-        logger.info("=== Hermes AGI デーモン停止 ===")
-        print("[デーモン] 停止しました。")
+        # ログファイルハンドルを確実に閉じる
+        if hasattr(self, "_file_handler"):
+            logger.removeHandler(self._file_handler)
+            self._file_handler.close()
+        logger.info("[デーモン] 停止しました。")
 
     # ------------------------------------------------------------------
     # PIDファイル
     # ------------------------------------------------------------------
 
     def _write_pid(self) -> None:
-        """現在のPIDをファイルに書き込む。"""
+        """現在のPIDをファイルに書き込む。
+
+        既存PIDファイルがあり、そのプロセスがまだ生きている場合は
+        起動を拒否して重複デーモンを防ぐ。
+        """
+        if _PID_FILE.exists():
+            try:
+                old_pid = int(_PID_FILE.read_text().strip())
+                if old_pid != os.getpid():
+                    os.kill(old_pid, 0)  # プロセス存在確認
+                    raise RuntimeError(
+                        f"デーモンは既に起動中です (PID={old_pid})。"
+                        " 停止してから再起動してください。"
+                    )
+            except (ValueError, OSError):
+                # PIDファイルが壊れているか、プロセスが存在しない → 上書きOK
+                pass
         _PID_FILE.write_text(str(os.getpid()))
 
     def _remove_pid(self) -> None:
@@ -478,9 +522,9 @@ if __name__ == "__main__":
     from hermes_agi_gen.mistral_client import MistralClient
     try:
         llm = MistralClient()
-        print(f"[デーモン] LLM: {llm.model}")
+        logger.info("[デーモン] LLM: %s", llm.model)
     except Exception as e:
-        print(f"[デーモン] LLM初期化エラー: {e}")
+        logger.error("[デーモン] LLM初期化エラー: %s", e)
         llm = None
 
     daemon = HermesDaemon(llm=llm)

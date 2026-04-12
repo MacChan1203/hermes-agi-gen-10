@@ -16,8 +16,16 @@ GlobalWorkspaceを通じて統合された判断を生成する。
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+from .config import (
+    COGNITIVE_ROLE_COMPLEX_PATTERNS,
+    COGNITIVE_ROLE_SIMPLE_PATTERNS,
+    COGNITIVE_ROLE_SUCCESS_EMA_ALPHA,
+    SIMPLE_GOAL_MAX_LEN,
+)
 
 # ------------------------------------------------------------------
 # ロール別システムプロンプト
@@ -186,6 +194,57 @@ COGNITIVE_ROLES: Dict[str, CognitiveRole] = {
 }
 
 
+# ------------------------------------------------------------------
+# ロール依存関係: どのロールがどのロールの前に来るべきか
+# ------------------------------------------------------------------
+ROLE_DEPENDENCIES: Dict[str, List[str]] = {
+    "strategist": ["perceiver"],       # perceiver が先に意図を明確化
+    "executor": ["strategist"],         # strategist が計画を立ててから実行
+    "critic": ["executor"],             # executor の結果を評価
+    "innovator": ["perceiver"],         # perceiver の理解を踏まえて提案
+    "ethicist": ["perceiver"],          # perceiver の意図理解が前提
+    "goal_manager": ["perceiver"],      # perceiver の意図理解が前提
+}
+
+
+def _keyword_match(keyword: str, text: str) -> bool:
+    """キーワードがテキストにマッチするか判定する。
+
+    英語キーワード（ASCII のみ）は単語境界マッチ、
+    日本語キーワードは部分文字列マッチを使う。
+    """
+    if keyword.isascii():
+        return bool(re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE))
+    else:
+        return keyword in text
+
+
+# ------------------------------------------------------------------
+# ロール成功率フィードバック (EMA)
+# ------------------------------------------------------------------
+
+_role_success_rates: Dict[str, float] = {}
+
+
+def record_role_outcome(roles: List[str], success: bool) -> None:
+    """使用されたロールの成功率をEMAで更新する。
+
+    Args:
+        roles: 使用されたロール名のリスト
+        success: ゴールが成功したかどうか
+    """
+    alpha = COGNITIVE_ROLE_SUCCESS_EMA_ALPHA
+    signal = 1.0 if success else 0.0
+    for role in roles:
+        old_rate = _role_success_rates.get(role, 0.5)
+        _role_success_rates[role] = (1 - alpha) * old_rate + alpha * signal
+
+
+def get_role_performance() -> Dict[str, float]:
+    """各ロールの成功率を返す（イントロスペクション用）。"""
+    return dict(_role_success_rates)
+
+
 def get_role(name: str) -> CognitiveRole:
     """ロール名から CognitiveRole を取得する。存在しない場合は executor を返す。"""
     return COGNITIVE_ROLES.get(name, COGNITIVE_ROLES["executor"])
@@ -208,21 +267,11 @@ def select_roles_for_goal(goal: str, context: str = "") -> List[str]:
 
     # --- 単純クエリの早期判定 ---
     # "ls", "ファイル一覧", "確認して" のような単純な情報取得は executor のみで十分
-    simple_patterns = [
-        "ファイル一覧", "ls ", "ls\n", "一覧を", "リストを",
-        "表示して", "見せて", "教えて", "何がある",
-        "バージョン", "version", "状態を", "status",
-    ]
-    complex_patterns = [
-        "作成", "実装", "修正", "変更", "追加", "削除", "書き換え",
-        "create", "implement", "fix", "modify", "refactor",
-        "改善", "最適化", "optimize", "improve", "革新",
-        "分析", "評価", "analyze", "review", "レビュー",
-        "調査してまとめ", "調べて報告", "設計",
-    ]
+    simple_patterns = COGNITIVE_ROLE_SIMPLE_PATTERNS
+    complex_patterns = COGNITIVE_ROLE_COMPLEX_PATTERNS
 
     is_simple = (
-        len(goal) < 30
+        len(goal) < SIMPLE_GOAL_MAX_LEN
         or any(p in goal_lower for p in simple_patterns)
     ) and not any(p in goal_lower for p in complex_patterns)
 
@@ -236,16 +285,16 @@ def select_roles_for_goal(goal: str, context: str = "") -> List[str]:
     roles.append("perceiver")
 
     # 調査系には memorist を追加
-    if any(k in goal_lower for k in ["調査", "調べ", "find", "search", "探"]):
+    if any(_keyword_match(k, goal_lower) for k in ["調査", "調べ", "find", "search", "探"]):
         roles.append("memorist")
 
     # 実装・修正・作成系
-    if any(k in goal_lower for k in ["作成", "実装", "修正", "変更", "create", "implement", "fix", "write", "追加"]):
+    if any(_keyword_match(k, goal_lower) for k in ["作成", "実装", "修正", "変更", "create", "implement", "fix", "write", "追加"]):
         roles.append("strategist")
         roles.append("executor")
         roles.append("critic")
     # 分析・評価系
-    elif any(k in goal_lower for k in ["分析", "評価", "analyze", "evaluate", "レビュー", "review"]):
+    elif any(_keyword_match(k, goal_lower) for k in ["分析", "評価", "analyze", "evaluate", "レビュー", "review"]):
         roles.append("memorist")
         roles.append("executor")
         roles.append("critic")
@@ -255,7 +304,7 @@ def select_roles_for_goal(goal: str, context: str = "") -> List[str]:
         roles.append("executor")
 
     # 改善・最適化には innovator を追加
-    if any(k in goal_lower for k in ["改善", "最適化", "optimize", "improve", "革新"]):
+    if any(_keyword_match(k, goal_lower) for k in ["改善", "最適化", "optimize", "improve", "革新"]):
         # executor の直前に挿入
         try:
             exec_idx = roles.index("executor")
@@ -264,9 +313,34 @@ def select_roles_for_goal(goal: str, context: str = "") -> List[str]:
             roles.append("innovator")
 
     # 危険な操作には ethicist を追加
-    if any(k in goal_lower for k in ["削除", "delete", "remove", "書き換え", "overwrite"]):
+    if any(_keyword_match(k, goal_lower) for k in ["削除", "delete", "remove", "書き換え", "overwrite"]):
         # perceiver の直後に挿入
         roles.insert(1, "ethicist")
+
+    # --- 成功率フィードバックによるロール調整 ---
+    # 成功率が高いロールを前方へ移動（必須ロールの順序は維持）
+    mandatory_roles = {"perceiver", "executor"}
+    if _role_success_rates:
+        # 高成功率ロールをブースト: 非必須ロールの中で前方に移動
+        boosted: List[str] = []
+        normal: List[str] = []
+        for r in roles:
+            rate = _role_success_rates.get(r)
+            if rate is not None and rate > 0.7 and r not in mandatory_roles:
+                boosted.append(r)
+            else:
+                normal.append(r)
+        if boosted:
+            # perceiver の直後にブーストされたロールを挿入
+            insert_pos = 1 if normal and normal[0] == "perceiver" else 0
+            roles = normal[:insert_pos] + boosted + normal[insert_pos:]
+
+        # 低成功率ロールを除外（必須ロール以外）
+        roles = [
+            r for r in roles
+            if r in mandatory_roles
+            or _role_success_rates.get(r, 0.5) >= 0.2
+        ]
 
     # 重複除去しながら順序維持
     seen = set()
@@ -295,6 +369,26 @@ def decompose_into_roles(
         [{"role": "...", "task": "..."}, ...] 形式のリスト
     """
     roles = available_roles or select_roles_for_goal(goal, context)
+
+    # ロール依存関係を検証し、必要な前提ロールを挿入する
+    validated_roles: List[str] = []
+    for role in roles:
+        deps = ROLE_DEPENDENCIES.get(role, [])
+        for dep in deps:
+            if dep not in validated_roles and dep not in roles[:roles.index(role)]:
+                validated_roles.append(dep)
+        if role not in validated_roles:
+            validated_roles.append(role)
+
+    # 重複除去しながら順序維持
+    seen: set = set()
+    final_roles: List[str] = []
+    for r in validated_roles:
+        if r not in seen:
+            seen.add(r)
+            final_roles.append(r)
+    roles = final_roles
+
     subtasks = []
 
     role_task_map = {

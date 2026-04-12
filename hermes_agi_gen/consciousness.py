@@ -16,6 +16,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from .config import (
+    GWT_RELEVANCE_WEIGHT,
+    GWT_URGENCY_WEIGHT,
+    GWT_CONFIDENCE_WEIGHT,
+    GWT_ATTENTION_THRESHOLD,
+    GWT_SIGNAL_STALENESS_SEC,
+    GWT_WINNER_SUPPRESSION,
+    GWT_WINNER_SUPPRESSION_URGENCY,
+    GWT_WINNER_SUPPRESSION_CONFIDENCE,
+)
+
 
 class SignalSource(str, Enum):
     """シグナルの発生源となる認知モジュール。"""
@@ -47,12 +58,13 @@ class WorkspaceSignal:
     confidence: float                # 確信度 (0.0〜1.0)
     tags: List[str] = field(default_factory=list)   # 分類タグ
     timestamp: float = field(default_factory=time.time)
+    created_at: float = field(default_factory=time.time)  # シグナル生成時刻
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def attention_score(self) -> float:
         """注意競争スコア: 関連度・緊急度・確信度の加重平均。"""
-        return (self.relevance * 0.4) + (self.urgency * 0.35) + (self.confidence * 0.25)
+        return (self.relevance * GWT_RELEVANCE_WEIGHT) + (self.urgency * GWT_URGENCY_WEIGHT) + (self.confidence * GWT_CONFIDENCE_WEIGHT)
 
     def __repr__(self) -> str:
         return (
@@ -89,7 +101,7 @@ class AttentionMechanism:
     最も重要なシグナルを選択して意識的処理に渡す。
     """
 
-    def __init__(self, threshold: float = 0.3) -> None:
+    def __init__(self, threshold: float = GWT_ATTENTION_THRESHOLD) -> None:
         """
         Args:
             threshold: このスコア未満のシグナルは無視される
@@ -160,6 +172,7 @@ class GlobalWorkspace:
         self._current_signals: List[WorkspaceSignal] = []
         self._shared_context: Dict[str, Any] = {}
         self._last_broadcast: Optional[BroadcastEvent] = None
+        self._suppressed_sources: Dict[str, bool] = {}  # source → 抑制対象
 
     def receive(self, signal: WorkspaceSignal) -> None:
         """モジュールからシグナルを受信する。"""
@@ -174,13 +187,67 @@ class GlobalWorkspace:
         if not self._current_signals:
             return None
 
-        event = self.attention.compete(self._current_signals)
+        now = time.time()
+
+        # 陳腐化したシグナルをフィルタリング
+        fresh_signals = [
+            s for s in self._current_signals
+            if (now - s.created_at) < GWT_SIGNAL_STALENESS_SEC
+        ]
+
+        # 全シグナルが陳腐化した場合、最後のブロードキャスト文脈を反映した
+        # デフォルトシグナルを生成する (単なる静的メッセージではなく実状態を反映)
+        if not fresh_signals:
+            last_content = "新しい入力を待機中"
+            last_source = SignalSource.PERCEIVER
+            if self._last_broadcast and self._last_broadcast.winner:
+                last_content = (
+                    f"前回の処理: [{self._last_broadcast.winner.source.value}] "
+                    f"{self._last_broadcast.winner.content[:40]} — 次の入力を待機"
+                )
+            fresh_signals = [WorkspaceSignal(
+                source=last_source,
+                content=last_content,
+                relevance=0.5,
+                urgency=0.3,
+                confidence=0.5,
+                tags=["default", "idle"],
+            )]
+
+        # 勝者抑制: 前回の勝者ソースの注意スコアを全3次元で一時的に下げる。
+        # signal を直接変更すると元のオブジェクトが破壊されるため、
+        # 抑制付きの一時コピーを作成して compete に渡す。
+        compete_signals: List[WorkspaceSignal] = []
+        for signal in fresh_signals:
+            src_key = signal.source.value
+            if src_key in self._suppressed_sources:
+                # 全3次元 (relevance, urgency, confidence) を抑制
+                suppressed = WorkspaceSignal(
+                    source=signal.source,
+                    content=signal.content,
+                    relevance=max(0.0, signal.relevance - GWT_WINNER_SUPPRESSION),
+                    urgency=max(0.0, signal.urgency - GWT_WINNER_SUPPRESSION_URGENCY),
+                    confidence=max(0.0, signal.confidence - GWT_WINNER_SUPPRESSION_CONFIDENCE),
+                    tags=list(signal.tags),
+                    timestamp=signal.timestamp,
+                    created_at=signal.created_at,
+                    metadata=dict(signal.metadata),
+                )
+                compete_signals.append(suppressed)
+            else:
+                compete_signals.append(signal)
+
+        event = self.attention.compete(compete_signals)
         if event:
             # 共有コンテキストを更新
             self._shared_context["last_broadcast_source"] = event.winner.source.value
             self._shared_context["last_broadcast_content"] = event.winner.content
             self._shared_context["last_broadcast_time"] = event.broadcast_time
             self._last_broadcast = event
+
+            # 勝者抑制を設定（次回のブロードキャストで適用）
+            self._suppressed_sources.clear()
+            self._suppressed_sources[event.winner.source.value] = True
 
         # シグナルをクリア（次のサイクルへ）
         self._current_signals = []

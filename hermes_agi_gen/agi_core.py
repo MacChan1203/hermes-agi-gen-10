@@ -50,16 +50,48 @@ AGI的観点:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    from typing import TypedDict
+except ImportError:
+    from typing_extensions import TypedDict
+
+from .config import (
+    IDENTITY_EMA_ALPHA,
+    IDENTITY_ASSESSMENT_CEILING,
+    IDENTITY_INITIAL_SELF_ASSESSMENT,
+    IDENTITY_STRATEGY_DIVERSITY_THRESHOLD,
+    IDENTITY_DIVERSITY_BONUS,
+    IDENTITY_BASE_INCREMENT,
+    WORLD_MODEL_REGROUND_INTERVAL,
+    TRANSFER_LEARNING_INTERVAL,
+    SELF_MODIFICATION_INTERVAL,
+    TRANSFER_CONFIDENCE_THRESHOLD,
+    DREAM_MODULE_AGE_THRESHOLD,
+    DREAM_DOMAINS,
+    DREAM_TRANSFER_PER_DOMAIN,
+    INTRINSIC_GOAL_MAX,
+    MODULE_LAST_USED_TTL,
+    PARTIAL_REWARD_MIN,
+    GOAL_MAX_LENGTH,
+    PREVIEW_SHORT,
+    PREVIEW_MEDIUM,
+    PREVIEW_LONG,
+    OUTCOME_TRUNCATE,
+    INSIGHTS_DISPLAY_LIMIT,
+    TRANSFER_CANDIDATES_MAX,
+)
+
 from .agent_runner import HermesAgentV9
 from .agent_state import AgentState
 from .consciousness import GlobalWorkspace, SignalSource, WorkspaceSignal
 from .experiment_runner import ExperimentRunner
-from .inner_dialogue import InnerDialogue
+from .inner_dialogue import DeliberationResult, InnerDialogue
 from .intrinsic_motivation import IntrinsicMotivationEngine
 from .long_term_memory import LongTermMemory
 from .meta_cognition import MetaCognition, QueuedGoal
@@ -70,8 +102,23 @@ from .reflection_engine import GrowthMetrics, Insight, ReflectionEngine
 from .self_improvement import SelfImprovementEngine
 from .self_modifier import SelfModifier
 from .state_store import SessionDB
-from .value_system import ValueSystem
+from .value_system import ValueAssessment, ValueSystem
 from .world_model import WorldModel
+
+logger = logging.getLogger(__name__)
+
+
+class RunGoalResult(TypedDict, total=False):
+    """run_goal() の返却型。"""
+    result: str
+    success: bool
+    identity: str
+    insights: List[str]
+    new_goals: int
+    metrics: str
+    strategy: str
+    complexity: str
+    deliberation: Optional[float]
 
 
 # ------------------------------------------------------------------
@@ -106,16 +153,9 @@ class AGIIdentity:
     ])
 
     # 自己評価 (経験から更新)
-    self_assessment: Dict[str, float] = field(default_factory=lambda: {
-        "reasoning": 0.7,
-        "planning": 0.7,
-        "execution": 0.6,
-        "learning": 0.7,
-        "reflection": 0.5,
-        "autonomy": 0.4,      # Gen 9: 自律性
-        "meta_learning": 0.3,  # Gen 9: メタ学習
-        "creativity": 0.4,     # Gen 9: 創造性
-    })
+    self_assessment: Dict[str, float] = field(
+        default_factory=lambda: dict(IDENTITY_INITIAL_SELF_ASSESSMENT),
+    )
 
     # 価値観
     core_values: List[str] = field(default_factory=lambda: [
@@ -143,21 +183,20 @@ class AGIIdentity:
 
     def update_from_metrics(self, metrics: GrowthMetrics) -> None:
         """成長指標から自己評価を更新する。"""
-        alpha = 0.1  # 学習率
         if metrics.success_rate > 0:
             self.self_assessment["execution"] = (
-                self.self_assessment["execution"] * (1 - alpha)
-                + metrics.success_rate * alpha
+                self.self_assessment["execution"] * (1 - IDENTITY_EMA_ALPHA)
+                + metrics.success_rate * IDENTITY_EMA_ALPHA
             )
         if metrics.reflection_count > 0:
             self.self_assessment["reflection"] = min(
-                0.95,
-                self.self_assessment["reflection"] + 0.02,
+                IDENTITY_ASSESSMENT_CEILING,
+                self.self_assessment["reflection"] + IDENTITY_BASE_INCREMENT,
             )
-        if metrics.strategy_diversity > 3:
+        if metrics.strategy_diversity > IDENTITY_STRATEGY_DIVERSITY_THRESHOLD:
             self.self_assessment["meta_learning"] = min(
-                0.95,
-                self.self_assessment["meta_learning"] + 0.03,
+                IDENTITY_ASSESSMENT_CEILING,
+                self.self_assessment["meta_learning"] + IDENTITY_DIVERSITY_BONUS,
             )
 
     def discover_capability(self, capability: str) -> None:
@@ -279,10 +318,10 @@ class AGICore:
             if data and isinstance(data, str):
                 parsed = json.loads(data)
                 if isinstance(parsed, dict):
-                    print("[AGICore] 永続Identityを復元しました", flush=True)
+                    logger.info("[AGICore] 永続Identityを復元しました")
                     return AGIIdentity.from_dict(parsed)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("[AGICore] Identity復元に失敗: %s", exc)
         return AGIIdentity()
 
     def save_identity(self) -> None:
@@ -293,14 +332,14 @@ class AGICore:
                 json.dumps(self.identity.to_dict(), ensure_ascii=False),
                 confidence=1.0,
             )
-        except Exception:
-            pass
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("[AGICore] Identity永続化に失敗: %s", exc)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def run_goal(self, goal: str, context: str = "") -> Dict[str, Any]:
+    def run_goal(self, goal: str, context: str = "") -> RunGoalResult:
         """1つのゴールを認知サイクル全体で処理する。
 
         Gen 9 認知ループ:
@@ -314,91 +353,141 @@ class AGICore:
         8. 学習 (Learn) — メタ学習更新 + few-shot抽出
         9. 内発動機 (Motivate) — 自律的ゴール生成
         10. 省察 (Reflect) — 定期的自己省察
+
+        各フェーズは個別に try-except で保護されており、
+        単一モジュールの障害がゴール処理全体をクラッシュさせない。
         """
+        # --- 入力バリデーション ---
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("goal は空でない文字列でなければなりません")
+        goal = goal.strip()[:GOAL_MAX_LENGTH]
+
+        # --- 古いモジュール追跡エントリをクリーンアップ ---
+        self._cleanup_stale_modules()
+
         self.identity.total_goals_processed += 1
 
         # --- 1. 知覚フェーズ: 世界モデルを最新化 ---
-        if self.world_model.needs_regrounding(max_age_seconds=300):
-            self._ground_world_model()
+        try:
+            if self.world_model.needs_regrounding(max_age_seconds=WORLD_MODEL_REGROUND_INTERVAL):
+                self._ground_world_model()
+        except Exception as exc:
+            logger.warning("[AGICore] 知覚フェーズでエラー (続行): %s", exc)
         self._record_module_use("world_model")
 
         # --- 2. 内部対話フェーズ (高リスク・高不確実時のみ) ---
         deliberation = None
-        preliminary_prediction = self.predictor.predict(
-            action=f"GOAL: {goal}", goal=goal, context=context,
-        )
-        preliminary_ethics = self.value_system.assess(goal)
+        _goal_already_refined = False
+        try:
+            preliminary_prediction = self.predictor.predict(
+                action=f"GOAL: {goal}", goal=goal, context=context,
+            )
+            preliminary_ethics = self.value_system.assess(goal)
 
-        if self.inner_dialogue.should_deliberate(
-            goal,
-            prediction_confidence=preliminary_prediction.success_probability,
-            ethics_score=preliminary_ethics.total_score,
-        ):
-            deliberation = self.inner_dialogue.deliberate(goal, context)
-            self._record_module_use("inner_dialogue")
-            if deliberation.refined_goal != goal:
-                print(
-                    f"[InnerDialogue] ゴール洗練: {goal[:40]}... → {deliberation.refined_goal[:40]}...",
-                    flush=True,
-                )
-                goal = deliberation.refined_goal
-            if not deliberation.should_proceed:
+            if self.inner_dialogue.should_deliberate(
+                goal,
+                prediction_confidence=preliminary_prediction.success_probability,
+                ethics_score=preliminary_ethics.total_score,
+            ):
+                deliberation = self.inner_dialogue.deliberate(goal, context)
+                self._record_module_use("inner_dialogue")
+                if not _goal_already_refined and deliberation.refined_goal != goal:
+                    logger.info(
+                        "[InnerDialogue] ゴール洗練: %s → %s",
+                        goal[:PREVIEW_SHORT], deliberation.refined_goal[:PREVIEW_SHORT],
+                    )
+                    goal = deliberation.refined_goal
+                    _goal_already_refined = True
+                if not deliberation.should_proceed:
+                    return {
+                        "result": f"[InnerDialogue] 対話の結果、実行を見送り: {deliberation.key_concerns}",
+                        "success": False,
+                        "identity": self.identity.profile_summary(),
+                        "insights": [],
+                        "new_goals": 0,
+                        "metrics": "",
+                        "strategy": "",
+                        "deliberation": deliberation.consensus_level,
+                    }
+        except Exception as exc:
+            logger.warning("[AGICore] 内部対話フェーズでエラー (続行): %s", exc)
+
+        # --- 3. 倫理評価フェーズ ---
+        try:
+            ethics = self.value_system.assess(goal)
+            if ethics.is_blocked:
                 return {
-                    "result": f"[InnerDialogue] 対話の結果、実行を見送り: {deliberation.key_concerns}",
+                    "result": f"[ValueSystem] {ethics.recommendation}",
                     "success": False,
                     "identity": self.identity.profile_summary(),
                     "insights": [],
                     "new_goals": 0,
                     "metrics": "",
                     "strategy": "",
-                    "deliberation": deliberation.consensus_level,
                 }
-
-        # --- 3. 倫理評価フェーズ ---
-        ethics = self.value_system.assess(goal)
-        if ethics.is_blocked:
-            return {
-                "result": f"[ValueSystem] {ethics.recommendation}",
-                "success": False,
-                "identity": self.identity.profile_summary(),
-                "insights": [],
-                "new_goals": 0,
-                "metrics": "",
-                "strategy": "",
-            }
-        self._record_module_use("value_system")
+            self._record_module_use("value_system")
+        except Exception as exc:
+            logger.warning("[AGICore] 倫理評価フェーズでエラー (続行): %s", exc)
+            # 倫理評価に失敗した場合はデフォルトの ethics を作成
+            from .value_system import ValueAssessment
+            ethics = ValueAssessment(
+                action=goal, total_score=0.0, violations=[],
+                is_blocked=False, recommendation="",
+            )
 
         # --- 4. 注意選択フェーズ: GlobalWorkspace ---
-        self._build_gen9_signals(goal, context, ethics, deliberation)
-        broadcast = self.workspace.broadcast()
-        if broadcast:
-            print(
-                f"[GlobalWorkspace] 注意焦点: [{broadcast.winner.source.value}] "
-                f"{broadcast.winner.content[:60]}",
-                flush=True,
-            )
+        try:
+            self._build_gen9_signals(goal, context, ethics, deliberation)
+            broadcast = self.workspace.broadcast()
+            if broadcast and broadcast.winner:
+                logger.info(
+                    "[GlobalWorkspace] 注意焦点: [%s] %s",
+                    broadcast.winner.source.value, broadcast.winner.content[:PREVIEW_MEDIUM],
+                )
+        except Exception as exc:
+            logger.warning("[AGICore] 注意選択フェーズでエラー (続行): %s", exc)
         self._record_module_use("workspace")
 
         # --- 5. メタ学習戦略選択フェーズ ---
-        domain = getattr(deliberation, "original_goal", goal).split()[0] if deliberation else "general"
-        strategy = self.meta_learner.select_strategy(domain)
-        print(f"[MetaLearner] 選択戦略: {strategy.name} (UCB={strategy.ucb_score:.2f})", flush=True)
+        domain = "general"
+        strategy = None
+        try:
+            domain = getattr(deliberation, "original_goal", goal).split()[0] if deliberation else "general"
+            strategy = self.meta_learner.select_strategy(domain)
+            logger.info("[MetaLearner] 選択戦略: %s (UCB=%.2f)", strategy.name, strategy.ucb_score)
+        except Exception as exc:
+            logger.warning("[AGICore] メタ学習フェーズでエラー: %s — デフォルト戦略を使用", exc)
         self._record_module_use("meta_learner")
 
+        # strategy がNoneの場合のフォールバック
+        if strategy is None:
+            from .meta_learning import StrategyRecord
+            strategy = StrategyRecord(
+                name="observe_then_act", domain="general", description="fallback",
+                total_uses=0, successes=0, avg_reward=0.0, ucb_score=0.0,
+            )
+
         # --- 6. 予測フェーズ ---
-        prediction = self.predictor.predict(
-            action=f"GOAL: {goal}",
-            goal=goal,
-            context=f"{context} | 戦略: {strategy.name}",
-        )
-        print(
-            f"[PredictiveEngine] 予測: 成功={prediction.success_probability:.0%}",
-            flush=True,
-        )
+        prediction = None
+        try:
+            prediction = self.predictor.predict(
+                action=f"GOAL: {goal}",
+                goal=goal,
+                context=f"{context} | 戦略: {strategy.name}",
+            )
+            logger.info("[PredictiveEngine] 予測: 成功=%.0f%%", prediction.success_probability * 100)
+        except Exception as exc:
+            logger.warning("[AGICore] 予測フェーズでエラー (続行): %s", exc)
         self._record_module_use("predictor")
 
         # --- 7. 行動フェーズ (適応的実行深度) ---
-        complexity = self.world_model.estimate_goal_complexity(goal)
+        try:
+            complexity = self.world_model.estimate_goal_complexity(goal)
+        except Exception as exc:
+            logger.warning("[AGICore] 複雑度推定でエラー: %s — デフォルト使用", exc)
+            complexity = None
+        if not isinstance(complexity, dict) or "recommended_iterations" not in complexity:
+            complexity = {"recommended_iterations": 5, "complexity": "medium"}
         max_iter = complexity["recommended_iterations"]
 
         agent = HermesAgentV9(
@@ -423,88 +512,130 @@ class AGICore:
         state.working_memory["goal_complexity"] = complexity
 
         # few-shot例とanti-patternをワーキングメモリに注入
-        self.self_improver.inject_into_state(state)
+        try:
+            self.self_improver.inject_into_state(state)
+        except Exception as exc:
+            logger.warning("[AGICore] few-shot注入でエラー (続行): %s", exc)
 
         # 内部対話の結果を注入
         if deliberation:
             state.working_memory["deliberation_concerns"] = deliberation.key_concerns
             state.working_memory["deliberation_approach"] = deliberation.suggested_approach
 
-        final_state = agent.run(state)
+        # エージェント実行 — これが最も重要な操作
+        try:
+            final_state = agent.run(state)
+        except Exception as exc:
+            logger.error("[AGICore] エージェント実行で致命的エラー: %s", exc)
+            final_state = state
+            final_state.is_done = False
+            final_state.failed_steps.append(f"agent.run() failed: {exc}")
+
         result_text = "\n".join(final_state.observations) if final_state.observations else "（観測なし）"
         success = final_state.is_done and len(final_state.failed_steps) == 0
 
         # --- 8. 学習フェーズ ---
-        actual_success = success
-        self.predictor.record_outcome(
-            prediction=prediction,
-            actual_outcome=result_text[:200],
-            actual_success=actual_success,
-        )
+        try:
+            if prediction is not None:
+                self.predictor.record_outcome(
+                    prediction=prediction,
+                    actual_outcome=result_text[:OUTCOME_TRUNCATE],
+                    actual_success=success,
+                )
+        except Exception as exc:
+            logger.warning("[AGICore] 予測結果記録でエラー (続行): %s", exc)
 
         if success:
             self.identity.successful_goals += 1
 
-        # メタ学習: 戦略の成否を記録
-        reward = 1.0 if success else (0.3 if final_state.completed_steps else 0.0)
-        self.meta_learner.record_outcome(
-            domain=domain,
-            strategy_name=strategy.name,
-            goal=goal[:100],
-            reward=reward,
+        partial_reward = max(
+            PARTIAL_REWARD_MIN,
+            len(final_state.completed_steps)
+            / max(1, len(final_state.completed_steps) + len(final_state.failed_steps)),
         )
+        reward = 1.0 if success else partial_reward
 
-        # 軌跡から few-shot 例・anti-pattern を学習
-        self.self_improver.analyze_session(final_state)
-        perf_score = 1.0 if success else (0.4 if final_state.completed_steps else 0.1)
-        self.self_improver.record_session_performance(
-            session_id=final_state.session_id,
-            goal=goal,
-            domain=domain,
-            score=perf_score,
-        )
+        try:
+            self.meta_learner.record_outcome(
+                domain=domain,
+                strategy_name=strategy.name,
+                goal=goal[:PREVIEW_LONG],
+                reward=reward,
+            )
+        except Exception as exc:
+            logger.warning("[AGICore] メタ学習記録でエラー (続行): %s", exc)
+
+        try:
+            self.self_improver.analyze_session(final_state)
+            perf_score = 1.0 if success else partial_reward
+            self.self_improver.record_session_performance(
+                session_id=final_state.session_id,
+                goal=goal,
+                domain=domain,
+                score=perf_score,
+            )
+        except Exception as exc:
+            logger.warning("[AGICore] セッション分析でエラー (続行): %s", exc)
         self._record_module_use("self_improver")
 
         # --- 9. 内発動機フェーズ: 自律的ゴール生成 ---
-        new_goals_count = self._generate_intrinsic_goals()
+        new_goals_count = 0
+        try:
+            new_goals_count = self._generate_intrinsic_goals()
+        except Exception as exc:
+            logger.warning("[AGICore] 内発動機フェーズでエラー (続行): %s", exc)
         self._record_module_use("motivation")
 
         # --- 10. 省察フェーズ (定期的・適応的インターバル) ---
-        recent_trend = self.self_improver.get_performance_trend(window=10)
         insights_summary: List[str] = []
+        try:
+            recent_trend = self.self_improver.get_performance_trend(window=10)
 
-        if self.reflection_engine.should_reflect(recent_success_rate=recent_trend):
-            insights = self.reflection_engine.reflect(self.ltm)
-            insights_summary = [f"[{i.category}] {i.content[:60]}" for i in insights[:3]]
+            if self.reflection_engine.should_reflect(recent_success_rate=recent_trend):
+                insights = self.reflection_engine.reflect(self.ltm)
+                insights_summary = [f"[{i.category}] {i.content[:PREVIEW_MEDIUM]}" for i in insights[:INSIGHTS_DISPLAY_LIMIT]]
 
-            # 戦略的ゴールを MetaCognition に追加
-            strategic_goals = self.reflection_engine.generate_strategic_goals(insights, self.ltm)
-            for sg in strategic_goals:
-                self.meta.goal_queue.add(sg)
-                new_goals_count += 1
+                # 戦略的ゴールを MetaCognition に追加
+                try:
+                    strategic_goals = self.reflection_engine.generate_strategic_goals(insights, self.ltm)
+                    for sg in strategic_goals:
+                        self.meta.goal_queue.add(sg)
+                        new_goals_count += 1
+                except Exception as exc:
+                    logger.warning("[AGICore] 戦略的ゴール生成でエラー (続行): %s", exc)
 
-            # 自己同一性を更新 (予測精度も含む)
-            metrics = self.reflection_engine.compute_growth_metrics(self.ltm)
-            metrics.prediction_accuracy = self.predictor.get_accuracy()
-            self.identity.update_from_metrics(metrics)
+                # 自己同一性を更新
+                try:
+                    metrics = self.reflection_engine.compute_growth_metrics(self.ltm)
+                    metrics.prediction_accuracy = self.predictor.get_accuracy()
+                    self.identity.update_from_metrics(metrics)
+                except Exception as exc:
+                    logger.warning("[AGICore] 成長指標更新でエラー (続行): %s", exc)
 
-            # 省察サイクルカウンタを更新
-            self._reflection_count += 1
-            self._record_module_use("reflection_engine")
+                self._reflection_count += 1
+                self._record_module_use("reflection_engine")
 
-            if self._reflection_count % 3 == 0:
-                # AutoResearch方式: 洞察 → 実験 → メトリクス検証
-                if self.llm is not None:
-                    exp_results = self.experiment_runner.run_experiments_from_insights(
-                        insights, max_experiments=2
-                    )
-                    accepted_count = sum(1 for r in exp_results if r.accepted)
-                    if accepted_count == 0 and exp_results:
-                        self._attempt_self_modification(insights)
+                # AutoResearch / 自己修正
+                if self._reflection_count % SELF_MODIFICATION_INTERVAL == 0:
+                    try:
+                        if self.llm is not None:
+                            exp_results = self.experiment_runner.run_experiments_from_insights(
+                                insights, max_experiments=2
+                            )
+                            accepted_count = sum(1 for r in exp_results if r.accepted)
+                            if accepted_count == 0 and exp_results:
+                                self._attempt_self_modification(insights)
+                    except Exception as exc:
+                        logger.warning("[AGICore] 自己修正/実験でエラー (続行): %s", exc)
+        except Exception as exc:
+            logger.warning("[AGICore] 省察フェーズでエラー (続行): %s", exc)
 
-        # 転移学習チェック (10ゴールごと)
-        if self.identity.total_goals_processed % 10 == 0:
-            self._attempt_transfer_learning(domain)
+        # 転移学習チェック
+        try:
+            if self.identity.total_goals_processed % TRANSFER_LEARNING_INTERVAL == 0:
+                self._attempt_transfer_learning(domain)
+        except Exception as exc:
+            logger.warning("[AGICore] 転移学習でエラー (続行): %s", exc)
 
         # Identityを永続化
         self.save_identity()
@@ -517,7 +648,7 @@ class AGICore:
             "new_goals": new_goals_count,
             "metrics": self.predictor.summary(),
             "strategy": strategy.name,
-            "complexity": complexity["complexity"],
+            "complexity": complexity.get("complexity", "unknown"),
             "deliberation": deliberation.consensus_level if deliberation else None,
         }
 
@@ -525,7 +656,7 @@ class AGICore:
     # 自律ループ: GoalQueueを自動消化
     # ------------------------------------------------------------------
 
-    def autonomous_loop(self, max_cycles: int = 10, idle_dream: bool = True) -> List[Dict[str, Any]]:
+    def autonomous_loop(self, max_cycles: int = 10, idle_dream: bool = True) -> List[RunGoalResult]:
         """GoalQueueからゴールを取り出して連続実行する。
 
         Args:
@@ -536,34 +667,49 @@ class AGICore:
             各サイクルの実行結果リスト
         """
         results = []
-        print(f"[AGICore] 自律ループ開始 (最大{max_cycles}サイクル)", flush=True)
+        logger.info("[AGICore] 自律ループ開始 (最大%dサイクル)", max_cycles)
 
         for cycle in range(max_cycles):
             # GoalQueueからゴールを取得
             queued = self.meta.goal_queue.pop()
             if queued is None:
                 if idle_dream:
-                    # キューが空の場合: Dreamフェーズ
-                    print(f"[AGICore] サイクル {cycle+1}: GoalQueue空 → 夢フェーズ", flush=True)
-                    self._dream_phase()
+                    logger.info("[AGICore] サイクル %d: GoalQueue空 → 夢フェーズ", cycle + 1)
+                    try:
+                        self._dream_phase()
+                    except Exception as exc:
+                        logger.warning("[AGICore] 夢フェーズでエラー (続行): %s", exc)
 
-                    # 内発動機で新しいゴールを生成
-                    new_count = self._generate_intrinsic_goals()
+                    try:
+                        new_count = self._generate_intrinsic_goals()
+                    except Exception as exc:
+                        logger.warning("[AGICore] 内発動機生成でエラー: %s", exc)
+                        new_count = 0
                     if new_count == 0:
-                        print("[AGICore] 自律ループ完了: 内発動機なし", flush=True)
+                        logger.info("[AGICore] 自律ループ完了: 内発動機なし")
                         break
                     continue
                 else:
-                    print("[AGICore] 自律ループ完了: GoalQueue空", flush=True)
+                    logger.info("[AGICore] 自律ループ完了: GoalQueue空")
                     break
 
-            print(
-                f"[AGICore] サイクル {cycle+1}/{max_cycles}: "
-                f"{queued.goal[:50]} (優先度={queued.composite_score:.2f})",
-                flush=True,
+            logger.info(
+                "[AGICore] サイクル %d/%d: %s (優先度=%.2f)",
+                cycle + 1, max_cycles, queued.goal[:PREVIEW_SHORT], queued.composite_score,
             )
-            result = self.run_goal(queued.goal, context=queued.rationale)
-            results.append(result)
+            try:
+                result = self.run_goal(queued.goal, context=queued.rationale)
+                results.append(result)
+            except Exception as exc:
+                logger.error("[AGICore] ゴール実行で致命的エラー: %s", exc)
+                results.append({
+                    "result": f"エラー: {exc}",
+                    "success": False,
+                    "identity": self.identity.profile_summary(),
+                    "insights": [], "new_goals": 0, "metrics": "",
+                    "strategy": "", "complexity": "unknown",
+                    "deliberation": None,
+                })
 
         self.save_identity()
         return results
@@ -579,21 +725,26 @@ class AGICore:
         - 関連知識のクラスタリング
         - 世界モデルの不確実性マップを更新
         """
-        print("[AGICore] 夢フェーズ: 知識の統合・再構成...", flush=True)
+        logger.info("[AGICore] 夢フェーズ: 知識の統合・再構成...")
 
         # 世界モデルの不確実性を更新
-        # 長期間アクセスされていない領域の不確実性を上げる
-        for module, last_used in self._module_last_used.items():
-            age_hours = (time.time() - last_used) / 3600
-            if age_hours > 1.0:
-                self.world_model.update_uncertainty(module, 0.1)
+        try:
+            for module, last_used in self._module_last_used.items():
+                age_seconds = time.time() - last_used
+                if age_seconds > DREAM_MODULE_AGE_THRESHOLD:
+                    self.world_model.update_uncertainty(module, 0.1)
+        except Exception as exc:
+            logger.warning("[Dream] 不確実性更新でエラー (続行): %s", exc)
 
         # 戦略の転移候補を探索
-        for domain in ["coding", "system", "web", "data"]:
-            candidates = self.meta_learner.find_transfer_candidates(domain)
-            for c in candidates[:1]:  # 各ドメイン最大1件
-                self.meta_learner.apply_transfer(c)
-                print(f"[Dream] 転移学習: {c.strategy_name} ({c.source_domain}→{c.target_domain})", flush=True)
+        try:
+            for domain in DREAM_DOMAINS:
+                candidates = self.meta_learner.find_transfer_candidates(domain)
+                for c in candidates[:DREAM_TRANSFER_PER_DOMAIN]:
+                    self.meta_learner.apply_transfer(c)
+                    logger.info("[Dream] 転移学習: %s (%s→%s)", c.strategy_name, c.source_domain, c.target_domain)
+        except Exception as exc:
+            logger.warning("[Dream] 転移学習でエラー (続行): %s", exc)
 
         self._record_module_use("dream")
 
@@ -609,7 +760,7 @@ class AGICore:
             module_last_used=self._module_last_used,
             world_model_uncertainties=self.world_model.get_uncertainty_areas(),
             ltm=self.ltm,
-            max_goals=2,
+            max_goals=INTRINSIC_GOAL_MAX,
         )
 
         if not signals:
@@ -622,7 +773,7 @@ class AGICore:
             count += 1
 
         if count > 0:
-            print(f"[IntrinsicMotivation] {count}件の内発ゴールを生成", flush=True)
+            logger.info("[IntrinsicMotivation] %d件の内発ゴールを生成", count)
 
         return count
 
@@ -633,13 +784,13 @@ class AGICore:
     def _attempt_transfer_learning(self, current_domain: str) -> None:
         """メタ学習の転移候補を探して適用する。"""
         candidates = self.meta_learner.find_transfer_candidates(current_domain)
-        for c in candidates[:2]:
-            if c.transfer_confidence > 0.5:
+        for c in candidates[:TRANSFER_CANDIDATES_MAX]:
+            if c.transfer_confidence > TRANSFER_CONFIDENCE_THRESHOLD:
                 self.meta_learner.apply_transfer(c)
-                print(
-                    f"[MetaLearner] 転移: {c.strategy_name} "
-                    f"({c.source_domain}→{c.target_domain}, 確信度={c.transfer_confidence:.0%})",
-                    flush=True,
+                logger.info(
+                    "[MetaLearner] 転移: %s (%s→%s, 確信度=%.0f%%)",
+                    c.strategy_name, c.source_domain, c.target_domain,
+                    c.transfer_confidence * 100,
                 )
 
     # ------------------------------------------------------------------
@@ -650,8 +801,8 @@ class AGICore:
         self,
         goal: str,
         context: str,
-        ethics: Any,
-        deliberation: Any,
+        ethics: ValueAssessment,
+        deliberation: Optional[DeliberationResult],
     ) -> None:
         """Gen 9の全認知モジュールからGlobalWorkspace信号を構築する。"""
         # 基本信号 (Gen 7)
@@ -686,7 +837,7 @@ class AGICore:
         if deliberation:
             self.workspace.receive(WorkspaceSignal(
                 source=SignalSource.DELIBERATOR,
-                content=f"対話合意度={deliberation.consensus_level:.0%}: {deliberation.suggested_approach[:60]}",
+                content=f"対話合意度={deliberation.consensus_level:.0%}: {deliberation.suggested_approach[:PREVIEW_MEDIUM]}",
                 relevance=0.8,
                 urgency=0.5 if deliberation.key_concerns else 0.2,
                 confidence=deliberation.consensus_level,
@@ -697,27 +848,36 @@ class AGICore:
     # 状態表示
     # ------------------------------------------------------------------
 
-    def get_status(self) -> Dict[str, Any]:
-        """AGIコアの全体状態を返す。"""
-        metrics = self.reflection_engine.compute_growth_metrics(self.ltm)
-        grounding_age = self.world_model.grounding_age()
-
-        return {
+    def get_status(self) -> Dict[str, object]:
+        """AGIコアの全体状態を返す。各モジュール障害時もエラーを返す。"""
+        status: Dict[str, object] = {
             "identity": self.identity.profile_summary(),
             "self_assessment": self.identity.self_assessment,
-            "world_model_age": f"{grounding_age:.0f}秒前" if grounding_age else "未グラウンディング",
-            "goal_queue_size": self.meta.goal_queue.size(),
-            "growth_metrics": metrics.summary(),
-            "reflection": self.reflection_engine.summary(),
-            "workspace": self.workspace.summary(),
-            "prediction_accuracy": self.predictor.get_accuracy(),
-            "experiment_loop": self.experiment_runner.summary(),
-            # Gen 9
-            "meta_learner": self.meta_learner.summary(),
-            "motivation": self.motivation.summary(),
-            "inner_dialogue": self.inner_dialogue.summary(),
-            "resource_usage": self.world_model.resource_summary(),
         }
+        # 各モジュールのステータスを個別に取得 (1つの障害で全体が落ちない)
+        _status_getters = {
+            "world_model_age": lambda: (
+                f"{self.world_model.grounding_age():.0f}秒前"
+                if self.world_model.grounding_age() else "未グラウンディング"
+            ),
+            "goal_queue_size": lambda: self.meta.goal_queue.size(),
+            "growth_metrics": lambda: self.reflection_engine.compute_growth_metrics(self.ltm).summary(),
+            "reflection": lambda: self.reflection_engine.summary(),
+            "workspace": lambda: self.workspace.summary(),
+            "prediction_accuracy": lambda: self.predictor.get_accuracy(),
+            "experiment_loop": lambda: self.experiment_runner.summary(),
+            "meta_learner": lambda: self.meta_learner.summary(),
+            "motivation": lambda: self.motivation.summary(),
+            "inner_dialogue": lambda: self.inner_dialogue.summary(),
+            "resource_usage": lambda: self.world_model.resource_summary(),
+        }
+        for key, getter in _status_getters.items():
+            try:
+                status[key] = getter()
+            except Exception as exc:
+                logger.warning("[AGICore] ステータス取得エラー (%s): %s", key, exc)
+                status[key] = f"(エラー: {exc})"
+        return status
 
     def print_status(self) -> None:
         """AGIコアの状態を表示する。"""
@@ -739,6 +899,18 @@ class AGICore:
     # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
+
+    def _cleanup_stale_modules(self) -> None:
+        """MODULE_LAST_USED_TTL より古いエントリを _module_last_used から除去する。"""
+        now = time.time()
+        stale_keys = [
+            k for k, v in self._module_last_used.items()
+            if (now - v) > MODULE_LAST_USED_TTL
+        ]
+        for k in stale_keys:
+            del self._module_last_used[k]
+        if stale_keys:
+            logger.info("[AGICore] %d件の古いモジュール追跡エントリを削除", len(stale_keys))
 
     def _record_module_use(self, module_name: str) -> None:
         """モジュール使用を記録する。"""
@@ -763,7 +935,7 @@ class AGICore:
         # 学習済みパターンを先にチェック
         pattern = self.self_modifier.find_similar_pattern(insight.content)
         if pattern:
-            print(f"[SelfModifier] 学習済みパターンを適用: {pattern['insight_keywords']}", flush=True)
+            logger.info("[SelfModifier] 学習済みパターンを適用: %s", pattern['insight_keywords'])
 
         keyword_to_target = {
             "計画": "hermes_agi_gen/planner.py",
@@ -803,27 +975,32 @@ class AGICore:
             f"根拠: {insight.source}\n"
             f"最近の成功率: {self.identity.success_rate:.0%}"
         )
-        print(f"[SelfModifier] 自己修正を試みる: {target}", flush=True)
-        patch = self.self_modifier.propose_change(target, analysis)
-        if patch:
-            accepted = self.self_modifier.validate_and_commit(patch)
-            status = "受け入れ ✓" if accepted else "ロールバック ✗"
-            print(f"[SelfModifier] {target} → {status}: {patch.rationale[:60]}", flush=True)
+        logger.info("[SelfModifier] 自己修正を試みる: %s", target)
+        try:
+            patch = self.self_modifier.propose_change(target, analysis)
+            if patch:
+                accepted = self.self_modifier.validate_and_commit(patch)
+                status = "受け入れ" if accepted else "ロールバック"
+                logger.info("[SelfModifier] %s → %s: %s", target, status, patch.rationale[:60])
 
-            # 学習済みパターンに記録
-            if accepted:
-                self.self_modifier.learn_pattern(
-                    insight.category,
-                    ",".join(content_lower.split()[:5]),
-                    target,
-                    patch.rationale,
-                )
-        else:
-            print("[SelfModifier] 適切なパッチ提案なし", flush=True)
+                if accepted:
+                    self.self_modifier.learn_pattern(
+                        insight.category,
+                        ",".join(content_lower.split()[:5]),
+                        target,
+                        patch.rationale,
+                    )
+            else:
+                logger.info("[SelfModifier] 適切なパッチ提案なし")
+        except Exception as exc:
+            logger.warning("[SelfModifier] 自己修正でエラー: %s", exc)
 
     def _ground_world_model(self) -> None:
         """世界モデルをファイルシステムの実態にグラウンドする。"""
-        self.world_model.initialize_from_filesystem(str(self.repo_root))
-        age = self.world_model.grounding_age()
-        if age is not None and age < 1.0:
-            print("[WorldModel] グラウンディング完了", flush=True)
+        try:
+            self.world_model.initialize_from_filesystem(str(self.repo_root))
+            age = self.world_model.grounding_age()
+            if age is not None and age < 1.0:
+                logger.info("[WorldModel] グラウンディング完了")
+        except Exception as exc:
+            logger.warning("[WorldModel] グラウンディングでエラー: %s", exc)

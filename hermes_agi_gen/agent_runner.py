@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .agent_state import AgentState
+from .config import AGENT_MAX_TOOL_OUTPUTS, AGENT_TOOL_OUTPUT_MAX_LEN
 from .executor import Executor
 from .long_term_memory import LongTermMemory
 from .memory import initialize_working_memory
@@ -18,6 +20,9 @@ from .state_store import SessionDB
 from .state_store import load_latest_run_summary, save_run_summary
 from .value_system import ValueSystem
 from .world_model import WorldModel
+
+
+logger = logging.getLogger(__name__)
 
 
 class HermesAgentV9:
@@ -114,7 +119,7 @@ class HermesAgentV9:
             if self.meta.is_stuck(state):
                 pivot = self.meta.suggest_pivot(state, self.ltm)
                 if pivot:
-                    print(f"  [メタ認知] 行き詰まりを検出 → 戦略転換: {pivot[:60]}", flush=True)
+                    logger.info("[メタ認知] 行き詰まりを検出 → 戦略転換: %s", pivot[:60])
                     state.current_plan.insert(0, pivot)
                     state.observations.append(f"[メタ認知] 行き詰まりを検出。戦略を転換します。")
 
@@ -127,10 +132,7 @@ class HermesAgentV9:
             # --- Gen 6: ValueSystem による倫理評価 ---
             ethics = self.value_system.assess(step)
             if ethics.is_blocked:
-                print(
-                    f"  [ValueSystem] ブロック: {ethics.recommendation[:60]}",
-                    flush=True,
-                )
+                logger.info("[ValueSystem] ブロック: %s", ethics.recommendation[:60])
                 state.observations.append(f"[ValueSystem] {ethics.recommendation}")
                 state.failed_steps.append(step)
                 state.working_memory.setdefault("blocked_by_ethics", []).append(step)
@@ -142,23 +144,23 @@ class HermesAgentV9:
                 goal=state.user_goal,
             )
             if prediction.confidence > 0.6 and prediction.success_probability < 0.25:
-                print(
-                    f"  [PredictiveEngine] 低成功予測 ({prediction.success_probability:.0%}): "
-                    f"{prediction.basis[:60]}",
-                    flush=True,
+                logger.info(
+                    "[PredictiveEngine] 低成功予測 (%s): %s",
+                    f"{prediction.success_probability:.0%}",
+                    prediction.basis[:60],
                 )
                 state.observations.append(
                     f"[予測] {step[:40]} — 成功確率={prediction.success_probability:.0%}"
                 )
 
             state.last_step = step
-            print(f"  [{state.iteration_count}/{state.max_iterations}] {step[:80]}", flush=True)
+            logger.info("[%d/%d] %s", state.iteration_count, state.max_iterations, step[:80])
             self.session_db.append_message(state.session_id, "assistant", f"次の一手: {step}")
             result = self.executor.execute(step, state)
             if not result.get("ok") and result.get("stderr"):
-                print(f"  [エラー] {result['stderr'][:200]}", flush=True)
+                logger.warning("[エラー] %s", result['stderr'][:200])
             elif result.get("stdout") and step.upper().startswith("PYTHON:"):
-                print(f"  [出力] {result['stdout'][:200]}", flush=True)
+                logger.debug("[出力] %s", result['stdout'][:200])
 
             # Gen 9: ツール出力をworking_memoryに記録 (CLI表示用)
             stdout = result.get("stdout", "")
@@ -167,7 +169,11 @@ class HermesAgentV9:
                 if any(step_upper.startswith(p) for p in ("FETCH:", "PYTHON:", "CMD:", "SEARCH:", "CALC:")):
                     if "tool_outputs" not in state.working_memory:
                         state.working_memory["tool_outputs"] = []
-                    state.working_memory["tool_outputs"].append(stdout[:2000])
+                    tool_outputs = state.working_memory["tool_outputs"]
+                    tool_outputs.append(stdout[:AGENT_TOOL_OUTPUT_MAX_LEN])
+                    # FIFO: remove oldest entries when exceeding max
+                    while len(tool_outputs) > AGENT_MAX_TOOL_OUTPUTS:
+                        tool_outputs.pop(0)
 
             review = self.reviewer.evaluate(step, result, state)
 
