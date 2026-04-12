@@ -364,10 +364,32 @@ python cli.py
 
 ### 自然言語スケジュール
 
+フリーテキストで時刻指定すると自動スケジュール登録されます。24時間表記・午前/午後表記の両方に対応:
+
 ```
-2026年4月12日午前9時になったら、天気予報を取得して要約してください
+17時30分になったら、Hacker Newsの最初のニュースを日本語で表示して
+午後5時になったら、天気予報を取得して要約してください
+2026年4月12日午前9時になったら、HNのAIニュースを翻訳して~/Desktop/AI_News/に保存して
 毎日午前8時になったら、HNのAIニュースを翻訳して~/Desktop/AI_News/に保存して
 30分ごとにシステム状態を確認して
+```
+
+`〜時〜分になったら` の時刻表現を自動検出し、スケジュール登録 → 指定時刻に自動発火します。
+
+### Hacker News プリビルトパイプライン
+
+ゴールに「Hacker News」+「日本語」が含まれる場合、LLMに頼らず動作確認済みスクリプトが自動発動:
+
+1. HN API (`firebaseio.com`) でトップストーリーのIDを取得
+2. 記事URLから本文をスクレイピング（`<script>`/`<style>` 除去済み）
+3. Anthropic API (Claude Haiku) または Groq API で日本語に翻訳・要約
+4. タイトル・出典URL・日本語要約を画面に表示
+
+ファイル保存を指示した場合は `~/Desktop/AI_News/AI_News_MM-DD_HHMM.txt` に自動保存:
+
+```
+Hacker Newsの最初のニュースを日本語で表示して         → 画面表示のみ
+HNのAIニュースを翻訳して~/Desktop/AI_News/に保存して  → ファイル保存+画面表示
 ```
 
 ---
@@ -409,6 +431,25 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 | InnerDialogue | `inner_dialogue.py` | 290 | メモリ |
 | ResourceCost追跡 | `world_model.py` | +120 | メモリ |
 | 学習済みパターンDB | `self_modifier.py` | +100 | SQLite |
+
+---
+
+## Gen 9 の改善点
+
+| # | ファイル | 変更内容 |
+|---|---|---|
+| 1 | `agi_core.py` | 永続Identity (SQLite LTM)・10段階認知ループ・autonomous_loop・夢フェーズ |
+| 2 | `intrinsic_motivation.py` | **新規**: 5動機源による自律的ゴール生成 (LLM不要) |
+| 3 | `meta_learning.py` | **新規**: UCB1戦略選択・転移学習・適応的探索率 |
+| 4 | `inner_dialogue.py` | **新規**: 批判者/革新者/倫理家/戦略家の内部対話 |
+| 5 | `self_modifier.py` | ホワイトリスト14ファイルに拡張・学習済みパターンDB・リスク段階制 |
+| 6 | `world_model.py` | ResourceCost追跡・ゴール複雑度推定・不確実性マップ |
+| 7 | `executor.py` | 全ツール実行にコスト計測を注入 |
+| 8 | `consciousness.py` | 3新SignalSource (MOTIVATOR, META_LEARNER, DELIBERATOR) |
+| 9 | `agent_runner.py` | ツール出力を `tool_outputs` に記録 (CLI表示用) |
+| 10 | `cli.py` | 24時間表記スケジュール対応・HNプリビルトパイプライン (表示のみ)・実行結果パネル表示 |
+| 11 | `mistral_client.py` | `--model` 明示指定時に環境変数より優先・タイムアウト180秒に延長 |
+| 12 | `__init__.py` | 新モジュール全export |
 
 ---
 

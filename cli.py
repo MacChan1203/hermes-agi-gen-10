@@ -233,6 +233,8 @@ _TIME_SPEC_PATTERNS = [
     r'\d{4}年\d{1,2}月\d{1,2}日',   # 2026年4月6日
     r'午前\d{1,2}時\d{0,2}分?',     # 午前3時32分
     r'午後\d{1,2}時\d{0,2}分?',
+    r'\d{1,2}時\d{0,2}分?になったら',  # 17時31分になったら (24時間表記)
+    r'\d{1,2}時\d{0,2}分?になれば',
     r'\d{1,2}:\d{2}に',              # 09:00に
     r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}',  # ISO8601
     r'になったら',
@@ -248,6 +250,7 @@ _TIME_SPEC_RE = re.compile("|".join(_TIME_SPEC_PATTERNS))
 def _extract_schedule_trigger(message: str) -> Optional[str]:
     """時間指定リクエストからISO8601トリガー文字列を抽出する。なければNone。"""
     import re
+    import datetime
 
     # ISO8601 直接指定
     m = re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}', message)
@@ -256,26 +259,39 @@ def _extract_schedule_trigger(message: str) -> Optional[str]:
 
     # 「YYYY年MM月DD日 午前/午後HH時MM分」形式
     date_m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', message)
+
+    hour, minute = None, None
+
+    # 午前/午後 付き: 午前3時32分, 午後5時
     time_m = re.search(r'午前(\d{1,2})時(\d{1,2})?分?', message)
-    if not time_m:
+    if time_m:
+        hour = int(time_m.group(1))
+        if hour == 12:
+            hour = 0
+        minute = int(time_m.group(2) or 0)
+    else:
         time_m = re.search(r'午後(\d{1,2})時(\d{1,2})?分?', message)
         if time_m:
             hour = int(time_m.group(1))
             if hour != 12:
                 hour += 12
             minute = int(time_m.group(2) or 0)
-        else:
-            hour, minute = None, None
-    else:
-        hour = int(time_m.group(1))
-        # 午前12時 = 深夜0時 (midnight = 00:xx)
-        if hour == 12:
-            hour = 0
-        minute = int(time_m.group(2) or 0)
 
-    if date_m and hour is not None:
-        y, mo, d = date_m.group(1), date_m.group(2).zfill(2), date_m.group(3).zfill(2)
-        return f"once:{y}-{mo}-{d}T{str(hour).zfill(2)}:{str(minute).zfill(2)}"
+    # 24時間表記: 17時31分, 9時, 23時05分
+    if hour is None:
+        time_m = re.search(r'(\d{1,2})時(\d{1,2})?分?', message)
+        if time_m:
+            hour = int(time_m.group(1))
+            minute = int(time_m.group(2) or 0)
+
+    if hour is not None:
+        if date_m:
+            y, mo, d = date_m.group(1), date_m.group(2).zfill(2), date_m.group(3).zfill(2)
+            return f"once:{y}-{mo}-{d}T{str(hour).zfill(2)}:{str(minute).zfill(2)}"
+        else:
+            # 日付なし → 今日の日付を補完
+            today = datetime.date.today()
+            return f"once:{today.isoformat()}T{str(hour).zfill(2)}:{str(minute).zfill(2)}"
 
     # 「HH:MM に」形式
     hhmm_m = re.search(r'(\d{1,2}):(\d{2})に', message)
@@ -482,6 +498,84 @@ print(f"保存完了: {{_fname}}")
 print(_content)
 """
         _prebuilt_plan = [f"PYTHON:\n{_script}", "DONE: ファイルを保存しました"]
+    elif not _prebuilt_plan and _wants_translate and any(kw in goal.lower() for kw in ["hacker news", "hn", "hackernews"]):
+        # HN + 日本語表示 (保存なし): ニュース内容を取得して翻訳・表示するスクリプト
+        _target_count_m = re.search(r'(\d+)\s*[件つ個]', goal)
+        _hn_count = int(_target_count_m.group(1)) if _target_count_m else 1
+        _hn_script = f"""\
+import requests, re, json, os
+# 1. HN APIでトップストーリーのIDを取得
+_ids = requests.get('https://hacker-news.firebaseio.com/v0/topstories.json', timeout=15).json()
+_articles = []
+for _sid in _ids[:{_hn_count}]:
+    _item = requests.get(f'https://hacker-news.firebaseio.com/v0/item/{{_sid}}.json', timeout=10).json()
+    _title = _item.get('title', '')
+    _url = _item.get('url', '')
+    # 記事本文を取得
+    _body = ''
+    if _url:
+        try:
+            _r = requests.get(_url, timeout=15, headers={{"User-Agent": "Mozilla/5.0"}})
+            _h = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", _r.text, flags=re.DOTALL|re.IGNORECASE)
+            _body = re.sub(r"<[^>]+>", " ", _h)
+            _body = re.sub(r"\\s+", " ", _body).strip()[:3000]
+        except Exception:
+            pass
+    _articles.append({{"title": _title, "url": _url, "body": _body}})
+# 2. 翻訳 (Anthropic > Groq > Ollama)
+_anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+_groq_key = os.environ.get("GROQ_API_KEY", "")
+for _a in _articles:
+    _body_snip = _a["body"][:2000] if _a["body"] else "(本文なし)"
+    _prompt = (
+        "以下の英語記事を日本語に翻訳してください。タイトルと内容の要約(300字以上)を含めてください。\\n\\n"
+        f"タイトル: {{_a['title']}}\\n出典: {{_a['url']}}\\n\\n本文抜粋:\\n{{_body_snip}}\\n\\n"
+        "以下のJSON形式のみで返してください:\\n"
+        '{{"title_ja":"日本語タイトル","summary_ja":"日本語の詳しい要約(300字以上)"}}'
+    )
+    _title_ja, _summary_ja = _a["title"], _a["body"][:500] if _a["body"] else "(内容取得不可)"
+    if _anthropic_key:
+        try:
+            _resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={{"x-api-key": _anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}},
+                json={{"model": "claude-haiku-4-5-20251001", "max_tokens": 1500,
+                      "messages": [{{"role": "user", "content": _prompt}}]}},
+                timeout=60,
+            )
+            _resp.raise_for_status()
+            _raw = _resp.json()["content"][0]["text"]
+            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
+            if _m:
+                _d = json.loads(_m.group())
+                _title_ja = _d.get("title_ja", _title_ja)
+                _summary_ja = _d.get("summary_ja", _summary_ja)
+        except Exception as _e:
+            _summary_ja = f"(翻訳エラー: {{_e}})"
+    elif _groq_key:
+        try:
+            _gr = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={{"Authorization": f"Bearer {{_groq_key}}", "Content-Type": "application/json"}},
+                json={{"model": "llama-3.1-8b-instant", "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": 1500}},
+                timeout=60,
+            )
+            _gr.raise_for_status()
+            _raw = _gr.json()["choices"][0]["message"]["content"]
+            _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
+            if _m:
+                _d = json.loads(_m.group())
+                _title_ja = _d.get("title_ja", _title_ja)
+                _summary_ja = _d.get("summary_ja", _summary_ja)
+        except Exception as _e:
+            _summary_ja = f"(翻訳エラー: {{_e}})"
+    print(f"\\n===== {{_title_ja}} =====")
+    print(f"原題: {{_a['title']}}")
+    print(f"出典: {{_a['url']}}")
+    print(f"\\n{{_summary_ja}}")
+    print()
+"""
+        _prebuilt_plan = [f"PYTHON:\n{_hn_script}", "DONE: Hacker Newsのニュースを日本語で表示しました"]
     elif _urls:
         context_hint = (
             "【重要】ゴールに以下のURLが含まれています。"
@@ -528,6 +622,13 @@ print(_content)
     summary = final_state.working_memory.get("completion_summary", "")
     if not summary and final_state.observations:
         summary = final_state.observations[-1]
+
+    # ツール実行の実際の出力を収集 (FETCH/PYTHON/CMD の stdout)
+    tool_outputs = final_state.working_memory.get("tool_outputs", [])
+    if tool_outputs:
+        combined = "\n".join(tool_outputs)
+        if combined.strip():
+            _display(combined[:3000], title="実行結果", border="green")
 
     if summary:
         _display(summary, title="エージェント完了", border="yellow")

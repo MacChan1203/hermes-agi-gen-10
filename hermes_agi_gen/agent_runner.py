@@ -160,6 +160,15 @@ class HermesAgentV9:
             elif result.get("stdout") and step.upper().startswith("PYTHON:"):
                 print(f"  [出力] {result['stdout'][:200]}", flush=True)
 
+            # Gen 9: ツール出力をworking_memoryに記録 (CLI表示用)
+            stdout = result.get("stdout", "")
+            if stdout and stdout.strip():
+                step_upper = step.upper()
+                if any(step_upper.startswith(p) for p in ("FETCH:", "PYTHON:", "CMD:", "SEARCH:", "CALC:")):
+                    if "tool_outputs" not in state.working_memory:
+                        state.working_memory["tool_outputs"] = []
+                    state.working_memory["tool_outputs"].append(stdout[:2000])
+
             review = self.reviewer.evaluate(step, result, state)
 
             # --- Gen 6: 予測誤差の記録 (学習) ---

@@ -22,7 +22,7 @@ from .hermes_constants import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 60
+_DEFAULT_TIMEOUT = 180  # qwen3等のthinkingモデルは推論に時間がかかるため余裕を持たせる
 
 
 _VALID_JSON_ESCAPES = set('"\\bfnrtu/')
@@ -174,10 +174,11 @@ class MistralClient:
             self.base_url = base_url or MISTRAL_API_BASE_URL
             self.model = model if not is_auto else "mistral-small-latest"
         else:
-            # Ollama は認証不要。OLLAMA_MODEL 環境変数でモデルを上書き可能
+            # Ollama は認証不要。
+            # 明示指定時はそのモデルを使用、未指定時は OLLAMA_MODEL 環境変数
             self.api_key = "ollama"
             self.base_url = base_url or OLLAMA_BASE_URL
-            self.model = os.getenv("OLLAMA_MODEL", model)
+            self.model = model if not is_auto else os.getenv("OLLAMA_MODEL", model)
 
     # ------------------------------------------------------------------
     # ファクトリ
