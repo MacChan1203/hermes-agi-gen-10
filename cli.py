@@ -464,11 +464,19 @@ print(_content)
 """
         _prebuilt_plan = [f"PYTHON:\n{_script}", "DONE: ファイルを保存しました"]
     elif not _prebuilt_plan and _wants_translate and any(kw in goal.lower() for kw in ["hacker news", "hn", "hackernews"]):
-        # HN + 日本語表示 (保存なし): ニュース内容を取得して翻訳・表示するスクリプト
+        # HN + 日本語: URL 無しでも HN API からトップストーリーを取得して翻訳
+        # _wants_save が True ならファイル保存、False なら画面表示のみ
         _target_count_m = re.search(r'(\d+)\s*[件つ個]', goal)
         _hn_count = int(_target_count_m.group(1)) if _target_count_m else 1
+        _out_dir_kw_hn = ""
+        _m2 = re.search(r'~/[a-zA-Z0-9/_.-]+', goal)
+        if _m2:
+            _out_dir_kw_hn = _m2.group(0).rstrip("/")
+        if not _out_dir_kw_hn:
+            _out_dir_kw_hn = "~/Desktop/AI_News"
+        _save_flag = "True" if _wants_save else "False"
         _hn_script = f"""\
-import requests, re, json, os
+import requests, re, json, os, datetime
 # 1. HN APIでトップストーリーのIDを取得
 _ids = requests.get('https://hacker-news.firebaseio.com/v0/topstories.json', timeout=15).json()
 _articles = []
@@ -488,7 +496,8 @@ for _sid in _ids[:{_hn_count}]:
             pass
     _articles.append({{"title": _title, "url": _url, "body": _body}})
 # 2. 翻訳 (Ollama gemma4:e4b)
-for _a in _articles:
+_sections = []
+for _i, _a in enumerate(_articles):
     _body_snip = _a["body"][:2000] if _a["body"] else "(本文なし)"
     _prompt = (
         "以下の英語記事を日本語に翻訳してください。タイトルと内容の要約(300字以上)を含めてください。\\n\\n"
@@ -514,13 +523,25 @@ for _a in _articles:
             _summary_ja = _d.get("summary_ja", _summary_ja)
     except Exception as _e:
         _summary_ja = f"(翻訳エラー: {{_e}})"
+    _sections.append(f"## 記事{{_i+1}}: {{_title_ja}}\\n原題: {{_a['title']}}\\n出典: {{_a['url']}}\\n\\n{{_summary_ja}}")
     print(f"\\n===== {{_title_ja}} =====")
     print(f"原題: {{_a['title']}}")
     print(f"出典: {{_a['url']}}")
     print(f"\\n{{_summary_ja}}")
     print()
+# 3. ファイル保存 (_wants_save が True の場合のみ)
+if {_save_flag}:
+    _header = f"=== Hacker News AI ニュース {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}} ===\\n"
+    _content = _header + "\\n\\n" + "\\n\\n---\\n\\n".join(_sections) + f"\\n\\n(Hacker Newsより取得 {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}})"
+    _out_dir = os.path.expanduser({_out_dir_kw_hn!r})
+    os.makedirs(_out_dir, exist_ok=True)
+    _fname = os.path.join(_out_dir, f"AI_News_{{datetime.datetime.now().strftime('%m-%d_%H%M')}}.txt")
+    with open(_fname, "w", encoding="utf-8") as _f:
+        _f.write(_content)
+    print(f"保存完了: {{_fname}}")
 """
-        _prebuilt_plan = [f"PYTHON:\n{_hn_script}", "DONE: Hacker Newsのニュースを日本語で表示しました"]
+        _done_msg = "DONE: ファイルを保存しました" if _wants_save else "DONE: Hacker Newsのニュースを日本語で表示しました"
+        _prebuilt_plan = [f"PYTHON:\n{_hn_script}", _done_msg]
     elif _urls:
         context_hint = (
             "【重要】ゴールに以下のURLが含まれています。"

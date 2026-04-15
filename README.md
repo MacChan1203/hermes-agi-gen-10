@@ -10,10 +10,10 @@
 | 指標 | 値 |
 |------|-----|
 | モジュール数 | 42 |
-| コード行数 | 15,524 |
-| テスト件数 | **563 (モック 549 + 実LLM 14、全合格)** |
+| コード行数 | 13,975 |
+| テスト件数 | **566 (モック 552 + 実LLM 14、全合格)** |
 | テストカバレッジ | 42/42 モジュール (100%) |
-| config 定数 | ~160 |
+| config 定数 | 147 |
 
 ---
 
@@ -35,9 +35,9 @@ python cli.py
 python cli.py --daemon
 
 # テスト実行
-python3 -m pytest tests/ -q                          # モックテスト (549件)
-python3 -m pytest tests/test_live_llm.py -v           # 実LLMテスト (14件, Ollama必須)
-python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト
+python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (552件)
+python3 -m pytest tests/test_live_llm.py -v              # 実LLMテスト (14件, Ollama必須)
+python3 -m pytest tests/                                  # 全テスト (566件)
 
 # Python から直接
 python3 -c "
@@ -159,7 +159,9 @@ Identity永続化 -> [ループ]
 
 | レイヤー | 手法 |
 |---------|------|
-| Python sandbox | **許可リスト方式** AST 解析 (30モジュール + 40関数のみ許可、全dunder禁止) |
+| Python sandbox | **許可リスト方式** AST 解析 (33モジュール許可、全dunder禁止) |
+| os モジュール | パス操作系は許可、破壊的/シェル系 (`system`, `popen`, `remove`, `exec*`, `fork`, `chmod` 等) を denylist 方式で拒否 |
+| open() 書込 | literal パス解析でシステム領域 (`/etc`, `/usr`, `/System`, ...) と秘密ファイル (`~/.ssh/*`, `~/.bashrc` 等) を拒否 |
 | シェル実行 | `shell=True` 完全廃止、`subprocess.Popen` チェーンでパイプ実装 |
 | CALC | `eval()` 廃止、`ast.literal_eval` + 安全な再帰降下パーサー |
 | DynamicTool | SHA-256 ハッシュ + `threading.Lock` + AST 検査 |
@@ -167,6 +169,7 @@ Identity永続化 -> [ループ]
 | LLM プロンプト | NFKC 正規化 + ロール偽装検出 + 長文切り詰め |
 | FTS5 クエリ | 演算子エスケープ + パラメータバインド |
 | ファイル書込 | `os.replace` アトミック書き込み + バックアップ |
+| メタ認知 pivot / reviewer recovery | executor 認識 prefix (`PYTHON:/CMD:/FETCH:/...`) 検証、非実行形式は破棄 |
 
 ### 6. 6つの自己適応フィードバックループ
 
@@ -244,6 +247,13 @@ python cli.py
 2026年4月12日午前9時になったら、HNのAIニュースを翻訳して~/Desktop/AI_News/に保存して
 ```
 
+#### HNニュースパイプライン
+
+- ゴールに `HN` / `Hacker News` / `hackernews` いずれかを含むと HN API からトップストーリーを取得
+- URL 直接指定時 (`https://news.ycombinator.com/` など) はそのページをスクレイプ
+- `保存` / `Desktop` / `ファイル` / `txt` のいずれかを含むと `~/Desktop/AI_News/AI_News_MM-DD_HHMM.txt` に保存 (出力先は goal 内の `~/path/...` で上書き可)
+- 件数指定 (`3件` / `2つ`) と文字数指定 (`1500字` 等) も goal から自動抽出
+
 ---
 
 ## テスト
@@ -261,10 +271,10 @@ python3 -m pytest tests/
 
 | テストファイル | 件数 | カバー内容 |
 |---------------|------|-----------|
-| `test_security.py` | 129 | AST許可リスト、Unicode回避、パス遍歴、FTSサニタイズ |
+| `test_security.py` | 132 | AST許可リスト、os denylist、open書込パス、Unicode回避、パス遍歴、FTSサニタイズ |
 | `test_infrastructure.py` | 111 | 並行安全、DAG循環、アトミック書込、エラーハンドリング |
 | `test_cognitive.py` | 92 | GWT 3次元抑制、フィードバック収束、ドメインベクトル学習 |
-| `test_cli.py` | 61 | REPL、コマンド、スケジュール検出、インテント分類 |
+| `test_cli.py` | 61 | REPL、コマンド、スケジュール検出、インテント分類、HNパイプライン |
 | `test_planner_orchestrator.py` | 60 | プランナー、オーケストレーター |
 | `test_integration.py` | 37 | Plan->Execute->Review、AGICore E2E、セキュリティ横断 |
 | `test_clients_utils.py` | 33 | MistralClient、utils、toolsets |

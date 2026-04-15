@@ -68,17 +68,23 @@ class TestIsPythonSafe:
     """Tests for _is_python_safe() AST checker."""
 
     @pytest.mark.parametrize("code", [
-        "import os",
         "import subprocess",
         "import sys",
         "import shutil",
-        "from os import path",
         "from subprocess import run",
+        # os/os.path 自体は許可だが、危険な関数の直接 import は拒否
+        "from os import system",
+        "from os import remove",
+        "from os import popen",
+        # 危険関数の呼び出し
+        "import os\nos.system('ls')",
+        "import os\nos.remove('/etc/passwd')",
     ])
     def test_rejects_dangerous_imports(self, code: str):
         safe, reason = _is_python_safe(code)
         assert safe is False
-        assert "blocked" in reason.lower() or "security" in reason.lower()
+        assert reason  # 具体的な理由が返ること
+        assert "許可" in reason or "禁止" in reason or "blocked" in reason.lower()
 
     @pytest.mark.parametrize("code", [
         "import json",
@@ -168,7 +174,7 @@ class TestShellCommandBlocking:
         state = _make_state(tmp_path)
         result = executor._run_shell(cmd, state)
         assert result["ok"] is False
-        assert "blocked" in result["stderr"].lower() or "security" in result["stderr"].lower()
+        assert "blocked" in result["stderr"].lower() or "security" in result["stderr"].lower() or "セキュリティ" in result["stderr"]
 
     def test_allows_simple_command(self, tmp_path):
         executor = _make_executor(tmp_path)
@@ -202,7 +208,7 @@ class TestPipeWhitelist:
         state = _make_state(tmp_path)
         result = executor._run_shell("ls | awk '{system(\"id\")}'", state)
         assert result["ok"] is False
-        assert "blocked" in result["stderr"].lower() or "security" in result["stderr"].lower()
+        assert "blocked" in result["stderr"].lower() or "security" in result["stderr"].lower() or "セキュリティ" in result["stderr"]
 
     def test_blocks_sed_pipe(self, tmp_path):
         """sed is not in the safe pipe commands list."""
@@ -746,7 +752,7 @@ class TestShellNoShellTrue:
         state.world_model = None
         result = ex._run_shell("echo x | /usr/bin/awk '{print}'", state)
         assert not result["ok"]
-        assert "security" in result["stderr"].lower()
+        assert "security" in result["stderr"].lower() or "セキュリティ" in result["stderr"]
 
 
 class TestPythonAllowlist:

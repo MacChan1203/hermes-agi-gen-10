@@ -10,7 +10,7 @@ from .config import AGENT_MAX_TOOL_OUTPUTS, AGENT_TOOL_OUTPUT_MAX_LEN
 from .executor import Executor
 from .long_term_memory import LongTermMemory
 from .memory import initialize_working_memory
-from .meta_cognition import MetaCognition
+from .meta_cognition import MetaCognition, _is_executable_step
 from .mistral_client import MistralClient
 from .planner import Planner
 from .predictive_engine import PredictiveEngine
@@ -118,10 +118,14 @@ class HermesAgentV10:
             # --- メタ認知: 行き詰まり検出 ---
             if self.meta.is_stuck(state):
                 pivot = self.meta.suggest_pivot(state, self.ltm)
-                if pivot:
+                if pivot and _is_executable_step(pivot):
                     logger.info("[メタ認知] 行き詰まりを検出 → 戦略転換: %s", pivot[:60])
                     state.current_plan.insert(0, pivot)
-                    state.observations.append(f"[メタ認知] 行き詰まりを検出。戦略を転換します。")
+                    state.observations.append(
+                        f"[メタ認知] 行き詰まりを検出。戦略を転換します: {pivot[:80]}"
+                    )
+                elif pivot:
+                    logger.debug("[メタ認知] pivot 候補が実行可能形式でないため破棄: %s", pivot[:80])
 
             step = self.planner.next_step(state, self.repo_root)
             if not step:
@@ -240,8 +244,13 @@ class HermesAgentV10:
                 )
 
                 recovery_action = review.get("recovery_action")
-                if recovery_action:
+                if recovery_action and _is_executable_step(recovery_action):
                     state.current_plan.insert(0, recovery_action)
+                elif recovery_action:
+                    logger.debug(
+                        "[Reviewer] recovery_action が実行可能形式でないため破棄: %s",
+                        str(recovery_action)[:80],
+                    )
 
                 if state.failed_steps.count(step) >= 2:
                     state.observations.append(f"[中断] {step} が繰り返し失敗したため終了します")

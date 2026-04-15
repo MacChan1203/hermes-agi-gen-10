@@ -193,7 +193,7 @@ class Reviewer:
                 }
             ],
             temperature=0.1,
-            max_tokens=768,
+            max_tokens=1536,
         )
 
         if not isinstance(data, dict):

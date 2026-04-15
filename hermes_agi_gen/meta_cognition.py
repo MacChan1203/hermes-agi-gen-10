@@ -30,6 +30,27 @@ if TYPE_CHECKING:
 
 
 # ------------------------------------------------------------------
+# Executor が認識するステップ prefix
+# ------------------------------------------------------------------
+
+_EXECUTABLE_PREFIXES = (
+    "PLAN:", "ANSWER:", "CALC:", "FETCH:", "SEARCH:",
+    "CMD:", "READ:", "WRITE:", "PYTHON:", "DONE:",
+    "SCHEDULE:", "SCHEDULE_AT:",
+)
+
+
+def _is_executable_step(text: str) -> bool:
+    """executor.execute() が dispatch できる prefix を持つかを判定する。"""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return stripped.upper().startswith(_EXECUTABLE_PREFIXES)
+
+
+# ------------------------------------------------------------------
 # プロンプトインジェクション防御
 # ------------------------------------------------------------------
 
@@ -293,12 +314,23 @@ class MetaCognition:
     # ------------------------------------------------------------------
 
     def suggest_pivot(self, state: AgentState, memory: LongTermMemory) -> Optional[str]:
-        """行き詰まり時に、別のアプローチを提案する。"""
+        """行き詰まり時に、別のアプローチを提案する。
+
+        Returns:
+            executor が直接実行可能なステップ文字列 (CMD:/READ:/PY: 等で始まる)。
+            注釈プレフィックスは付けない (executor が「未知のステップ」を返すため)。
+        """
         successful = memory.get_successful_strategies(limit=5)
         for s in successful:
             strategy = s.get("strategy", "")
-            if strategy and strategy not in state.failed_steps and strategy not in state.completed_steps:
-                return f"[メタ認知] 過去の成功戦略を参考: {strategy}"
+            if not isinstance(strategy, str) or not strategy.strip():
+                continue
+            strategy = strategy.strip()
+            if strategy in state.failed_steps or strategy in state.completed_steps:
+                continue
+            if not _is_executable_step(strategy):
+                continue
+            return strategy
 
         error_history = state.working_memory.get("error_history", [])
         if error_history:

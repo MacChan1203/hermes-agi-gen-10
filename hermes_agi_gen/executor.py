@@ -59,7 +59,63 @@ _ALLOWED_IMPORT_MODULES = frozenset({
     "statistics", "random", "hashlib", "hmac", "base64",
     "csv", "io", "enum", "dataclasses", "typing", "abc",
     "unicodedata", "difflib", "bisect", "heapq",
+    # ネットワーク取得 (HTTP/HTTPS のみ)
+    "urllib", "http", "requests", "httpx",
+    # パス操作
+    "os", "pathlib",
+    # HN 等の軽量パース用
+    "html", "xml",
 })
+
+# os モジュールで禁止する関数 (os.xxx 形式で検査)
+# パス操作 (os.path.*, os.getenv, os.makedirs 等) は許可、破壊的/シェル系のみ拒否
+_OS_DENY_FUNCS = frozenset({
+    "system", "popen",
+    "remove", "unlink", "rmdir", "removedirs", "truncate",
+    "execv", "execve", "execl", "execle", "execlp", "execlpe",
+    "execvp", "execvpe",
+    "spawnl", "spawnle", "spawnlp", "spawnlpe",
+    "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    "fork", "forkpty", "kill", "killpg",
+    "chmod", "chown", "lchmod", "lchown", "chroot",
+    "setuid", "setgid", "seteuid", "setegid", "setreuid", "setregid",
+    "mknod", "mkfifo", "symlink", "link", "rename", "replace",
+    "umask", "nice",
+    "exec", "_exec", "abort", "_exit",
+})
+
+# open() で書き込みを禁止するパス (literal 引数でのみ検査可能)
+_OPEN_WRITE_DENYLIST_PREFIXES = (
+    "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev",
+    "/System", "/Library/LaunchDaemons", "/Library/LaunchAgents",
+    "/private/etc", "/private/var", "/var",
+)
+_OPEN_WRITE_DENYLIST_COMPONENTS = frozenset({
+    ".ssh", ".aws", ".gnupg", ".config",
+    ".bashrc", ".zshrc", ".profile", ".bash_profile", ".zshenv",
+    "authorized_keys", "id_rsa", "id_ed25519",
+})
+
+
+def _is_safe_open_write_path(path: Any) -> bool:
+    """open() 書き込みモードで literal 指定されたパスが安全かを判定する。
+
+    - システムディレクトリ (/etc, /usr, ...) や秘密ファイル (~/.ssh/*, ~/.bashrc) を拒否
+    - それ以外 (リポジトリ配下、~/Desktop/、/tmp/ など) は許可
+    """
+    if not isinstance(path, str):
+        return False
+    # ~ を展開 (ホーム直下の秘密ファイルを検出するため)
+    expanded = path.replace("~", "/HOME", 1) if path.startswith("~") else path
+    lower = expanded
+    for prefix in _OPEN_WRITE_DENYLIST_PREFIXES:
+        if lower == prefix or lower.startswith(prefix + "/"):
+            return False
+    parts = [p for p in expanded.replace("\\", "/").split("/") if p]
+    for part in parts:
+        if part in _OPEN_WRITE_DENYLIST_COMPONENTS:
+            return False
+    return True
 
 # 許可する組み込み関数呼び出し
 _ALLOWED_BUILTINS = frozenset({
@@ -241,6 +297,17 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     _user_defined.add(target.id)
+        elif isinstance(node, ast.ImportFrom):
+            # from X import Y, Z — Y/Z をローカル名として呼び出し許可
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if local != "*":
+                    _user_defined.add(local)
+        elif isinstance(node, ast.Import):
+            # import X as Y / import X — 束縛名 (X または Y) を許可
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                _user_defined.add(local)
 
     for node in ast.walk(tree):
         # --- インポート: 許可リストのみ通す ---
@@ -248,18 +315,23 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
             for alias in node.names:
                 top = alias.name.split(".")[0]
                 if top not in _ALLOWED_IMPORT_MODULES:
-                    return False, "blocked by security policy"
+                    return False, f"import '{alias.name}' は許可されていません"
 
         elif isinstance(node, ast.ImportFrom):
             # 相対インポート (from . import X) は全面禁止
             if node.module is None:
-                return False, "blocked by security policy"
+                return False, "相対 import は禁止されています"
             top = node.module.split(".")[0]
             if top not in _ALLOWED_IMPORT_MODULES:
-                return False, "blocked by security policy"
+                return False, f"from '{node.module}' import ... は許可されていません"
             # from X import * は禁止
             if any(alias.name == "*" for alias in node.names):
-                return False, "blocked by security policy"
+                return False, f"from {node.module} import * は禁止されています"
+            # os モジュールから禁止関数の直接 import を拒否 (os.system バイパス防止)
+            if top == "os":
+                for alias in node.names:
+                    if alias.name in _OS_DENY_FUNCS:
+                        return False, f"from os import {alias.name} は禁止されています"
 
         # --- 関数呼び出し: 許可リスト + ユーザー定義のみ ---
         elif isinstance(node, ast.Call):
@@ -267,33 +339,59 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
             if isinstance(func, ast.Name):
                 name = func.id
                 if name == "open":
-                    # open() は読み取りモードのみ許可
-                    is_read = False
-                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
-                        mode = node.args[1].value
-                        if isinstance(mode, str) and set(mode) <= {"r", "b", "t"}:
-                            is_read = True
+                    # open() モード解析: 省略時 'r'、明示時は literal のみ許可
+                    mode_value: Optional[str] = "r"  # default
+                    mode_is_literal = True
+                    if len(node.args) >= 2:
+                        if isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                            mode_value = node.args[1].value
+                        else:
+                            mode_is_literal = False
                     for kw in node.keywords:
-                        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
-                            mode = kw.value.value
-                            if isinstance(mode, str) and set(mode) <= {"r", "b", "t"}:
-                                is_read = True
-                    if not is_read:
-                        return False, "blocked by security policy"
+                        if kw.arg == "mode":
+                            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                                mode_value = kw.value.value
+                            else:
+                                mode_is_literal = False
+                    if not mode_is_literal:
+                        return False, "open() の mode 引数は literal 文字列のみ許可されます"
+                    # 有効モード文字のみ許可
+                    if mode_value is None or not set(mode_value) <= {"r", "w", "a", "x", "b", "t", "+"}:
+                        return False, f"open() の mode '{mode_value}' は無効です"
+                    is_write = any(ch in mode_value for ch in ("w", "a", "x", "+"))
+                    if is_write:
+                        # 書き込み時は literal パスの危険ゾーンを拒否
+                        # (変数パスは AST では判定できないため通す)
+                        if node.args and isinstance(node.args[0], ast.Constant):
+                            path = node.args[0].value
+                            if isinstance(path, str) and not _is_safe_open_write_path(path):
+                                return False, f"open() 書き込みパス '{path}' は保護ゾーンにあります"
+                        for kw in node.keywords:
+                            if kw.arg == "file" and isinstance(kw.value, ast.Constant):
+                                path = kw.value.value
+                                if isinstance(path, str) and not _is_safe_open_write_path(path):
+                                    return False, f"open() 書き込みパス '{path}' は保護ゾーンにあります"
                 elif name not in _ALLOWED_BUILTINS and name not in _user_defined:
-                    return False, "blocked by security policy"
+                    return False, f"関数 '{name}()' は許可されていません"
             # メソッド呼び出し (.method()) — 属性部分を検査
             elif isinstance(func, ast.Attribute):
                 if func.attr.startswith("__") and func.attr.endswith("__"):
-                    return False, "blocked by security policy"
+                    return False, f"メソッド '.{func.attr}()' は禁止されています (dunder)"
+                # os.<危険関数>() を拒否。os.path.xxx は value が Attribute なので通過。
+                if (
+                    isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                    and func.attr in _OS_DENY_FUNCS
+                ):
+                    return False, f"os.{func.attr}() は禁止されています (破壊的/シェル実行系)"
 
         # --- dunder 属性アクセス: 全面禁止 ---
         elif isinstance(node, ast.Attribute):
             if node.attr in _DANGEROUS_ATTRS:
-                return False, "blocked by security policy"
+                return False, f"属性 '.{node.attr}' は禁止されています"
             # 未知の dunder も禁止 (安全側に倒す)
             if node.attr.startswith("__") and node.attr.endswith("__"):
-                return False, "blocked by security policy"
+                return False, f"dunder 属性 '.{node.attr}' は禁止されています"
 
     return True, ""
 
@@ -423,20 +521,21 @@ class Executor:
         # `;` `&&` `||` バックティック `$()` は完全禁止
         # `|` はパイプとして許可 (後続コマンドが安全リストにある場合)
         _dangerous = [";", "&&", "||", "`"]
-        if any(pat in cmd for pat in _dangerous):
-            return {
-                "ok": False,
-                "stdout": "",
-                "stderr": "セキュリティ制限: blocked by security policy",
-                "returncode": 1,
-                "command": None
-            }
+        for pat in _dangerous:
+            if pat in cmd:
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": f"セキュリティ制限: シェル連結演算子 '{pat}' は禁止されています",
+                    "returncode": 1,
+                    "command": None
+                }
         # $() コマンド置換を禁止
         if _RE_CMD_SUBSTITUTION.search(cmd):
             return {
                 "ok": False,
                 "stdout": "",
-                "stderr": "セキュリティ制限: blocked by security policy",
+                "stderr": "セキュリティ制限: $(...) コマンド置換は禁止されています",
                 "returncode": 1,
                 "command": None
             }
@@ -461,7 +560,7 @@ class Executor:
                     return {
                         "ok": False,
                         "stdout": "",
-                        "stderr": "セキュリティ制限: blocked by security policy",
+                        "stderr": f"セキュリティ制限: パイプ後続コマンド '{cmd_name}' は許可リストにありません",
                         "returncode": 1,
                         "command": None
                     }
@@ -635,7 +734,7 @@ class Executor:
         try:
             path.resolve().relative_to(resolved_root)
         except ValueError:
-            return {"ok": False, "stdout": "", "stderr": "アクセス拒否: blocked by security policy", "returncode": 1, "command": None}
+            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: READ: はリポジトリ外のパス '{filepath}' を読めません", "returncode": 1, "command": None}
 
         if not path.exists():
             return {"ok": False, "stdout": "", "stderr": f"ファイルが見つかりません: {filepath}", "returncode": 1, "command": f"READ: {filepath}"}
@@ -695,7 +794,7 @@ class Executor:
             except ValueError:
                 pass
         if not allowed:
-            return {"ok": False, "stdout": "", "stderr": "アクセス拒否: blocked by security policy", "returncode": 1, "command": None}
+            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: WRITE: はリポジトリ外かつホーム外のパス '{filepath}' に書けません", "returncode": 1, "command": None}
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
