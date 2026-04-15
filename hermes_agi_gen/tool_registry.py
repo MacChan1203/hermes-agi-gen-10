@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
 
 _REGISTRY_PATH = get_hermes_home() / "tool_registry.db"
 
@@ -157,7 +160,7 @@ class DynamicTool:
                     self._fn = fn
                     return True
             except Exception:
-                pass
+                logger.debug("ツール '%s' のコンパイルに失敗", self.name, exc_info=True)
             return False
 
     def invoke(self, args: str) -> Dict[str, Any]:

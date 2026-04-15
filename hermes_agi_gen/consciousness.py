@@ -38,7 +38,7 @@ class SignalSource(str, Enum):
     GOAL_MANAGER = "goal_manager"    # ゴール管理
     INNOVATOR = "innovator"          # 創造的解決
     ETHICIST = "ethicist"            # 価値整合
-    # Gen 9: AGI拡張シグナルソース
+    # Gen 10: AGI拡張シグナルソース
     MOTIVATOR = "motivator"          # 内発的動機
     META_LEARNER = "meta_learner"    # メタ学習戦略
     DELIBERATOR = "deliberator"      # 内部対話・合意形成
@@ -337,13 +337,13 @@ class GlobalWorkspace:
                 tags=["stuck", "pivot"],
             ))
 
-    def build_gen9_signals(
+    def build_gen10_signals(
         self,
         motivation_summary: str = "",
         meta_learner_summary: str = "",
         deliberation_result: Optional[str] = None,
     ) -> None:
-        """Gen 9 追加シグナルを構築してワークスペースに送信する。"""
+        """Gen 10 追加シグナルを構築してワークスペースに送信する。"""
         if motivation_summary:
             self.receive(WorkspaceSignal(
                 source=SignalSource.MOTIVATOR,

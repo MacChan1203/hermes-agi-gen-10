@@ -4,7 +4,7 @@
 計画前に環境の現在状態を考慮できるようにする。
 
 Gen 7追加: プロアクティブなグラウンディング (initialize_from_filesystem)
-Gen 9追加: 資源認識型プランニング (コスト追跡・複雑度推定)
+Gen 10追加: 資源認識型プランニング (コスト追跡・複雑度推定)
 """
 from __future__ import annotations
 
@@ -66,8 +66,8 @@ class WorldModel:
         known_services: 稼働中のサービス・プロセス情報
         installed_packages: インストール済みPythonパッケージ
         git_state: gitリポジトリの状態
-        resource_history: ツール実行のコスト履歴 (Gen 9)
-        uncertainty_map: 領域ごとの不確実性スコア (Gen 9)
+        resource_history: ツール実行のコスト履歴 (Gen 10)
+        uncertainty_map: 領域ごとの不確実性スコア (Gen 10)
     """
     filesystem: Dict[str, Any] = field(default_factory=dict)
     environment: Dict[str, Any] = field(default_factory=dict)
@@ -75,7 +75,7 @@ class WorldModel:
     known_services: Dict[str, str] = field(default_factory=dict)
     installed_packages: List[str] = field(default_factory=list)
     git_state: Dict[str, Any] = field(default_factory=dict)
-    # Gen 9: 資源認識
+    # Gen 10: 資源認識
     resource_history: List[ResourceCost] = field(default_factory=list)
     uncertainty_map: Dict[str, float] = field(default_factory=dict)
 
@@ -218,7 +218,7 @@ class WorldModel:
         return time.time() - grounded_at
 
     # ------------------------------------------------------------------
-    # Gen 9: 資源認識型プランニング
+    # Gen 10: 資源認識型プランニング
     # ------------------------------------------------------------------
 
     def record_resource_cost(self, tool_type: str, execution_time: float, output_size: int, success: bool) -> None:

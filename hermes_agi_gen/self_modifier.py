@@ -31,7 +31,7 @@ from .config import SELF_MODIFIER_MAX_PENDING_HIGH_RISK
 
 logger = logging.getLogger(__name__)
 
-# 自己修正が許可されるファイルのホワイトリスト (Gen 9: 拡張)
+# 自己修正が許可されるファイルのホワイトリスト (Gen 10: 拡張)
 _SAFE_MODIFY_TARGETS = {
     "hermes_agi_gen/planner.py",
     "hermes_agi_gen/reviewer.py",
@@ -40,7 +40,7 @@ _SAFE_MODIFY_TARGETS = {
     "hermes_agi_gen/long_term_memory.py",
     "hermes_agi_gen/world_model.py",
     "hermes_agi_gen/self_improvement.py",
-    # Gen 9: 認知モジュールへの自己修正を許可
+    # Gen 10: 認知モジュールへの自己修正を許可
     "hermes_agi_gen/cognitive_roles.py",
     "hermes_agi_gen/consciousness.py",
     "hermes_agi_gen/predictive_engine.py",
@@ -230,7 +230,7 @@ class SelfModifier:
         if not isinstance(data, dict):
             return None
 
-        # Gen 9: リスク段階制 (low→自動, medium→テスト必須, high→ユーザー確認要求)
+        # Gen 10: リスク段階制 (low→自動, medium→テスト必須, high→ユーザー確認要求)
         risk = data.get("risk_level", "low")
         if risk == "high":
             # high リスクはログに記録して保留（ユーザー確認を推奨）
@@ -511,7 +511,7 @@ class SelfModifier:
         return 0.0
 
     # ------------------------------------------------------------------
-    # Gen 9: 学習済み修正パターン
+    # Gen 10: 学習済み修正パターン
     # ------------------------------------------------------------------
 
     def learn_pattern(self, insight_category: str, keywords: str, target_file: str, patch_template: str) -> None:

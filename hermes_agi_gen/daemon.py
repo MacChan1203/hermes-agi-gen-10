@@ -26,7 +26,7 @@ from typing import Any, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from .mistral_client import MistralClient
 
-from .agent_runner import HermesAgentV9
+from .agent_runner import HermesAgentV10
 from .agent_state import AgentState
 from .config import (
     DAEMON_DAILY_BUDGET,
@@ -257,7 +257,7 @@ class HermesDaemon:
         logger.info("[デーモン] 本日 %d/%d ゴール消費", used, self.budget.max_daily)
 
         try:
-            agent = HermesAgentV9(
+            agent = HermesAgentV10(
                 repo_root=Path("."),
                 model=getattr(self.llm, "model", "daemon"),
                 llm=self.llm,

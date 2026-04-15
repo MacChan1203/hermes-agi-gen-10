@@ -31,7 +31,7 @@ from rich.prompt import Prompt
 from rich.rule import Rule
 from rich.table import Table
 
-from hermes_agi_gen import AgentOrchestrator, AgentState, HermesAgentV9
+from hermes_agi_gen import AgentOrchestrator, AgentState, HermesAgentV10
 from hermes_agi_gen.agi_core import AGICore
 from hermes_agi_gen.code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from hermes_agi_gen.daemon import HermesDaemon
@@ -360,7 +360,7 @@ def _run_agent(
     max_iterations: int = 8,
     world_model: Optional[WorldModel] = None,
 ) -> Tuple[str, AgentState]:
-    """HermesAgentV9 を起動してタスクを実行し、(サマリー, 最終state) を返す。"""
+    """HermesAgentV10 を起動してタスクを実行し、(サマリー, 最終state) を返す。"""
     # ゴール内の URL を抽出 (ASCII文字のみ = 日本語で誤って伸びない)
     _urls = re.findall(r'https?://[a-zA-Z0-9./_?=&#%+~-]+', goal)
     _wants_save = any(w in goal for w in ["保存", "ファイル", "txt", "Desktop", "save", "write"])
@@ -534,7 +534,7 @@ for _a in _articles:
         style="yellow",
     ))
 
-    agent = HermesAgentV9(
+    agent = HermesAgentV10(
         repo_root=Path("."),
         model=llm.model,
         max_iterations=max_iterations,

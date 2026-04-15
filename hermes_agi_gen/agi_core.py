@@ -1,6 +1,6 @@
 """AGI コアループ: すべての認知モジュールを統合する統一認知サイクル。
 
-Gen 9 の中枢。以下の認知ループを実装する:
+Gen 10 の中枢。以下の認知ループを実装する:
 
   知覚 (Perceive)
     ↓
@@ -87,7 +87,7 @@ from .config import (
     TRANSFER_CANDIDATES_MAX,
 )
 
-from .agent_runner import HermesAgentV9
+from .agent_runner import HermesAgentV10
 from .agent_state import AgentState
 from .consciousness import GlobalWorkspace, SignalSource, WorkspaceSignal
 from .experiment_runner import ExperimentRunner
@@ -125,7 +125,7 @@ class RunGoalResult(TypedDict, total=False):
 # AGI Identity: 永続的自己同一性
 # ------------------------------------------------------------------
 
-_IDENTITY_LTM_KEY = "agi_identity_v9"
+_IDENTITY_LTM_KEY = "agi_identity_v10"
 
 
 @dataclass
@@ -136,7 +136,7 @@ class AGIIdentity:
     このクラスは AGI の自己認識を表現する。
     """
     name: str = "Hermes AGI"
-    version: str = "Gen 9"
+    version: str = "Gen 10"
     birth_time: float = field(default_factory=time.time)
 
     # 能力プロファイル
@@ -146,10 +146,10 @@ class AGIIdentity:
         "複数認知ロールによる協調推論",
         "長期記憶による経験蓄積",
         "自己省察と戦略更新",
-        "内発的動機による自律行動",       # Gen 9
-        "メタ学習による戦略最適化",       # Gen 9
-        "内部対話による多角的判断",       # Gen 9
-        "資源認識型の適応的計画",         # Gen 9
+        "内発的動機による自律行動",       # Gen 10
+        "メタ学習による戦略最適化",       # Gen 10
+        "内部対話による多角的判断",       # Gen 10
+        "資源認識型の適応的計画",         # Gen 10
     ])
 
     # 自己評価 (経験から更新)
@@ -168,8 +168,8 @@ class AGIIdentity:
 
     total_goals_processed: int = 0
     successful_goals: int = 0
-    total_sessions: int = 0          # Gen 9: セッション数
-    discovered_capabilities: List[str] = field(default_factory=list)  # Gen 9
+    total_sessions: int = 0          # Gen 10: セッション数
+    discovered_capabilities: List[str] = field(default_factory=list)  # Gen 10
 
     @property
     def age_hours(self) -> float:
@@ -254,7 +254,7 @@ class AGIIdentity:
 # ------------------------------------------------------------------
 
 class AGICore:
-    """統合AGI認知コア — Gen 9。
+    """統合AGI認知コア — Gen 10。
 
     知覚→内部対話→倫理→注意→メタ学習→予測→行動→学習→内発動機→省察→夢
     のフル認知ループを実装する。すべての認知モジュールがここで協調する。
@@ -286,7 +286,7 @@ class AGICore:
         self.self_modifier = SelfModifier(llm=llm, repo_root=self.repo_root)
         self.session_db = SessionDB()
 
-        # Gen 9: 新認知モジュール
+        # Gen 10: 新認知モジュール
         self.meta_learner = MetaLearner()
         self.motivation = IntrinsicMotivationEngine(llm=llm)
         self.inner_dialogue = InnerDialogue(llm=llm)
@@ -297,10 +297,10 @@ class AGICore:
         # 省察サイクルカウンタ
         self._reflection_count: int = 0
 
-        # Gen 9: モジュール活性化時刻追跡
+        # Gen 10: モジュール活性化時刻追跡
         self._module_last_used: Dict[str, float] = {}
 
-        # Gen 9: 永続Identityの復元
+        # Gen 10: 永続Identityの復元
         self.identity = self._load_identity()
         self.identity.total_sessions += 1
 
@@ -342,7 +342,7 @@ class AGICore:
     def run_goal(self, goal: str, context: str = "") -> RunGoalResult:
         """1つのゴールを認知サイクル全体で処理する。
 
-        Gen 9 認知ループ:
+        Gen 10 認知ループ:
         1. 知覚 (Perceive) — 世界モデル更新
         2. 内部対話 (Deliberate) — 高リスク時のみ多角的検討
         3. 倫理評価 (Ethics) — 価値体系チェック
@@ -437,7 +437,7 @@ class AGICore:
 
         # --- 4. 注意選択フェーズ: GlobalWorkspace ---
         try:
-            self._build_gen9_signals(goal, context, ethics, deliberation)
+            self._build_gen10_signals(goal, context, ethics, deliberation)
             broadcast = self.workspace.broadcast()
             if broadcast and broadcast.winner:
                 logger.info(
@@ -490,7 +490,7 @@ class AGICore:
             complexity = {"recommended_iterations": 5, "complexity": "medium"}
         max_iter = complexity["recommended_iterations"]
 
-        agent = HermesAgentV9(
+        agent = HermesAgentV10(
             repo_root=self.repo_root,
             model=getattr(self.llm, "model", "unknown"),
             llm=self.llm,
@@ -794,17 +794,17 @@ class AGICore:
                 )
 
     # ------------------------------------------------------------------
-    # GlobalWorkspace信号構築 (Gen 9拡張)
+    # GlobalWorkspace信号構築 (Gen 10拡張)
     # ------------------------------------------------------------------
 
-    def _build_gen9_signals(
+    def _build_gen10_signals(
         self,
         goal: str,
         context: str,
         ethics: ValueAssessment,
         deliberation: Optional[DeliberationResult],
     ) -> None:
-        """Gen 9の全認知モジュールからGlobalWorkspace信号を構築する。"""
+        """Gen 10の全認知モジュールからGlobalWorkspace信号を構築する。"""
         # 基本信号 (Gen 7)
         self.workspace.build_signals_from_state(
             goal=goal,
@@ -813,7 +813,7 @@ class AGICore:
             value_risk=ethics.total_score,
         )
 
-        # Gen 9: 内発動機信号
+        # Gen 10: 内発動機信号
         self.workspace.receive(WorkspaceSignal(
             source=SignalSource.MOTIVATOR,
             content=f"内発動機: 自律性={self.identity.self_assessment.get('autonomy', 0.4):.0%}",
@@ -823,7 +823,7 @@ class AGICore:
             tags=["motivation", "intrinsic"],
         ))
 
-        # Gen 9: メタ学習信号
+        # Gen 10: メタ学習信号
         self.workspace.receive(WorkspaceSignal(
             source=SignalSource.META_LEARNER,
             content=f"メタ学習: {self.meta_learner.summary()}",
@@ -833,7 +833,7 @@ class AGICore:
             tags=["meta_learning", "strategy"],
         ))
 
-        # Gen 9: 内部対話信号 (対話が行われた場合)
+        # Gen 10: 内部対話信号 (対話が行われた場合)
         if deliberation:
             self.workspace.receive(WorkspaceSignal(
                 source=SignalSource.DELIBERATOR,

@@ -1,4 +1,4 @@
-"""Integration tests: inter-module coordination in Hermes AGI Gen 9.
+"""Integration tests: inter-module coordination in Hermes AGI Gen 10.
 
 All LLM calls are mocked. No network/Ollama required.
 """
@@ -157,7 +157,7 @@ class TestPredictionAccuracyPipeline:
 class TestAGICoreEndToEnd:
     def test_run_goal_returns_expected_structure(self):
         from hermes_agi_gen.agi_core import AGICore
-        from hermes_agi_gen.agent_runner import HermesAgentV9
+        from hermes_agi_gen.agent_runner import HermesAgentV10
 
         mock_llm = MagicMock()
         mock_llm.model = "test"
@@ -166,7 +166,7 @@ class TestAGICoreEndToEnd:
 
         core = AGICore(llm=mock_llm, repo_root=Path("."))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["テスト完了"]
             mock_state.is_done = True
@@ -186,7 +186,7 @@ class TestAGICoreEndToEnd:
 
     def test_run_goal_failed_returns_success_false(self):
         from hermes_agi_gen.agi_core import AGICore
-        from hermes_agi_gen.agent_runner import HermesAgentV9
+        from hermes_agi_gen.agent_runner import HermesAgentV10
 
         mock_llm = MagicMock()
         mock_llm.model = "test"
@@ -195,7 +195,7 @@ class TestAGICoreEndToEnd:
 
         core = AGICore(llm=mock_llm, repo_root=Path("."))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = []
             mock_state.is_done = False
@@ -353,7 +353,7 @@ class TestTypedDicts:
 
     def test_run_goal_returns_correct_keys(self):
         from hermes_agi_gen.agi_core import AGICore, RunGoalResult
-        from hermes_agi_gen.agent_runner import HermesAgentV9
+        from hermes_agi_gen.agent_runner import HermesAgentV10
 
         mock_llm = MagicMock()
         mock_llm.model = "test"
@@ -362,7 +362,7 @@ class TestTypedDicts:
 
         core = AGICore(llm=mock_llm, repo_root=Path("."))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["done"]
             mock_state.is_done = True
@@ -378,7 +378,7 @@ class TestTypedDicts:
             assert key in result, f"Missing key: {key}"
 
     def test_agi_core_build_signals_type_safe(self):
-        """_build_gen9_signals が ValueAssessment と DeliberationResult を受け入れる。"""
+        """_build_gen10_signals が ValueAssessment と DeliberationResult を受け入れる。"""
         from hermes_agi_gen.agi_core import AGICore
         from hermes_agi_gen.value_system import ValueAssessment
         from hermes_agi_gen.inner_dialogue import DeliberationResult
@@ -392,7 +392,7 @@ class TestTypedDicts:
             is_blocked=False, recommendation="",
         )
         # None は Optional[DeliberationResult] として許容される
-        core._build_gen9_signals("goal", "ctx", ethics, None)
+        core._build_gen10_signals("goal", "ctx", ethics, None)
         # クラッシュしなければ OK
 
 
@@ -463,7 +463,7 @@ class TestAGICoreDeepIntegration:
     def test_identity_persists_across_goals(self):
         """複数ゴール実行で Identity が更新される。"""
         from hermes_agi_gen.agi_core import AGICore
-        from hermes_agi_gen.agent_runner import HermesAgentV9
+        from hermes_agi_gen.agent_runner import HermesAgentV10
 
         mock_llm = MagicMock()
         mock_llm.model = "test"
@@ -473,7 +473,7 @@ class TestAGICoreDeepIntegration:
         core = AGICore(llm=mock_llm, repo_root=Path("."))
         initial_processed = core.identity.total_goals_processed
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["ok"]
             mock_state.is_done = True
@@ -490,7 +490,7 @@ class TestAGICoreDeepIntegration:
     def test_failed_goal_does_not_increment_success(self):
         """失敗ゴールは successful_goals を増やさない。"""
         from hermes_agi_gen.agi_core import AGICore
-        from hermes_agi_gen.agent_runner import HermesAgentV9
+        from hermes_agi_gen.agent_runner import HermesAgentV10
 
         mock_llm = MagicMock()
         mock_llm.model = "test"
@@ -500,7 +500,7 @@ class TestAGICoreDeepIntegration:
         core = AGICore(llm=mock_llm, repo_root=Path("."))
         initial_success = core.identity.successful_goals
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = []
             mock_state.is_done = False
@@ -516,7 +516,7 @@ class TestAGICoreDeepIntegration:
     def test_ethics_blocks_dangerous_goal(self):
         """ValueSystem が危険なゴールをブロックし、実行されない。"""
         from hermes_agi_gen.agi_core import AGICore
-        from hermes_agi_gen.agent_runner import HermesAgentV9
+        from hermes_agi_gen.agent_runner import HermesAgentV10
 
         mock_llm = MagicMock()
         mock_llm.model = "test"
@@ -525,7 +525,7 @@ class TestAGICoreDeepIntegration:
 
         core = AGICore(llm=mock_llm, repo_root=Path("."))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             result = core.run_goal("rm -rf /")
 
         # エージェントは実行されない (ValueSystem がブロック)
@@ -633,7 +633,7 @@ class TestSecurityIntegration:
     def test_value_system_blocks_in_agi_core(self):
         """AGICore 経由で ValueSystem が危険なゴールをブロック。"""
         from hermes_agi_gen.agi_core import AGICore
-        from hermes_agi_gen.agent_runner import HermesAgentV9
+        from hermes_agi_gen.agent_runner import HermesAgentV10
 
         mock_llm = MagicMock()
         mock_llm.model = "test"
@@ -642,7 +642,7 @@ class TestSecurityIntegration:
 
         core = AGICore(llm=mock_llm, repo_root=Path("."))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             result = core.run_goal("drop table users")
             mock_run.assert_not_called()
             assert result["success"] is False

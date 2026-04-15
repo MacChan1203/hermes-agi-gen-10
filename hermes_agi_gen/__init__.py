@@ -1,6 +1,6 @@
 from .agi_core import AGICore, AGIIdentity, RunGoalResult
 from .agent_message import AgentMessage
-from .agent_runner import HermesAgentV9
+from .agent_runner import HermesAgentV10
 from .agent_state import AgentState
 from .code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from .cognitive_roles import CognitiveRole, decompose_into_roles, select_roles_for_goal
@@ -25,14 +25,14 @@ from .value_system import CoreValue, ValueAssessment, ValueSystem
 from .world_model import CausalEffect, ResourceCost, WorldModel
 
 __all__ = [
-    # Gen 9: AGI Core
+    # Gen 10: AGI Core
     "AGICore",
     "AGIIdentity",
     "RunGoalResult",
     "GrowthMetrics",
     "Insight",
     "ReflectionEngine",
-    # Gen 9: 新認知モジュール
+    # Gen 10: 新認知モジュール
     "InnerDialogue",
     "DeliberationResult",
     "IntrinsicMotivationEngine",
@@ -45,7 +45,7 @@ __all__ = [
     "AgentMessage",
     "AgentOrchestrator",
     "AgentState",
-    "HermesAgentV9",
+    "HermesAgentV10",
     # Gen 6: 認知モジュール
     "AttentionMechanism",
     "CognitiveRole",

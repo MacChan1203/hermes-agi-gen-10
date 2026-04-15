@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .agent_state import AgentState
@@ -286,7 +289,7 @@ class SelfImprovementEngine:
                     max_tokens=256,
                 ) or self._rule_based_few_shot_text(examples)
             except Exception:
-                pass
+                logger.debug("LLM few-shot テキスト生成に失敗", exc_info=True)
         return self._rule_based_few_shot_text(examples)
 
     def _rule_based_few_shot_text(self, examples: List[Dict[str, Any]]) -> str:

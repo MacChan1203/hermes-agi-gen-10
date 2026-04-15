@@ -598,4 +598,4 @@ class ExperimentRunner:
             }
             self.agi_core.ltm.learn(key, json.dumps(data, ensure_ascii=False))
         except Exception:
-            pass
+            logger.debug("実験受諾のLTM記録に失敗", exc_info=True)

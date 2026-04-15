@@ -25,8 +25,8 @@ from .world_model import WorldModel
 logger = logging.getLogger(__name__)
 
 
-class HermesAgentV9:
-    """旧 Hermes の運用感と v9 の plan-act-review を合わせた軽量 AGI 版。
+class HermesAgentV10:
+    """旧 Hermes の運用感と v10 の plan-act-review を合わせた軽量 AGI 版。
 
     llm を渡すと Planner/Reviewer が Mistral (または Ollama) を使う LLM モードで動作する。
     llm=None の場合は静的ルールによる従来モードで動作する。
@@ -162,7 +162,7 @@ class HermesAgentV9:
             elif result.get("stdout") and step.upper().startswith("PYTHON:"):
                 logger.debug("[出力] %s", result['stdout'][:200])
 
-            # Gen 9: ツール出力をworking_memoryに記録 (CLI表示用)
+            # Gen 10: ツール出力をworking_memoryに記録 (CLI表示用)
             stdout = result.get("stdout", "")
             if stdout and stdout.strip():
                 step_upper = step.upper()

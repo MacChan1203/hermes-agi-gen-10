@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from .agent_message import AgentMessage
 from .config import ORCHESTRATOR_MAX_CONTEXT_LEN, ORCHESTRATOR_MAX_GOAL_LEN, ORCHESTRATOR_RESULT_TRUNCATE, PLANNER_MAX_PARALLEL, PLANNER_THREAD_TIMEOUT
-from .agent_runner import HermesAgentV9
+from .agent_runner import HermesAgentV10
 from .agent_state import AgentState
 from .cognitive_roles import (
     COGNITIVE_ROLES,
@@ -432,7 +432,7 @@ class AgentOrchestrator:
         cognitive_role = COGNITIVE_ROLES.get(role)
         max_iter = cognitive_role.max_iterations if cognitive_role else self.max_worker_iterations
 
-        agent = HermesAgentV9(
+        agent = HermesAgentV10(
             repo_root=self.repo_root,
             model=self.llm.model,
             max_iterations=max_iter,

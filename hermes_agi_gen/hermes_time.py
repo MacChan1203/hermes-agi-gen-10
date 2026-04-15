@@ -36,7 +36,7 @@ def _resolve_timezone_name() -> str:
             if isinstance(tz_cfg, str) and tz_cfg.strip():
                 return tz_cfg.strip()
     except Exception:
-        pass
+        logger.debug("config.yaml からタイムゾーン取得に失敗", exc_info=True)
 
     return ""
 

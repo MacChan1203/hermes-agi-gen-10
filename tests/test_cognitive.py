@@ -1,4 +1,4 @@
-"""Comprehensive pytest tests for Hermes AGI Gen 9 cognitive modules.
+"""Comprehensive pytest tests for Hermes AGI Gen 10 cognitive modules.
 
 Tests cover: consciousness (GWT), intrinsic_motivation, meta_learning,
 inner_dialogue, predictive_engine, reflection_engine, and cognitive_roles.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from hermes_agi_gen import AgentState, HermesAgentV9
+from hermes_agi_gen import AgentState, HermesAgentV10
 from hermes_agi_gen.hermes_constants import DOMAIN_CONFIG
 from hermes_agi_gen.mistral_client import MistralClient
 
@@ -34,7 +34,7 @@ def main(
         except ValueError as e:
             print(f"\n[設定エラー] {e}")
             return
-    agent = HermesAgentV9(
+    agent = HermesAgentV10(
         repo_root=Path(repo_root),
         model=model,
         max_iterations=max_turns,

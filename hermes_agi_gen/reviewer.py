@@ -4,8 +4,11 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from .agent_state import AgentState
 from .config import (
@@ -316,7 +319,7 @@ class Reviewer:
                     if "recovery" in s.get("key", "").lower() and val:
                         return val
         except Exception:
-            pass
+            logger.debug("類似リカバリー戦略の参照に失敗", exc_info=True)
         return None
 
     def _static_failure_review(self, step: str, result: Dict[str, Any], state: AgentState) -> Dict[str, Any]:

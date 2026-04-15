@@ -322,7 +322,7 @@ class Executor:
         if prediction:
             state.working_memory["last_world_prediction"] = prediction
 
-        # Gen 9: 実行結果にコスト記録を付加するヘルパー
+        # Gen 10: 実行結果にコスト記録を付加するヘルパー
         def _record_cost(result: ExecutorResult, tool_type: str) -> ExecutorResult:
             elapsed = _time.time() - _exec_start
             output_size = len(result.get("stdout", ""))

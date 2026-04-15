@@ -91,7 +91,7 @@ class SemanticIndexer:
                     if any(candidate in m for m in models):
                         return candidate
         except Exception:
-            pass
+            logger.debug("埋め込みモデル自動検出に失敗", exc_info=True)
         return None
 
     def embed(self, text: str) -> Optional[List[float]]:

@@ -1,4 +1,4 @@
-"""Comprehensive security tests for hermes-agi-gen-9.
+"""Comprehensive security tests for hermes-agi-gen-10.
 
 Covers: executor sandbox, tool_registry code safety, state_store FTS sanitization,
 meta_cognition prompt injection defence, and value_system ethical blocking.

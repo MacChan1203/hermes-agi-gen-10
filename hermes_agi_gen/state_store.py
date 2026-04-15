@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -12,6 +13,8 @@ from typing import Any, Dict, List, Optional
 from .config import STATE_STORE_MAX_SESSIONS, STATE_STORE_CLEANUP_INTERVAL
 
 from .hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = get_hermes_home() / "state2.db"
 SCHEMA_VERSION = 1
@@ -162,8 +165,8 @@ class SessionDB:
             cur.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", old_ids)
             cur.execute(f"DELETE FROM sessions WHERE id IN ({placeholders})", old_ids)
             self._conn.commit()
-        except Exception:
-            pass
+        except sqlite3.Error:
+            logger.debug("セッションクリーンアップに失敗", exc_info=True)
 
 
 

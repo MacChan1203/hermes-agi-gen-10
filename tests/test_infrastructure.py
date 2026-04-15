@@ -1,4 +1,4 @@
-"""Comprehensive pytest tests for Hermes AGI Gen 9 infrastructure modules.
+"""Comprehensive pytest tests for Hermes AGI Gen 10 infrastructure modules.
 
 All tests are self-contained: no external LLM, Ollama, or network calls.
 Uses mocks for subprocess, requests, and LLM. Uses tmp_path for file/DB ops.
@@ -1030,7 +1030,7 @@ class TestAGICoreErrorHandling:
         core.world_model.needs_regrounding = MagicMock(side_effect=RuntimeError("test error"))
 
         # agent.run のモック — 最低限の AgentState を返す
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["test"]
             mock_state.is_done = True
@@ -1047,7 +1047,7 @@ class TestAGICoreErrorHandling:
         core = self._make_core()
         core.predictor.predict = MagicMock(side_effect=RuntimeError("predict failed"))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["done"]
             mock_state.is_done = True
@@ -1064,7 +1064,7 @@ class TestAGICoreErrorHandling:
         """エージェント実行 (agent.run) が例外を出しても run_goal は完了する。"""
         core = self._make_core()
 
-        with patch.object(HermesAgentV9, 'run', side_effect=RuntimeError("agent crashed")):
+        with patch.object(HermesAgentV10, 'run', side_effect=RuntimeError("agent crashed")):
             result = core.run_goal("テスト")
             assert "result" in result
             assert result["success"] is False  # 失敗として記録される
@@ -1074,7 +1074,7 @@ class TestAGICoreErrorHandling:
         core = self._make_core()
         core.reflection_engine.should_reflect = MagicMock(side_effect=RuntimeError("reflect error"))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["ok"]
             mock_state.is_done = True
@@ -1091,7 +1091,7 @@ class TestAGICoreErrorHandling:
         core = self._make_core()
         core.meta_learner.select_strategy = MagicMock(side_effect=RuntimeError("meta error"))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["ok"]
             mock_state.is_done = True
@@ -1108,7 +1108,7 @@ class TestAGICoreErrorHandling:
         core = self._make_core()
         core.motivation.generate_intrinsic_goals = MagicMock(side_effect=RuntimeError("motivation error"))
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["ok"]
             mock_state.is_done = True
@@ -1133,7 +1133,7 @@ class TestAGICoreErrorHandling:
         """run_goal 内で print() が呼ばれないことを確認 (logger を使用)。"""
         core = self._make_core()
 
-        with patch.object(HermesAgentV9, 'run') as mock_run:
+        with patch.object(HermesAgentV10, 'run') as mock_run:
             mock_state = MagicMock()
             mock_state.observations = ["ok"]
             mock_state.is_done = True
@@ -1148,8 +1148,8 @@ class TestAGICoreErrorHandling:
                 mock_print.assert_not_called()
 
 
-# HermesAgentV9 のインポート (テスト用)
-from hermes_agi_gen.agent_runner import HermesAgentV9
+# HermesAgentV10 のインポート (テスト用)
+from hermes_agi_gen.agent_runner import HermesAgentV10
 
 
 # =========================================================================
