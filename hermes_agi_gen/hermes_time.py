@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,9 @@ try:
 except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
 
+# キャッシュ初期化はデーモンの複数スレッドから同時に呼ばれうる。
+# ダブルチェックロッキングで不整合な中間状態が観測されるのを防ぐ。
+_cache_lock = threading.Lock()
 _cached_tz: Optional[ZoneInfo] = None
 _cached_tz_name: Optional[str] = None
 _cache_resolved: bool = False
@@ -53,15 +57,18 @@ def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
 
 def get_timezone() -> Optional[ZoneInfo]:
     global _cached_tz, _cached_tz_name, _cache_resolved
-    if not _cache_resolved:
-        _cached_tz_name = _resolve_timezone_name()
-        _cached_tz = _get_zoneinfo(_cached_tz_name)
-        _cache_resolved = True
+    # ダブルチェックロッキング: 既に解決済みならロックを取らず即 return。
+    if _cache_resolved:
+        return _cached_tz
+    with _cache_lock:
+        if not _cache_resolved:
+            _cached_tz_name = _resolve_timezone_name()
+            _cached_tz = _get_zoneinfo(_cached_tz_name)
+            _cache_resolved = True
     return _cached_tz
 
 
 def get_timezone_name() -> str:
-    global _cached_tz_name, _cache_resolved
     if not _cache_resolved:
         get_timezone()
     return _cached_tz_name or ""
@@ -76,6 +83,7 @@ def now() -> datetime:
 
 def reset_cache() -> None:
     global _cached_tz, _cached_tz_name, _cache_resolved
-    _cached_tz = None
-    _cached_tz_name = None
-    _cache_resolved = False
+    with _cache_lock:
+        _cached_tz = None
+        _cached_tz_name = None
+        _cache_resolved = False

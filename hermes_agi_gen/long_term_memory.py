@@ -90,8 +90,15 @@ class SemanticIndexer:
                 for candidate in _EMBED_MODEL_CANDIDATES:
                     if any(candidate in m for m in models):
                         return candidate
+        except requests.exceptions.Timeout:
+            logger.warning("Ollama 埋め込みモデル検出がタイムアウト (%ss) — TF-IDF にフォールバック", LTM_EMBEDDING_DETECT_TIMEOUT)
+        except requests.exceptions.ConnectionError:
+            logger.warning("Ollama に接続できません (%s) — TF-IDF にフォールバック", self.ollama_base)
+        except (ValueError, KeyError) as e:
+            # JSON decode / レスポンス形式異常 (永続的障害)
+            logger.error("Ollama /api/tags レスポンス解析失敗: %s", e, exc_info=True)
         except Exception:
-            logger.debug("埋め込みモデル自動検出に失敗", exc_info=True)
+            logger.warning("埋め込みモデル自動検出で予期せぬエラー", exc_info=True)
         return None
 
     def embed(self, text: str) -> Optional[List[float]]:
@@ -114,9 +121,20 @@ class SemanticIndexer:
             )
             if resp.status_code == 200:
                 return resp.json().get("embedding")
-        except Exception:
+            logger.warning("Ollama embeddings HTTP %s — TF-IDF にフォールバック", resp.status_code)
             self._use_ollama = False
-            logger.info("Ollama embedding unavailable, falling back to TF-IDF")
+        except requests.exceptions.Timeout:
+            logger.warning("Ollama embedding タイムアウト (%ss) — TF-IDF にフォールバック", LTM_EMBEDDING_TIMEOUT)
+            self._use_ollama = False
+        except requests.exceptions.ConnectionError:
+            logger.warning("Ollama 接続断 (%s) — TF-IDF にフォールバック", self.ollama_base)
+            self._use_ollama = False
+        except (ValueError, KeyError) as e:
+            logger.error("Ollama embeddings レスポンス解析失敗: %s — TF-IDF にフォールバック", e, exc_info=True)
+            self._use_ollama = False
+        except Exception:
+            logger.error("Ollama embedding で予期せぬエラー — TF-IDF にフォールバック", exc_info=True)
+            self._use_ollama = False
         return None
 
     @staticmethod
@@ -297,7 +315,9 @@ class LongTermMemory:
                 try:
                     vec = json.loads(embedding_json)
                     score = SemanticIndexer.cosine_similarity(query_vec, vec)
-                except Exception:
+                except (json.JSONDecodeError, TypeError) as e:
+                    # 格納済み埋め込みの JSON 破損 (データ不整合)。TF-IDF で復旧を試みる。
+                    logger.warning("破損した埋め込みを検出 key=%r: %s — TF-IDF にフォールバック", r.get("key"), e)
                     score = SemanticIndexer.tfidf_similarity(query, f"{r['key']}: {r['value']}")
             else:
                 score = SemanticIndexer.tfidf_similarity(query, f"{r['key']}: {r['value']}")

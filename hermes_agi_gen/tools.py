@@ -59,7 +59,8 @@ summary = f"【AI News】{title}\n出典: {url}\n\n(Hacker Newsより取得 {dat
 out_dir = os.path.expanduser('~/Desktop/AI_News')
 os.makedirs(out_dir, exist_ok=True)
 fname = os.path.join(out_dir, f"AI_News_{datetime.datetime.now().strftime('%m-%d_%H%M')}.txt")
-open(fname, 'w', encoding='utf-8').write(summary)
+with open(fname, 'w', encoding='utf-8') as f:
+    f.write(summary)
 print(f"保存完了: {fname}")
 print(summary)\
 """

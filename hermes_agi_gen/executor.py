@@ -12,11 +12,12 @@ from __future__ import annotations
 import ast
 import math
 import operator
+import os
+import re
+import shlex
 import subprocess
 import sys
 import textwrap
-import re
-import shlex
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -85,6 +86,12 @@ _OS_DENY_FUNCS = frozenset({
 })
 
 # open() で書き込みを禁止するパス (literal 引数でのみ検査可能)
+#
+# 設計注記:
+#   本 denylist は PYTHON: コード内の open(..., 'w') に対する AST 解析ゲートで、
+#   変数パスは判定できないため「明示的に危険なゾーンのみ弾く」方針 (permissive)。
+#   一方、WRITE: ツールの _write_file() は allowlist 方式 (repo_root / HOME のみ許可)
+#   を採っており、こちらの方が強い制約。2段で役割が異なるため両者を残す。
 _OPEN_WRITE_DENYLIST_PREFIXES = (
     "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev",
     "/System", "/Library/LaunchDaemons", "/Library/LaunchAgents",
@@ -798,7 +805,19 @@ class Executor:
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            # アトミック書込: 同一ディレクトリの .tmp に書いてから os.replace で置換
+            # (POSIX/Windows いずれもアトミック保証。途中クラッシュでもターゲットは破損しない)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            try:
+                tmp_path.write_text(content, encoding="utf-8")
+                os.replace(tmp_path, path)
+            finally:
+                # 失敗時の残留 tmp を掃除
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
             remember_successful_command(state, f"WRITE: {filepath}")
             return {"ok": True, "stdout": f"{filepath} に {len(content)} 文字を書き込みました", "stderr": "", "returncode": 0, "command": f"WRITE: {filepath}"}
         except Exception as e:

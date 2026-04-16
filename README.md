@@ -168,7 +168,9 @@ Identity永続化 -> [ループ]
 | 価値体系 | Unicode NFKC 正規化 + ダッシュ/スペース類統一 + 柔軟マッチ |
 | LLM プロンプト | NFKC 正規化 + ロール偽装検出 + 長文切り詰め |
 | FTS5 クエリ | 演算子エスケープ + パラメータバインド |
-| ファイル書込 | `os.replace` アトミック書き込み + バックアップ |
+| ファイル書込 | `os.replace` アトミック書き込み + バックアップ (WRITE: ツール・self_modifier・daemon 予算カウンタで統一) |
+| 並行安全 | Daemon 予算カウンタ fcntl + フォールバック `threading.Lock` / タイムゾーンキャッシュ DCL / LTM スレッドロック / DynamicTool lock |
+| LTM 例外粒度 | Ollama 埋め込み呼び出しを `Timeout` / `ConnectionError` / `JSONDecodeError` / 汎用 の4段で分別、破損埋め込みはキー付き WARNING |
 | メタ認知 pivot / reviewer recovery | executor 認識 prefix (`PYTHON:/CMD:/FETCH:/...`) 検証、非実行形式は破棄 |
 
 ### 6. 6つの自己適応フィードバックループ

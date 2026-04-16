@@ -59,6 +59,10 @@ class DailyBudgetGuard:
     日付ごとのカウンタをJSONファイルで管理する (LTMスキャンを排除)。
     """
 
+    # プロセス内の複数スレッドが同時に fallback 経路へ入っても
+    # 予算カウンタが破壊されないよう、スレッドロックを併用する。
+    _thread_lock: threading.Lock = threading.Lock()
+
     def __init__(self, max_daily: int = DAEMON_DAILY_BUDGET) -> None:
         self.max_daily = max_daily
         self._counter_file = _BUDGET_COUNTER_FILE
@@ -76,15 +80,25 @@ class DailyBudgetGuard:
             return {}
 
     def _save_counters(self, counters: dict) -> None:
-        """カウンタファイルに書き出す。古い日付のエントリは削除する。"""
+        """カウンタファイルに書き出す。古い日付のエントリは削除する。
+
+        tmp 書込 + os.replace でアトミック化し、途中クラッシュ時の
+        JSON 破損を防ぐ。
+        """
         today = self._today_key()
         cleaned = {k: v for k, v in counters.items() if k == today}
+        tmp = self._counter_file.with_suffix(self._counter_file.suffix + ".tmp")
         try:
-            self._counter_file.write_text(
-                json.dumps(cleaned, ensure_ascii=False), encoding="utf-8"
-            )
+            self._counter_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(cleaned, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._counter_file)
         except OSError as exc:
             logger.warning("予算カウンタ保存エラー: %s", exc)
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def get_used(self) -> int:
         counters = self._load_counters()
@@ -117,14 +131,17 @@ class DailyBudgetGuard:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             return count
         except Exception as exc:
-            logger.warning("予算カウンタ更新エラー: %s — フォールバック", exc)
-            # フォールバック: 非ロック版
-            counters = self._load_counters()
-            key = self._today_key()
-            count = counters.get(key, 0) + 1
-            counters[key] = count
-            self._save_counters(counters)
-            return count
+            logger.warning("予算カウンタ更新エラー (fcntl): %s — スレッドロック版にフォールバック", exc)
+            # フォールバック: fcntl が使えない環境 (Windows / 一部 FS) 用。
+            # プロセス間安全性は失われるが、スレッドロック + アトミック置換で
+            # 単一プロセス内の race と途中書き込み破損は防ぐ。
+            with self.__class__._thread_lock:
+                counters = self._load_counters()
+                key = self._today_key()
+                count = counters.get(key, 0) + 1
+                counters[key] = count
+                self._save_counters(counters)
+                return count
 
     def is_exhausted(self) -> bool:
         return self.get_used() >= self.max_daily
