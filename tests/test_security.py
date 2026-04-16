@@ -848,8 +848,10 @@ class TestToolRegistryTOCTOU:
             code="def main(args): return 'ok'",
             invocation_prefix="TEST",
         )
-        import threading
-        assert isinstance(tool._lock, threading.Lock)
+        # threading.Lock は CPython ではファクトリ関数 (型ではない) のため
+        # isinstance では判定できない。ロックプロトコル (acquire/release) で確認。
+        assert hasattr(tool._lock, "acquire") and hasattr(tool._lock, "release")
+        assert callable(tool._lock.acquire) and callable(tool._lock.release)
 
     def test_tamper_during_compile_rejected(self):
         """compile 中にコードが変更された場合は拒否される。"""
