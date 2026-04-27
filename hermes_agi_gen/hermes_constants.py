@@ -17,9 +17,11 @@ def get_hermes_home() -> Path:
     return home
 
 
-# Ollama (ローカル gemma4:e4b 専用)
+# LLM providers
 OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gemma4:e4b"
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
 
 # ドメイン別エージェント設定
 DOMAIN_CONFIG: dict[str, dict] = {

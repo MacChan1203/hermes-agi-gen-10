@@ -1,6 +1,6 @@
 # Hermes AGI Gen 10
 
-**自律進化型AGIフレームワーク** — 認知科学に基づく10段階認知ループ、6つの自己適応フィードバックループ、許可リスト方式セキュリティ、566件のテストを備えた自律型AGI。
+**自律進化型AGIフレームワーク** — 認知科学に基づく10段階認知ループ、6つの自己適応フィードバックループ、許可リスト方式セキュリティ、576件のテストを備えた自律型AGI。
 
 > Gen 6: タスク反応型AGI (入力→処理→出力)
 > Gen 7: 自律認知型AGI (知覚→省察→注意→計画→行動→学習)
@@ -9,10 +9,10 @@
 
 | 指標 | 値 |
 |------|-----|
-| モジュール数 | 42 |
-| コード行数 | 13,975 |
-| テスト件数 | **566 (モック 552 + 実LLM 14、全合格)** |
-| テストカバレッジ | 42/42 モジュール (100%) |
+| モジュール数 | 43 |
+| コード行数 | 14,426 |
+| テスト件数 | **576 (モック 562 + 実LLM 14、全合格)** |
+| テストカバレッジ | 43/43 モジュール (100%) |
 | config 定数 | 150 |
 
 ---
@@ -35,9 +35,9 @@ python cli.py
 python cli.py --daemon
 
 # テスト実行
-python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (552件)
+python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (562件)
 python3 -m pytest tests/test_live_llm.py -v              # 実LLMテスト (14件, Ollama必須)
-python3 -m pytest tests/                                  # 全テスト (566件)
+python3 -m pytest tests/                                  # 全テスト (576件)
 
 # Python から直接
 python3 -c "
@@ -49,15 +49,32 @@ core = AGICore(llm=llm)
 result = core.run_goal('このプロジェクトの構造を分析して')
 print(result['success'], result['strategy'])
 "
+
+# 仕様書準拠の最小 Planner -> Executor -> Critic ループ
+python3 -c "
+from hermes_agi_gen import run_spec_mvp
+print(run_spec_mvp('READMEを確認して改善点をまとめる', '.hermes/spec_mvp_memory.json'))
+"
 ```
 
 ### LLM プロバイダー
 
-ローカル Ollama の **gemma4:e4b** を使用します。
+既定ではローカル Ollama の **gemma4:e4b** を使用します。
 
 ```bash
 # .env (オプション)
 OLLAMA_MODEL=gemma4:e4b
+```
+
+OpenAI の GPT-5.5 型モデルを使う場合:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export HERMES_LLM_PROVIDER=openai
+export HERMES_MODEL=gpt-5.5
+export HERMES_REASONING_EFFORT=medium  # 任意: none/minimal/low/medium/high/xhigh
+
+python cli.py --model gpt-5.5
 ```
 
 ### 環境変数
@@ -66,6 +83,11 @@ OLLAMA_MODEL=gemma4:e4b
 |------|-----------|------|
 | `HERMES_HOME` | `~/.hermes` | 全 DB・設定ファイルの格納先 |
 | `OLLAMA_MODEL` | `gemma4:e4b` | 使用する Ollama モデル |
+| `HERMES_LLM_PROVIDER` | 自動判定 | `ollama` または `openai` |
+| `HERMES_MODEL` | `gemma4:e4b` | 使用するモデル名 (`gpt-*` は OpenAI として扱う) |
+| `OPENAI_API_KEY` | 未設定 | OpenAI provider 使用時の API キー |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI互換エンドポイント |
+| `HERMES_REASONING_EFFORT` | 未設定 | GPT-5系の reasoning effort |
 
 ---
 
@@ -206,12 +228,13 @@ Identity永続化 -> [ループ]
 | `hermes_agi_gen/experiment_runner.py` | AutoResearch方式の実験ループ |
 | `hermes_agi_gen/cognitive_roles.py` | 8認知ロール定義 (成功率EMAフィードバック) |
 | `hermes_agi_gen/agent_runner.py` | コアループ (Plan -> Act -> Review) |
+| `hermes_agi_gen/spec_core.py` | 仕様書準拠MVP (Task/Plan/Result/CriticOutput + JSONメモリ + 最大3ループ) |
 | `hermes_agi_gen/orchestrator.py` | 8ロール対応オーケストレーター |
 | `hermes_agi_gen/long_term_memory.py` | SQLite + セマンティック検索 (スレッドロック保護) |
 | `hermes_agi_gen/meta_cognition.py` | GoalQueue・自律ゴール生成 (プロンプトインジェクション防御) |
 | `hermes_agi_gen/daemon.py` | 24/7 自律デーモン (アトミック予算カウンタ) |
 | `hermes_agi_gen/scheduler.py` | cron-like スケジューラ (ファイルロック) |
-| `hermes_agi_gen/mistral_client.py` | Ollama gemma4:e4b 専用 LLM クライアント |
+| `hermes_agi_gen/mistral_client.py` | Ollama / OpenAI 対応 LLM クライアント |
 | `hermes_agi_gen/hermes_constants.py` | 共有定数 + `get_hermes_home()` (HERMES_HOME 統一) |
 | `cli.py` | インタラクティブ TUI・自然言語スケジューラ・HNパイプライン |
 
@@ -231,6 +254,7 @@ python cli.py
 | `/goals` | 自律ゴールキューを表示 |
 | `/world` | 世界モデルの状態を表示 |
 | `/improve` | 自己改善レポートを表示 |
+| `/mvp <目標>` | 仕様書準拠の最小 Planner→Executor→Critic ループを実行 |
 | `/reflect` | 手動省察を実行 |
 | `/experiment` | AutoResearch実験を実行 |
 | `/self-modify` | 自己修正を手動トリガー |
@@ -261,13 +285,13 @@ python cli.py
 ## テスト
 
 ```bash
-# 全テスト (Ollama 不要: 552件)
+# 全テスト (Ollama 不要: 562件)
 python3 -m pytest tests/ --ignore=tests/test_live_llm.py
 
 # 実 LLM テスト (Ollama + gemma4:e4b 必須: 14件)
 python3 -m pytest tests/test_live_llm.py -v
 
-# 全テスト (Ollama 起動時: 566件)
+# 全テスト (Ollama 起動時: 576件)
 python3 -m pytest tests/
 ```
 
@@ -276,10 +300,11 @@ python3 -m pytest tests/
 | `test_security.py` | 132 | AST許可リスト、os denylist、open書込パス、Unicode回避、パス遍歴、FTSサニタイズ |
 | `test_infrastructure.py` | 111 | 並行安全、DAG循環、アトミック書込、エラーハンドリング |
 | `test_cognitive.py` | 92 | GWT 3次元抑制、フィードバック収束、ドメインベクトル学習 |
-| `test_cli.py` | 61 | REPL、コマンド、スケジュール検出、インテント分類、HNパイプライン |
+| `test_cli.py` | 66 | REPL、コマンド、スケジュール検出、インテント分類、HNパイプライン |
 | `test_planner_orchestrator.py` | 60 | プランナー、オーケストレーター |
 | `test_integration.py` | 37 | Plan->Execute->Review、AGICore E2E、セキュリティ横断 |
-| `test_clients_utils.py` | 33 | MistralClient、utils、toolsets |
+| `test_clients_utils.py` | 36 | MistralClient、utils、toolsets |
+| `test_spec_core.py` | 3 | 仕様書準拠MVP、JSONメモリ、最大3ループ |
 | `test_experiment_improvement.py` | 21 | 実験メトリクス、自己改善 |
 | `test_live_llm.py` | 14 | 実 Ollama 接続、応答バリエーション耐性 |
 | `test_errors.py` | 4 | エラー分類、リトライ判定 |

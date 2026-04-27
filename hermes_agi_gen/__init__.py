@@ -19,6 +19,19 @@ from .reflection_engine import GrowthMetrics, Insight, ReflectionEngine
 from .experiment_runner import ExperimentMetrics, ExperimentResult, ExperimentRunner
 from .self_improvement import SelfImprovementEngine
 from .self_modifier import SelfModifier
+from .spec_core import (
+    CriticOutput,
+    HermesAGIMVP,
+    JsonMemory,
+    Plan,
+    PlanStep,
+    Result,
+    SpecCritic,
+    SpecExecutor,
+    SpecPlanner,
+    Task,
+    run_spec_mvp,
+)
 from .state_store import SessionDB
 from .tool_registry import DynamicTool, ToolRegistry
 from .value_system import CoreValue, ValueAssessment, ValueSystem
@@ -78,6 +91,17 @@ __all__ = [
     "ExperimentRunner",
     "SelfImprovementEngine",
     "SelfModifier",
+    "CriticOutput",
+    "HermesAGIMVP",
+    "JsonMemory",
+    "Plan",
+    "PlanStep",
+    "Result",
+    "SpecCritic",
+    "SpecExecutor",
+    "SpecPlanner",
+    "Task",
+    "run_spec_mvp",
     "SessionDB",
     "ToolRegistry",
     "WorldModel",

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 
 # =========================================================================
@@ -20,14 +21,24 @@ from hermes_agi_gen.mistral_client import (
 
 
 class TestMistralClientInit:
+    @patch.dict(os.environ, {}, clear=True)
     def test_defaults_to_gemma4(self):
         c = MistralClient()
         assert c.model == "gemma4:e4b"
         assert "11434" in c.base_url
+        assert c.provider == "ollama"
 
+    @patch.dict(os.environ, {}, clear=True)
     def test_fast_returns_same_model(self):
         c = MistralClient.fast()
         assert c.model == "gemma4:e4b"
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True)
+    def test_gpt_model_selects_openai_provider(self):
+        c = MistralClient(model="gpt-5.5")
+        assert c.provider == "openai"
+        assert c.model == "gpt-5.5"
+        assert c.base_url == "https://api.openai.com/v1"
 
 
 class TestMistralClientChat:
@@ -60,6 +71,46 @@ class TestMistralClientChat:
             result = c.chat([{"role": "user", "content": "test"}])
         assert "think" not in result
         assert result == "actual answer"
+
+    def test_chat_falls_back_to_ollama_native_api_on_openai_compat_404(self):
+        c = MistralClient()
+        compat_resp = MagicMock()
+        compat_resp.status_code = 404
+        compat_resp.text = "not found"
+        compat_error = requests.HTTPError("404 Client Error")
+        compat_error.response = compat_resp
+
+        native_resp = MagicMock()
+        native_resp.json.return_value = {
+            "message": {"content": "hello from native ollama"}
+        }
+        native_resp.raise_for_status = MagicMock()
+
+        with patch(
+            "hermes_agi_gen.mistral_client.requests.post",
+            side_effect=[compat_error, native_resp],
+        ) as post:
+            result = c.chat([{"role": "user", "content": "hi"}])
+
+        assert result == "hello from native ollama"
+        assert post.call_args_list[0].args[0].endswith("/v1/chat/completions")
+        assert post.call_args_list[1].args[0].endswith("/api/chat")
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True)
+    def test_chat_openai_responses_returns_text(self):
+        c = MistralClient(model="gpt-5.5", reasoning_effort="medium")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"output_text": "hello from gpt"}
+        mock_resp.raise_for_status = MagicMock()
+        with patch("hermes_agi_gen.mistral_client.requests.post", return_value=mock_resp) as post:
+            result = c.chat([{"role": "user", "content": "hi"}])
+        assert result == "hello from gpt"
+        url = post.call_args.args[0]
+        payload = post.call_args.kwargs["json"]
+        assert url.endswith("/responses")
+        assert payload["model"] == "gpt-5.5"
+        assert payload["reasoning"] == {"effort": "medium"}
+        assert "temperature" not in payload
 
 
 class TestMistralClientChatJson:

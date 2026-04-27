@@ -22,6 +22,7 @@ from cli import (
     _has_action_verb,
     _classify_intent,
     _build_llm,
+    _cmd_mvp,
     _parse_args,
     _TIME_SPEC_RE,
 )
@@ -178,9 +179,18 @@ class TestProviderLabel:
     def test_returns_ollama_label(self):
         mock_llm = MagicMock()
         mock_llm.model = "gemma4:e4b"
+        mock_llm.provider = "ollama"
         label = _provider_label(mock_llm)
         assert "Ollama" in label
         assert "gemma4:e4b" in label
+
+    def test_returns_openai_label(self):
+        mock_llm = MagicMock()
+        mock_llm.model = "gpt-5.5"
+        mock_llm.provider = "openai"
+        label = _provider_label(mock_llm)
+        assert "OpenAI" in label
+        assert "gpt-5.5" in label
 
 
 # =========================================================================
@@ -188,12 +198,20 @@ class TestProviderLabel:
 # =========================================================================
 
 class TestBuildLlm:
+    @patch.dict("os.environ", {}, clear=True)
     def test_returns_mistral_client(self):
         from hermes_agi_gen.mistral_client import MistralClient
         with patch("cli.console"):
             llm = _build_llm(None)
         assert isinstance(llm, MistralClient)
         assert llm.model == "gemma4:e4b"
+
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}, clear=True)
+    def test_builds_openai_for_gpt_model(self):
+        with patch("cli.console"):
+            llm = _build_llm("gpt-5.5")
+        assert llm.provider == "openai"
+        assert llm.model == "gpt-5.5"
 
 
 # =========================================================================
@@ -216,6 +234,11 @@ class TestParseArgs:
         with patch("sys.argv", ["cli.py", "--daemon"]):
             args = _parse_args()
         assert args.daemon is True
+
+    def test_model_arg(self):
+        with patch("sys.argv", ["cli.py", "--model", "gpt-5.5"]):
+            args = _parse_args()
+        assert args.model == "gpt-5.5"
 
 
 # =========================================================================
@@ -419,6 +442,27 @@ class TestCmdSchedule:
                 _cmd_schedule("disable job-abc")
             calls = [str(c) for c in mock_con.print.call_args_list]
             assert any("無効化" in c for c in calls)
+
+
+class TestCmdMvp:
+    def test_missing_goal(self):
+        with patch("cli.console") as mock_con:
+            result = _cmd_mvp("")
+        assert result == {}
+        calls = [str(c) for c in mock_con.print.call_args_list]
+        assert any("使い方" in c for c in calls)
+
+    def test_runs_spec_mvp(self):
+        with patch("cli.console") as mock_con:
+            with patch("cli.run_spec_mvp", return_value={
+                "task": {"goal": "テスト", "status": "done"},
+                "review": {"score": 1.0, "feedback": "OK", "done": True},
+                "iterations": 1,
+                "memory_path": ".hermes/spec_mvp_memory.json",
+            }):
+                result = _cmd_mvp("テスト")
+        assert result["review"]["done"] is True
+        assert mock_con.print.called
 
 
 # =========================================================================

@@ -40,6 +40,7 @@ from hermes_agi_gen.mistral_client import MistralClient
 from hermes_agi_gen.scheduler import JobScheduler, ScheduledJob, parse_trigger_spec
 from hermes_agi_gen.self_improvement import SelfImprovementEngine
 from hermes_agi_gen.self_modifier import SelfModifier, _SAFE_MODIFY_TARGETS
+from hermes_agi_gen.spec_core import run_spec_mvp
 from hermes_agi_gen.state_store import SessionDB
 from hermes_agi_gen.tool_registry import ToolRegistry
 from hermes_agi_gen.world_model import WorldModel
@@ -137,6 +138,7 @@ _HELP = """\
 | `/world` | 世界モデルの状態を表示 |
 | `/status` | AGIシステム全体のステータスを表示 |
 | `/improve` | 自己改善レポートを表示 |
+| `/mvp <目標>` | 仕様書準拠の最小 Planner→Executor→Critic ループを実行 |
 | `/perf` | パフォーマンス履歴を表示 |
 | `/clear` | 会話履歴をリセット |
 | `/provider` | 現在の LLM プロバイダーを表示 |
@@ -302,7 +304,9 @@ def _extract_schedule_trigger(message: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _provider_label(llm) -> str:
-    return f"[bold white]Ollama[/bold white] ({llm.model})"
+    provider = getattr(llm, "provider", "ollama")
+    name = "OpenAI" if provider == "openai" else "Ollama"
+    return f"[bold white]{name}[/bold white] ({llm.model})"
 
 
 def _collect_code() -> str:
@@ -321,6 +325,30 @@ def _collect_code() -> str:
 
 def _display(result: str, title: str, border: str = "green") -> None:
     console.print(Panel(Markdown(result), title=title, border_style=border))
+
+
+def _cmd_mvp(goal: str) -> dict:
+    """Run the hermes_agi_spec.md MVP loop and show a compact summary."""
+    if not goal:
+        console.print("[red]使い方: /mvp <目標>[/red]")
+        return {}
+    memory_path = Path(".hermes") / "spec_mvp_memory.json"
+    result = run_spec_mvp(goal=goal, memory_path=memory_path)
+    review = result["review"]
+    task = result["task"]
+    console.print(Panel(
+        "\n".join([
+            f"[bold green]Task[/bold green]: {task['goal']}",
+            f"[bold cyan]Status[/bold cyan]: {task['status']}",
+            f"[bold cyan]Iterations[/bold cyan]: {result['iterations']}/3",
+            f"[bold cyan]Score[/bold cyan]: {review['score']:.0%}",
+            f"[bold cyan]Feedback[/bold cyan]: {review['feedback']}",
+            f"[dim]JSON memory: {result['memory_path']}[/dim]",
+        ]),
+        title="Hermes AGI MVP",
+        border_style="green",
+    ))
+    return result
 
 
 def _has_action_verb(message: str) -> bool:
@@ -1328,19 +1356,25 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="AGI自律デーモンモードで起動 (フォアグラウンドで継続実行)",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="使用するLLMモデル名。gpt-* 指定時は OpenAI Responses API を使用",
+    )
     return parser.parse_args()
 
 
 def _build_llm(model: Optional[str]):
-    """Ollama gemma4:e4b 専用のLLMクライアントを構築する。"""
-    console.print("[green]Ollama (gemma4:e4b) を使用します。[/green]")
-    return MistralClient()
+    """LLMクライアントを構築する。"""
+    llm = MistralClient(model=model)
+    console.print(f"[green]{_provider_label(llm)} を使用します。[/green]")
+    return llm
 
 
 def main() -> None:
     args = _parse_args()
 
-    llm = _build_llm(None)
+    llm = _build_llm(args.model)
     if llm is None:
         sys.exit(1)
 
@@ -1468,6 +1502,10 @@ def main() -> None:
         elif raw == "/improve":
             domain = last_state.domain if last_state else "general"
             _cmd_improve(self_improver, domain)
+
+        # --- 仕様書準拠 MVP ループ ---
+        elif raw.startswith("/mvp"):
+            _cmd_mvp(raw[4:].strip())
 
         # --- 明示的なエージェント起動 ---
         elif raw.startswith("/run"):
@@ -1604,7 +1642,7 @@ def main() -> None:
             _KNOWN_CMDS = [
                 "/quit", "/exit", "/help", "/clear", "/provider", "/status",
                 "/tools", "/daemon", "/schedule", "/self-modify", "/experiment", "/run",
-                "/orch", "/reflect", "/apply", "/generate", "/review",
+                "/mvp", "/orch", "/reflect", "/apply", "/generate", "/review",
             ]
             import difflib
             cmd_word = raw.split()[0]
