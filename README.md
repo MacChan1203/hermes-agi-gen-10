@@ -10,10 +10,10 @@
 
 | 指標 | 値 |
 |------|-----|
-| モジュール数 | 44 |
-| コード行数 | 15,337 |
-| テスト件数 | **モック 636 + 実LLM 14 (Ollama 起動時のみ実行)** |
-| テストカバレッジ | 44/44 モジュール (100%) |
+| モジュール数 | 45 |
+| コード行数 | 16,100 |
+| テスト件数 | **モック 673 + 実LLM 14 (Ollama 起動時のみ実行)** |
+| テストカバレッジ | 45/45 モジュール (100%) |
 | config 定数 | 160 |
 
 ---
@@ -39,7 +39,7 @@ python cli.py --daemon
 
 # テスト実行
 pip install -r requirements-dev.txt
-python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (636件)
+python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (673件)
 python3 -m pytest tests/test_live_llm.py -v              # 実LLMテスト (14件, Ollama必須。未起動ならskip)
 python3 -m pytest tests/                                  # Ollama起動時は実LLMテストも実行
 
@@ -54,10 +54,21 @@ result = core.run_goal('このプロジェクトの構造を分析して')
 print(result['success'], result['strategy'])
 "
 
-# 仕様書準拠の最小 Planner -> Executor -> Critic ループ
+# 仕様書準拠の最小 Planner -> Executor -> Critic ループ (MVP)
 python3 -c "
 from hermes_agi_gen import run_spec_mvp
 print(run_spec_mvp('READMEを確認して改善点をまとめる', '.hermes/spec_mvp_memory.json'))
+"
+
+# 正式版 spec ループ (反復上限解除・SQLite履歴・LLM対応・価値整合・プラトー検出)
+python3 -c "
+from hermes_agi_gen import run_spec_full, FullConfig
+out = run_spec_full(
+    'READMEを確認して改善点をまとめる',
+    '.hermes/spec_full.sqlite',
+    config=FullConfig(max_iterations=10, patience=2),
+)
+print('done=', out['review']['done'], 'iters=', out['iterations'], 'metrics=', out['metrics'])
 "
 ```
 
@@ -204,6 +215,34 @@ Identity永続化 -> [ループ]
 agent = HermesAgentV10(repo_root=".", llm=llm, use_bellman=True)
 ```
 
+### 4.6. 仕様準拠ループ 正式版 (`spec_full.py`)
+
+`spec_core.HermesAGIMVP` の MVP 制約を取り払った本番運用向けバリアント。
+
+| 項目 | MVP (`spec_core.py`) | **正式版 (`spec_full.py`)** |
+|------|---------------------|---------------------------|
+| 反復上限 | 3 で固定クランプ | 任意 (`FullConfig.max_iterations`) |
+| プラン | 3 ステップ固定テンプレ | LLM 駆動 + ドメイン認識テンプレ (general/coding/research/writing/data) |
+| ステップ数 | 3 固定 | `plan_min_steps`〜`plan_max_steps` の範囲で可変 |
+| Executor | 副作用なしダミー | リトライ (指数バックオフ) + 価値整合ゲート + 任意の実ツール (`make_real_tool_runner`) |
+| Critic | 成功率のみ | 完了率 × 価値整合 × 目標被覆度 の重み付きスコア |
+| 停止条件 | 反復数のみ | done / プラトー / 価値違反 (`halt_on_value_violation`) |
+| メモリ | フラット JSON | `SqliteMemory` (タスク横断クエリ・FK・タイムスタンプ・試行回数・実行時間) |
+| 反復間学習 | critic_feedback を制約に追記 | 同上 + 前回フィードバックを次プランの冒頭に反映 |
+| 出力 | task / review / iterations | 同上 + `history` / `halted_reason` / `metrics` (best_score, failure_rate) |
+
+```python
+from hermes_agi_gen import HermesAGIFull, FullConfig, make_real_tool_runner, FullExecutor
+# 実ツールを使う場合
+runner = make_real_tool_runner(repo_root=".")
+app = HermesAGIFull(
+    "/tmp/full.sqlite",
+    config=FullConfig(max_iterations=10, patience=2, retry_max=3),
+    executor=FullExecutor(runner=runner),  # CMD:/READ:/WRITE: 等を実行
+)
+print(app.run("テストを実行して結果をまとめる"))
+```
+
 ### 5. セキュリティ
 
 | レイヤー | 手法 |
@@ -257,6 +296,7 @@ agent = HermesAgentV10(repo_root=".", llm=llm, use_bellman=True)
 | `hermes_agi_gen/cognitive_roles.py` | 8認知ロール定義 (成功率EMAフィードバック) |
 | `hermes_agi_gen/agent_runner.py` | コアループ (Plan -> Act -> Review) |
 | `hermes_agi_gen/spec_core.py` | 仕様書準拠MVP (Task/Plan/Result/CriticOutput + JSONメモリ + 最大3ループ) |
+| `hermes_agi_gen/spec_full.py` | 仕様準拠ループ 正式版 (LLM駆動プラン・SQLite履歴・重み付きCritic・プラトー検出・実ツール対応) |
 | `hermes_agi_gen/orchestrator.py` | 8ロール対応オーケストレーター |
 | `hermes_agi_gen/long_term_memory.py` | SQLite + セマンティック検索 (スレッドロック保護) |
 | `hermes_agi_gen/meta_cognition.py` | GoalQueue・自律ゴール生成 (プロンプトインジェクション防御) |
@@ -313,7 +353,7 @@ python cli.py
 ## テスト
 
 ```bash
-# 全テスト (Ollama 不要: 636件)
+# 全テスト (Ollama 不要: 673件)
 python3 -m pytest tests/ --ignore=tests/test_live_llm.py
 
 # 実 LLM テスト (Ollama + gemma4:e4b 必須: 14件。未起動ならskip)
@@ -334,6 +374,7 @@ python3 -m pytest tests/
 | `test_integration.py` | 37 | Plan->Execute->Review、AGICore E2E、セキュリティ横断 |
 | `test_clients_utils.py` | 36 | MistralClient、utils、toolsets |
 | `test_spec_core.py` | 3 | 仕様書準拠MVP、JSONメモリ、最大3ループ |
+| `test_spec_full.py` | 37 | 正式版: SQLiteメモリ、LLMプランナー、重み付きCritic、プラトー/価値違反停止、実ツールアダプタ |
 | `test_experiment_improvement.py` | 21 | 実験メトリクス、自己改善 |
 | `test_live_llm.py` | 14 | 実 Ollama 接続、応答バリエーション耐性 |
 | `test_errors.py` | 4 | エラー分類、リトライ判定 |

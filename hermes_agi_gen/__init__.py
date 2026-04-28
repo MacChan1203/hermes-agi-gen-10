@@ -40,6 +40,16 @@ from .spec_core import (
     Task,
     run_spec_mvp,
 )
+from .spec_full import (
+    FullConfig,
+    FullCritic,
+    FullExecutor,
+    FullPlanner,
+    HermesAGIFull,
+    SqliteMemory,
+    make_real_tool_runner,
+    run_spec_full,
+)
 from .state_store import SessionDB
 from .tool_registry import DynamicTool, ToolRegistry
 from .value_system import CoreValue, ValueAssessment, ValueSystem
@@ -117,6 +127,15 @@ __all__ = [
     "SpecPlanner",
     "Task",
     "run_spec_mvp",
+    # Spec Full (正式版)
+    "FullConfig",
+    "FullCritic",
+    "FullExecutor",
+    "FullPlanner",
+    "HermesAGIFull",
+    "SqliteMemory",
+    "make_real_tool_runner",
+    "run_spec_full",
     "SessionDB",
     "ToolRegistry",
     "WorldModel",
