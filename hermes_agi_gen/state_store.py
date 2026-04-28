@@ -169,6 +169,25 @@ class SessionDB:
         except sqlite3.Error:
             logger.debug("セッションクリーンアップに失敗", exc_info=True)
 
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None  # type: ignore[assignment]
+
+    def __enter__(self) -> "SessionDB":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _agent2_db_path(repo_root: str | Path) -> Path:

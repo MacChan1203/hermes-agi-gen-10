@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from run_agent import AIAgent
+from hermes_agi_gen import HermesAgentV10
 from hermes_agi_gen.toolset_distributions import sample_toolsets_from_distribution, validate_distribution
 
 
@@ -25,12 +25,12 @@ def main(dataset_file: str, output_file: str = "batch_results.jsonl", run_name: 
                 prompts.append(item.get("prompt") or item.get("task") or line)
             except json.JSONDecodeError:
                 prompts.append(line)
-    agent = AIAgent(max_iterations=max_iterations)
+    agent = HermesAgentV10(max_iterations=max_iterations)
     selected_toolsets = sample_toolsets_from_distribution(distribution)
     out_path = Path(output_file)
     with open(out_path, "w", encoding="utf-8") as f:
         for i, prompt in enumerate(prompts, start=1):
-            result = agent.run_conversation(prompt)
+            result = agent.chat(prompt)
             entry = {
                 "run_name": run_name,
                 "index": i,

@@ -338,7 +338,7 @@ class HermesAgentV10:
 
     def render_progress(self, state: AgentState) -> str:
         lines: List[str] = []
-        lines.append("=== Hermes AGI Gen 6 進捗 ===")
+        lines.append("=== Hermes AGI Gen 10 進捗 ===")
         lines.append(f"目的: {state.user_goal}")
         lines.append(f"反復回数: {state.iteration_count}/{state.max_iterations}")
         lines.append(f"最後のステップ: {state.last_step}")
