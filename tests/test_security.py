@@ -108,6 +108,82 @@ class TestIsPythonSafe:
         assert safe is False
 
     @pytest.mark.parametrize("code", [
+        "import os\ns = os.system\ns('echo pwned')",
+        "import os as o\ns = o.system\ns('echo pwned')",
+        "import os as o\no.system('echo pwned')",
+        "f = open\nf('/tmp/hermes_alias_probe.txt', 'w').write('x')",
+        "open('/tmp/hermes_literal_open_probe.txt', 'w').write('x')",
+        "p = '/tmp/hermes_open_var_probe.txt'\nopen(p, 'w').write('x')",
+        "from pathlib import Path\nPath('/tmp/hermes_pathlib_probe.txt').write_text('x')",
+        "from pathlib import Path\nPath('/tmp/hermes_pathlib_probe.txt').open('w')",
+        "from pathlib import Path\n(Path('/tmp') / 'hermes_pathlib_probe.txt').write_text('x')",
+        "from pathlib import Path\np = Path('/tmp') / 'hermes_pathlib_probe.txt'\np.write_text('x')",
+        "from pathlib import Path\np = Path('/tmp')\nq = p / 'hermes_pathlib_probe.txt'\nq.write_text('x')",
+        "from pathlib import Path\np = Path('/tmp').joinpath('hermes_pathlib_probe.txt')\np.write_text('x')",
+        "from pathlib import Path\nPath('/tmp/hermes_pathlib_probe.txt').unlink()",
+        "from pathlib import Path\nPath('/tmp/hermes_pathlib_probe.txt').chmod(0o777)",
+        "from pathlib import Path\np = Path('/tmp/hermes_pathlib_probe.txt')\np.replace('/tmp/hermes_pathlib_probe_2.txt')",
+    ])
+    def test_rejects_dangerous_callable_aliases(self, code: str):
+        safe, reason = _is_python_safe(code)
+        assert safe is False
+        assert reason
+
+    def test_executor_blocks_dangerous_alias_execution(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        state = _make_state(tmp_path)
+
+        result = executor.execute(
+            "PYTHON: import os\ns = os.system\ns('echo pwned')",
+            state,
+        )
+
+        assert result["ok"] is False
+        assert "セキュリティ制限" in result["stderr"]
+
+    def test_executor_blocks_pathlib_write_execution(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        state = _make_state(tmp_path)
+        target = tmp_path / "pathlib_probe.txt"
+
+        result = executor.execute(
+            f"PYTHON: from pathlib import Path\nPath({str(target)!r}).write_text('x')",
+            state,
+        )
+
+        assert result["ok"] is False
+        assert "セキュリティ制限" in result["stderr"]
+        assert not target.exists()
+
+    def test_executor_blocks_pathlib_join_write_execution(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        state = _make_state(tmp_path)
+        target = tmp_path / "joined_pathlib_probe.txt"
+
+        result = executor.execute(
+            f"PYTHON: from pathlib import Path\n(Path({str(tmp_path)!r}) / 'joined_pathlib_probe.txt').write_text('x')",
+            state,
+        )
+
+        assert result["ok"] is False
+        assert "セキュリティ制限" in result["stderr"]
+        assert not target.exists()
+
+    def test_executor_blocks_open_variable_write_execution(self, tmp_path):
+        executor = _make_executor(tmp_path)
+        state = _make_state(tmp_path)
+        target = tmp_path / "open_var_probe.txt"
+
+        result = executor.execute(
+            f"PYTHON: p = {str(target)!r}\nopen(p, 'w').write('x')",
+            state,
+        )
+
+        assert result["ok"] is False
+        assert "セキュリティ制限" in result["stderr"]
+        assert not target.exists()
+
+    @pytest.mark.parametrize("code", [
         "getattr(obj, '__class__')",
         "x.__class__",
         "x.__subclasses__()",
@@ -119,6 +195,10 @@ class TestIsPythonSafe:
 
     def test_allows_benign_code(self):
         safe, _ = _is_python_safe("x = [1, 2, 3]\nprint(sum(x))")
+        assert safe is True
+
+    def test_allows_regular_string_replace(self):
+        safe, _ = _is_python_safe("'abc'.replace('a', 'z')")
         assert safe is True
 
 
@@ -245,6 +325,44 @@ class TestWriteFileSizeLimit:
         spec = "small.txt\nhello world"
         result = executor._write_file(spec, state)
         assert result["ok"] is True
+
+    def test_rejects_home_secret_path(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        repo = tmp_path / "repo"
+        monkeypatch.setenv("HOME", str(home))
+        executor = _make_executor(repo)
+        state = _make_state(tmp_path)
+
+        result = executor._write_file("~/.ssh/authorized_keys\nbad", state)
+
+        assert result["ok"] is False
+        assert "アクセス拒否" in result["stderr"]
+        assert not (home / ".ssh" / "authorized_keys").exists()
+
+    def test_rejects_external_write_without_allowlist(self, tmp_path):
+        repo = tmp_path / "repo"
+        external = tmp_path / "external" / "out.txt"
+        executor = _make_executor(repo)
+        state = _make_state(tmp_path)
+
+        result = executor._write_file(f"{external}\ncontent", state)
+
+        assert result["ok"] is False
+        assert "HERMES_WRITE_ALLOW_DIRS" in result["stderr"]
+        assert not external.exists()
+
+    def test_allows_external_write_with_allowlist(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        external_dir = tmp_path / "external"
+        external = external_dir / "out.txt"
+        monkeypatch.setenv("HERMES_WRITE_ALLOW_DIRS", str(external_dir))
+        executor = _make_executor(repo)
+        state = _make_state(tmp_path)
+
+        result = executor._write_file(f"{external}\ncontent", state)
+
+        assert result["ok"] is True
+        assert external.read_text(encoding="utf-8") == "content"
 
 
 class TestReadFilePathTraversal:
@@ -818,6 +936,29 @@ class TestPythonAllowlist:
         assert not safe
 
 
+class TestShellCommandDenylist:
+    """executor.py: CMD が単体の破壊的コマンドを実行前に拒否する。"""
+
+    @pytest.mark.parametrize("cmd", [
+        "rm important.txt",
+        "/bin/rm important.txt",
+        "chmod 777 important.txt",
+        "sudo ls",
+        "python3 -c \"__import__('pathlib').Path('important.txt').unlink()\"",
+    ])
+    def test_blocks_destructive_direct_commands(self, tmp_path, cmd: str):
+        ex = Executor(repo_root=tmp_path)
+        state = _make_state(tmp_path)
+        target = tmp_path / "important.txt"
+        target.write_text("keep", encoding="utf-8")
+
+        result = ex._run_shell(cmd, state)
+
+        assert result["ok"] is False
+        assert "セキュリティ制限" in result["stderr"]
+        assert target.exists()
+
+
 class TestToolRegistryTOCTOU:
     """tool_registry.py: TOCTOU 修正と相対インポート検出の検証。"""
 
@@ -839,6 +980,20 @@ class TestToolRegistryTOCTOU:
     def test_marshal_blocked(self):
         safe, reason = _is_tool_code_safe("import marshal")
         assert not safe
+
+    def test_infinite_loop_blocked(self):
+        safe, reason = _is_tool_code_safe("def main(args):\n    while True:\n        pass")
+        assert not safe
+        assert "無限ループ" in reason
+
+    def test_truthy_constant_loop_blocked(self):
+        safe, reason = _is_tool_code_safe("def main(args):\n    while 1:\n        pass")
+        assert not safe
+        assert "無限ループ" in reason
+
+    def test_conditional_while_allowed(self):
+        safe, _ = _is_tool_code_safe("def main(args):\n    while args:\n        return args\n    return 'ok'")
+        assert safe
 
     def test_compile_is_thread_safe(self):
         """DynamicTool.compile() がロックを持つことを確認。"""

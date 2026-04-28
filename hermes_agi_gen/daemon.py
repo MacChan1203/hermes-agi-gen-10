@@ -44,12 +44,20 @@ from .world_model import WorldModel
 
 logger = logging.getLogger(__name__)
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
-_HERMES_DIR = get_hermes_home()
-_PID_FILE = _HERMES_DIR / "daemon.pid"
-_LOG_FILE = _HERMES_DIR / "daemon.log"
-_BUDGET_COUNTER_FILE = _HERMES_DIR / "daemon_budget.json"
+def _pid_file() -> Path:
+    return get_hermes_path("daemon.pid")
+
+
+def _log_file() -> Path:
+    return get_hermes_path("daemon.log")
+
+
+def _budget_counter_file() -> Path:
+    return get_hermes_path("daemon_budget.json")
+
+
 _HEARTBEAT_KEY = "daemon_heartbeat"
 
 
@@ -65,7 +73,7 @@ class DailyBudgetGuard:
 
     def __init__(self, max_daily: int = DAEMON_DAILY_BUDGET) -> None:
         self.max_daily = max_daily
-        self._counter_file = _BUDGET_COUNTER_FILE
+        self._counter_file = _budget_counter_file()
 
     def _today_key(self) -> str:
         return date.today().isoformat()
@@ -165,7 +173,6 @@ class HermesDaemon:
         max_daily_goals: int = DAEMON_DAILY_BUDGET,
         curiosity_threshold: float = DAEMON_CURIOSITY_THRESHOLD,
     ) -> None:
-        _HERMES_DIR.mkdir(parents=True, exist_ok=True)
         self.llm = llm
         self.idle_seconds = idle_seconds
         self.ltm = LongTermMemory()
@@ -188,7 +195,7 @@ class HermesDaemon:
 
     def _setup_file_logger(self) -> None:
         """デーモン専用のファイルロガーを設定する。"""
-        self._file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+        self._file_handler = logging.FileHandler(_log_file(), encoding="utf-8")
         self._file_handler.setLevel(logging.INFO)
         formatter = logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s",
@@ -215,7 +222,7 @@ class HermesDaemon:
         logger.info("[デーモン] 起動しました (PID=%d)", os.getpid())
         logger.info("[デーモン] GoalQueue: %d件", self.meta.goal_queue.size())
         logger.info("[デーモン] 本日の残り予算: %d件", self.budget.remaining())
-        logger.info("[デーモン] PID=%s, ログ=%s", _PID_FILE, _LOG_FILE)
+        logger.info("[デーモン] PID=%s, ログ=%s", _pid_file(), _log_file())
 
         while not self._stop_event.is_set():
             try:
@@ -443,9 +450,10 @@ class HermesDaemon:
         既存PIDファイルがあり、そのプロセスがまだ生きている場合は
         起動を拒否して重複デーモンを防ぐ。
         """
-        if _PID_FILE.exists():
+        pid_file = _pid_file()
+        if pid_file.exists():
             try:
-                old_pid = int(_PID_FILE.read_text().strip())
+                old_pid = int(pid_file.read_text().strip())
                 if old_pid != os.getpid():
                     os.kill(old_pid, 0)  # プロセス存在確認
                     raise RuntimeError(
@@ -455,12 +463,12 @@ class HermesDaemon:
             except (ValueError, OSError):
                 # PIDファイルが壊れているか、プロセスが存在しない → 上書きOK
                 pass
-        _PID_FILE.write_text(str(os.getpid()))
+        pid_file.write_text(str(os.getpid()))
 
     def _remove_pid(self) -> None:
         """PIDファイルを削除する。"""
         try:
-            _PID_FILE.unlink()
+            _pid_file().unlink()
         except FileNotFoundError:
             pass
 
@@ -486,9 +494,10 @@ class HermesDaemon:
 
         pid_running = False
         pid = None
-        if _PID_FILE.exists():
+        pid_file = _pid_file()
+        if pid_file.exists():
             try:
-                pid = int(_PID_FILE.read_text().strip())
+                pid = int(pid_file.read_text().strip())
                 os.kill(pid, 0)  # シグナル0でプロセス存在確認
                 pid_running = True
             except (ValueError, OSError):
@@ -503,10 +512,11 @@ class HermesDaemon:
     @staticmethod
     def stop_daemon() -> bool:
         """PIDファイルを読んでデーモンにSIGTERMを送る。"""
-        if not _PID_FILE.exists():
+        pid_file = _pid_file()
+        if not pid_file.exists():
             return False
         try:
-            pid = int(_PID_FILE.read_text().strip())
+            pid = int(pid_file.read_text().strip())
             os.kill(pid, signal.SIGTERM)
             return True
         except (ValueError, OSError):
@@ -515,10 +525,11 @@ class HermesDaemon:
     @staticmethod
     def get_log(lines: int = 50) -> str:
         """デーモンのログを返す。"""
-        if not _LOG_FILE.exists():
+        log_file = _log_file()
+        if not log_file.exists():
             return "ログファイルが存在しません。"
         try:
-            log_lines = _LOG_FILE.read_text(encoding="utf-8").splitlines()
+            log_lines = log_file.read_text(encoding="utf-8").splitlines()
             return "\n".join(log_lines[-lines:])
         except Exception as exc:
             return f"ログ読み込みエラー: {exc}"

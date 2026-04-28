@@ -12,11 +12,12 @@ from typing import Any, Dict, List, Optional
 
 from .config import STATE_STORE_MAX_SESSIONS, STATE_STORE_CLEANUP_INTERVAL
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = get_hermes_home() / "state2.db"
+DEFAULT_DB_NAME = "state2.db"
+DEFAULT_DB_PATH = get_hermes_path(DEFAULT_DB_NAME)
 SCHEMA_VERSION = 1
 
 SCHEMA_SQL = """
@@ -90,7 +91,7 @@ class SessionDB:
     """SQLite + FTS5 の軽量セッション保存。"""
 
     def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = Path(db_path) if db_path is not None else get_hermes_path(DEFAULT_DB_NAME)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)

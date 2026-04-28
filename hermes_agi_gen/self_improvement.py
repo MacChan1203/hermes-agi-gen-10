@@ -21,9 +21,10 @@ if TYPE_CHECKING:
     from .agent_state import AgentState
     from .mistral_client import MistralClient
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
-_IMPROVEMENT_DB_PATH = get_hermes_home() / "self_improvement.db"
+_IMPROVEMENT_DB_NAME = "self_improvement.db"
+_IMPROVEMENT_DB_PATH = get_hermes_path(_IMPROVEMENT_DB_NAME)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_performance (
@@ -115,7 +116,7 @@ class SelfImprovementEngine:
         db_path: Optional[Path] = None,
         llm: Optional[MistralClient] = None,
     ) -> None:
-        self.db_path = db_path or _IMPROVEMENT_DB_PATH
+        self.db_path = Path(db_path) if db_path is not None else get_hermes_path(_IMPROVEMENT_DB_NAME)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row

@@ -299,6 +299,14 @@ class TestStaticBootstrapPlans:
         plan = _STATIC_BOOTSTRAP["research"]
         assert any("SEARCH:" in step for step in plan)
 
+    def test_static_cmd_steps_match_executor_chain_policy(self):
+        for domain, plan in _STATIC_BOOTSTRAP.items():
+            for step in plan:
+                if step.startswith("CMD:"):
+                    assert "&&" not in step
+                    assert "||" not in step
+                    assert ";" not in step
+
 
 # ======================================================================
 # planner.py — Planner._generate_summary_answer

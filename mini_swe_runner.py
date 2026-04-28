@@ -33,8 +33,7 @@ def main(task: str, output_file: str = "mini-swe-output.jsonl", env: str = "loca
     runner = MiniSWERunner(env_type=env, cwd=cwd, max_iterations=max_iterations)
     result = runner.run_task(task)
     with open(output_file, "w", encoding="utf-8") as f:
-        f.write(json.dumps(result, ensure_ascii=False) + "
-")
+        f.write(json.dumps(result, ensure_ascii=False) + "\n")
     print(f"保存しました: {output_file}")
 
 

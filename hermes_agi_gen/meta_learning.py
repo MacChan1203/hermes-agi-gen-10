@@ -36,9 +36,10 @@ from .config import (
 )
 
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
-_META_LEARNING_DB = get_hermes_home() / "meta_learning.db"
+_META_LEARNING_DB_NAME = "meta_learning.db"
+_META_LEARNING_DB = get_hermes_path(_META_LEARNING_DB_NAME)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS strategies (
@@ -120,7 +121,7 @@ class MetaLearner:
     """
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        self.db_path = db_path or _META_LEARNING_DB
+        self.db_path = Path(db_path) if db_path is not None else get_hermes_path(_META_LEARNING_DB_NAME)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row

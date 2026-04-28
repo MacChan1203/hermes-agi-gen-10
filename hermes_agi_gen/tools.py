@@ -7,7 +7,7 @@ TOOL_DESCRIPTIONS = """\
 - SEARCH: <query>              DuckDuckGo でウェブ検索する (最新情報・外部知識の取得)
 - FETCH: <url>                 指定URLのコンテンツを取得する (API・HTMLページ・JSONなど直接アクセス)
 - CALC: <expression>           数式・統計式を即座に計算する (sqrt/log/sin/pi など math 関数も使用可)
-- CMD: <bash command>          シェルコマンドを実行する (ls, find, grep, python など)
+- CMD: <bash command>          シェルコマンドを実行する (ls, find, grep など。インタプリタ起動は不可)
 - READ: <filepath>             ファイルの内容を読む
 - WRITE: <filepath>            ファイルに書き込む (次の行から内容を記述、末尾は EOF)
 - PYTHON: <code>               Python コードを実行する (1行 or 複数行)
@@ -19,7 +19,7 @@ TOOL_EXAMPLES = """\
 【ツール使用例】
 PLAN: SEARCH: 最新の量子コンピュータ動向 || SEARCH: 量子コンピュータ 商用化 2024 || ANSWER: 調査結果のまとめ
 PLAN: CMD: find . -name "*.py" | head -20 || READ: main.py || ANSWER: コードの概要
-PLAN: FETCH: https://hacker-news.firebaseio.com/v0/topstories.json || PYTHON: import json; data=__import__('json').loads(open('/dev/stdin').read()) || DONE: HNトップ記事IDを取得した
+PLAN: FETCH: https://hacker-news.firebaseio.com/v0/topstories.json || ANSWER: 取得したJSONから必要な記事IDを要約する
 ANSWER: はい、一般的な質問に答えることができます。コーディング・調査・文章作成など幅広いトピックに対応しています。
 SEARCH: Python 3.12 新機能
 SEARCH: 東京の今日の天気
@@ -47,22 +47,10 @@ SCHEDULE_AT: daily:09:00 毎朝のニュースをチェックして要約する
 SCHEDULE_AT: every:30m システム状態を確認する
 DONE: README を確認し、プロジェクトが Python 3.11 で動作することを検証しました。
 
-# Hacker News からAI記事を取得・要約・ファイル保存する場合の推奨パターン:
-PYTHON:
-import requests, os, re, datetime
-resp = requests.get('https://news.ycombinator.com/', timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
-items = re.findall(r'class="titleline"><a href="([^"]+)">([^<]+)', resp.text)
-ai_kw = ['ai', 'llm', 'gpt', 'machine learning', 'neural', 'model', 'agent', 'openai', 'anthropic', 'deepmind', 'robot']
-ai_items = [(u, t) for u, t in items if any(k in t.lower() for k in ai_kw)]
-url, title = ai_items[0] if ai_items else (items[0] if items else ('https://news.ycombinator.com/', 'AI News'))
-summary = f"【AI News】{title}\n出典: {url}\n\n(Hacker Newsより取得 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})"
-out_dir = os.path.expanduser('~/Desktop/AI_News')
-os.makedirs(out_dir, exist_ok=True)
-fname = os.path.join(out_dir, f"AI_News_{datetime.datetime.now().strftime('%m-%d_%H%M')}.txt")
-with open(fname, 'w', encoding='utf-8') as f:
-    f.write(summary)
-print(f"保存完了: {fname}")
-print(summary)\
+# Hacker News から記事を取得・要約・保存する場合の推奨パターン:
+PLAN: FETCH: https://hacker-news.firebaseio.com/v0/topstories.json || FETCH: https://hacker-news.firebaseio.com/v0/item/<id>.json || WRITE: output/hn_summary.txt
+ここに要約を書く
+EOF\
 """
 
 TOOL_CONSTRAINTS = """\
@@ -73,7 +61,8 @@ TOOL_CONSTRAINTS = """\
   例: SCHEDULE_AT: once:2026-04-07T02:30 HackerNewsのトップAIニュースを日本語100字に要約して~/Desktop/AI_News/に保存する
 - SCHEDULE_AT: 登録に成功したら、直後に DONE: で終了する (別途実行は不要)
 - SCHEDULE_AT: トリガー形式: once:<ISO8601> | every:<N>m | every:<N>h | daily:<HH:MM> | weekly:<day>:<HH:MM>
-- WRITE: はホームディレクトリ (~/Desktop/... など) または相対パス両方OK。システムファイル (/etc, /usr など) は禁止
+- WRITE: は原則リポジトリ配下のみOK。外部出力先は HERMES_WRITE_ALLOW_DIRS で明示許可されたディレクトリのみ書ける
+- PYTHON: はファイル書き込み不可。ファイル変更は WRITE: を使う
 - ブラウザ・GUI アプリケーションは使えない
 - 失敗済みの同一コマンドを繰り返さない
 - tree コマンドは存在しない → find を使う

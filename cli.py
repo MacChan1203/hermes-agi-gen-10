@@ -391,192 +391,24 @@ def _run_agent(
     """HermesAgentV10 を起動してタスクを実行し、(サマリー, 最終state) を返す。"""
     # ゴール内の URL を抽出 (ASCII文字のみ = 日本語で誤って伸びない)
     _urls = re.findall(r'https?://[a-zA-Z0-9./_?=&#%+~-]+', goal)
-    _wants_save = any(w in goal for w in ["保存", "ファイル", "txt", "Desktop", "save", "write"])
-    _wants_translate = any(w in goal for w in ["翻訳", "要約", "日本語", "translate", "summarize"])
-
-    # URL + 保存 + 要約タスク: LLMに生成させず動作確認済みスクリプトを直接プランに注入
-    _prebuilt_plan: List[str] = []
-    if _urls and _wants_save and _wants_translate:
-        _target_url = _urls[0]
-        _out_dir_kw = ""
-        _m = re.search(r'~/[a-zA-Z0-9/_.-]+', goal)  # ASCII文字のみ
-        if _m:
-            _out_dir_kw = _m.group(0).rstrip("/")
-        if not _out_dir_kw:
-            _out_dir_kw = "~/Desktop/AI_News"
-        _ollama_model = "gemma4:e4b"
-        # ゴールから長さ・詳細指示を抽出してスクリプトに注入
-        # 数値(字/文字)があればそれを使い、なければユーザーの表現をそのまま使う
-        _num_m = re.search(r'(\d+)\s*[字文]', goal)
-        _target_chars = int(_num_m.group(1)) if _num_m else None
-        # 翻訳/要約の指示部分を抽出 (例: "翻訳して1500字程度にまとめて" → "1500字程度にまとめること")
-        _inst_m = re.search(r'(?:翻訳して|日本語[にで])(.+?)(?:[、,。]|~/|ファイル|txt)', goal)
-        if _inst_m:
-            _length_instruction = re.sub(r'(?:してください|して|ください)$', '', _inst_m.group(1).strip())
-        elif _target_chars:
-            _length_instruction = f"{_target_chars}字程度にまとめること"
-        else:
-            _length_instruction = "詳しくまとめること"
-        _max_tokens = max(800, _target_chars * 3) if _target_chars else 2000
-        _body_limit = max(4000, _target_chars * 10) if _target_chars else 8000
-        _target_count_m = re.search(r'(\d+)\s*[件つ個]', goal)
-        _target_count = int(_target_count_m.group(1)) if _target_count_m else 3
-        _script = f"""\
-import requests, os, re, datetime, json
-# 1. HNからAI記事を取得
-_hn = requests.get({_target_url!r}, timeout=15, headers={{"User-Agent": "Mozilla/5.0"}})
-_items = re.findall(r'class=[\\x22\\x27]titleline[\\x22\\x27]><a href=[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]>([^<]+)', _hn.text)
-_kw = ["ai", "llm", "gpt", "machine learning", "neural", "model", "agent", "openai", "anthropic",
-       "deepmind", "claude", "gemini", "mistral", "ml", "nlp", "robot", "coding", "software"]
-_ai = [(u, t) for u, t in _items if any(k in t.lower() for k in _kw)]
-# 目標件数に満たなければ一般記事で補完
-_targets = _ai[:{_target_count}]
-if len(_targets) < {_target_count}:
-    _non_ai = [(u, t) for u, t in _items if (u, t) not in _ai]
-    _targets += _non_ai[:{_target_count} - len(_targets)]
-# 2. 各記事の本文を取得
-def _fetch_body(url, limit={_body_limit}):
-    if url.startswith("item?") or url.startswith("//"):
-        return ""
-    try:
-        _r = requests.get(url, timeout=15, headers={{"User-Agent": "Mozilla/5.0"}})
-        _h = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", _r.text, flags=re.DOTALL|re.IGNORECASE)
-        _t = re.sub(r"<[^>]+>", " ", _h)
-        return re.sub(r"\\s+", " ", _t).strip()[:limit]
-    except Exception:
-        return ""
-_articles = []
-for _u, _tit in _targets:
-    _tit_clean = re.sub(r"&#x27;", "'", _tit).strip()
-    _body = _fetch_body(_u)
-    _articles.append({{"title": _tit_clean, "url": _u, "body": _body}})
-# 3. Ollama (gemma4:e4b) で翻訳・要約
-_sections = []
-for _i, _a in enumerate(_articles):
-    _body_snip = _a["body"][:2000] if _a["body"] else "(本文取得不可)"
-    _prompt = (
-        f"以下の英語記事を日本語に翻訳して{_length_instruction}で要約してください。\\n\\n"
-        f"タイトル: {{_a['title']}}\\n\\n本文抜粋:\\n{{_body_snip}}\\n\\n"
-        "以下のJSON形式のみで返してください:\\n"
-        '{{"title_ja":"翻訳タイトル","summary_ja":"日本語要約"}}'
-    )
-    _title_ja, _summary_ja = _a["title"], "(翻訳なし)"
-    try:
-        _gr = requests.post(
-            "http://127.0.0.1:11434/v1/chat/completions",
-            headers={{"Content-Type": "application/json"}},
-            json={{"model": {_ollama_model!r}, "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": {_max_tokens}}},
-            timeout=180,
-        )
-        _gr.raise_for_status()
-        _raw = _gr.json()["choices"][0]["message"]["content"]
-        _raw = re.sub(r"<think>.*?</think>", "", _raw, flags=re.DOTALL).strip()
-        _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
-        if _m:
-            _d = json.loads(_m.group())
-            _title_ja = _d.get("title_ja", _title_ja)
-            _summary_ja = _d.get("summary_ja", _summary_ja)
-    except Exception as _e:
-        _summary_ja = f"(翻訳エラー: {{_e}})"
-    _sections.append(f"## 記事{{_i+1}}: {{_title_ja}}\\n原題: {{_a['title']}}\\n出典: {{_a['url']}}\\n\\n{{_summary_ja}}")
-# 4. ファイル保存
-_header = f"=== Hacker News AI ニュース {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}} ===\\n"
-_content = _header + "\\n\\n" + "\\n\\n---\\n\\n".join(_sections) + f"\\n\\n(Hacker Newsより取得 {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}})"
-_out_dir = os.path.expanduser({_out_dir_kw!r})
-os.makedirs(_out_dir, exist_ok=True)
-_fname = os.path.join(_out_dir, f"AI_News_{{datetime.datetime.now().strftime('%m-%d_%H%M')}}.txt")
-with open(_fname, "w", encoding="utf-8") as _f:
-    _f.write(_content)
-print(f"保存完了: {{_fname}}")
-print(_content)
-"""
-        _prebuilt_plan = [f"PYTHON:\n{_script}", "DONE: ファイルを保存しました"]
-    elif not _prebuilt_plan and _wants_translate and any(kw in goal.lower() for kw in ["hacker news", "hn", "hackernews"]):
-        # HN + 日本語: URL 無しでも HN API からトップストーリーを取得して翻訳
-        # _wants_save が True ならファイル保存、False なら画面表示のみ
-        _target_count_m = re.search(r'(\d+)\s*[件つ個]', goal)
-        _hn_count = int(_target_count_m.group(1)) if _target_count_m else 1
-        _out_dir_kw_hn = ""
-        _m2 = re.search(r'~/[a-zA-Z0-9/_.-]+', goal)
-        if _m2:
-            _out_dir_kw_hn = _m2.group(0).rstrip("/")
-        if not _out_dir_kw_hn:
-            _out_dir_kw_hn = "~/Desktop/AI_News"
-        _save_flag = "True" if _wants_save else "False"
-        _hn_script = f"""\
-import requests, re, json, os, datetime
-# 1. HN APIでトップストーリーのIDを取得
-_ids = requests.get('https://hacker-news.firebaseio.com/v0/topstories.json', timeout=15).json()
-_articles = []
-for _sid in _ids[:{_hn_count}]:
-    _item = requests.get(f'https://hacker-news.firebaseio.com/v0/item/{{_sid}}.json', timeout=10).json()
-    _title = _item.get('title', '')
-    _url = _item.get('url', '')
-    # 記事本文を取得
-    _body = ''
-    if _url:
-        try:
-            _r = requests.get(_url, timeout=15, headers={{"User-Agent": "Mozilla/5.0"}})
-            _h = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", _r.text, flags=re.DOTALL|re.IGNORECASE)
-            _body = re.sub(r"<[^>]+>", " ", _h)
-            _body = re.sub(r"\\s+", " ", _body).strip()[:3000]
-        except Exception:
-            pass
-    _articles.append({{"title": _title, "url": _url, "body": _body}})
-# 2. 翻訳 (Ollama gemma4:e4b)
-_sections = []
-for _i, _a in enumerate(_articles):
-    _body_snip = _a["body"][:2000] if _a["body"] else "(本文なし)"
-    _prompt = (
-        "以下の英語記事を日本語に翻訳してください。タイトルと内容の要約(300字以上)を含めてください。\\n\\n"
-        f"タイトル: {{_a['title']}}\\n出典: {{_a['url']}}\\n\\n本文抜粋:\\n{{_body_snip}}\\n\\n"
-        "以下のJSON形式のみで返してください:\\n"
-        '{{"title_ja":"日本語タイトル","summary_ja":"日本語の詳しい要約(300字以上)"}}'
-    )
-    _title_ja, _summary_ja = _a["title"], _a["body"][:500] if _a["body"] else "(内容取得不可)"
-    try:
-        _gr = requests.post(
-            "http://127.0.0.1:11434/v1/chat/completions",
-            headers={{"Content-Type": "application/json"}},
-            json={{"model": "gemma4:e4b", "messages": [{{"role": "user", "content": _prompt}}], "max_tokens": 1500}},
-            timeout=180,
-        )
-        _gr.raise_for_status()
-        _raw = _gr.json()["choices"][0]["message"]["content"]
-        _raw = re.sub(r"<think>.*?</think>", "", _raw, flags=re.DOTALL).strip()
-        _m = re.search(r"\\{{.*?\\}}", _raw, re.DOTALL)
-        if _m:
-            _d = json.loads(_m.group())
-            _title_ja = _d.get("title_ja", _title_ja)
-            _summary_ja = _d.get("summary_ja", _summary_ja)
-    except Exception as _e:
-        _summary_ja = f"(翻訳エラー: {{_e}})"
-    _sections.append(f"## 記事{{_i+1}}: {{_title_ja}}\\n原題: {{_a['title']}}\\n出典: {{_a['url']}}\\n\\n{{_summary_ja}}")
-    print(f"\\n===== {{_title_ja}} =====")
-    print(f"原題: {{_a['title']}}")
-    print(f"出典: {{_a['url']}}")
-    print(f"\\n{{_summary_ja}}")
-    print()
-# 3. ファイル保存 (_wants_save が True の場合のみ)
-if {_save_flag}:
-    _header = f"=== Hacker News AI ニュース {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}} ===\\n"
-    _content = _header + "\\n\\n" + "\\n\\n---\\n\\n".join(_sections) + f"\\n\\n(Hacker Newsより取得 {{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}})"
-    _out_dir = os.path.expanduser({_out_dir_kw_hn!r})
-    os.makedirs(_out_dir, exist_ok=True)
-    _fname = os.path.join(_out_dir, f"AI_News_{{datetime.datetime.now().strftime('%m-%d_%H%M')}}.txt")
-    with open(_fname, "w", encoding="utf-8") as _f:
-        _f.write(_content)
-    print(f"保存完了: {{_fname}}")
-"""
-        _done_msg = "DONE: ファイルを保存しました" if _wants_save else "DONE: Hacker Newsのニュースを日本語で表示しました"
-        _prebuilt_plan = [f"PYTHON:\n{_hn_script}", _done_msg]
-    elif _urls:
+    if _urls:
         context_hint = (
             "【重要】ゴールに以下のURLが含まれています。"
             "SEARCH: ではなく FETCH: でこのURLに直接アクセスしてください: "
             + ", ".join(_urls)
         )
         context = (context_hint + "\n" + context) if context else context_hint
+    is_hn_task = (
+        any(kw in goal.lower() for kw in ["hacker news", "hackernews"])
+        or re.search(r'(?<![A-Za-z])HN(?![A-Za-z])', goal, re.IGNORECASE)
+    )
+    if is_hn_task:
+        hn_hint = (
+            "【Hacker Newsタスク】FETCH: https://hacker-news.firebaseio.com/v0/topstories.json "
+            "などの通常ツールで取得し、保存が必要な場合は WRITE: でリポジトリ配下、"
+            "または HERMES_WRITE_ALLOW_DIRS で許可された外部ディレクトリに書き込んでください。"
+        )
+        context = (hn_hint + "\n" + context) if context else hn_hint
 
     console.print(Rule(
         f"[bold yellow]エージェントモード[/bold yellow]  domain=[cyan]{domain}[/cyan]",
@@ -600,10 +432,6 @@ if {_save_flag}:
         max_iterations=max_iterations,
         world_model=world_model,  # 世界モデルを引き継ぐ
     )
-    # 動作確認済みプランがあれば直接注入 (LLM計画をスキップ)
-    if _prebuilt_plan:
-        state.current_plan = _prebuilt_plan
-
     final_state = agent.run(state)
 
     console.print(Rule(style="yellow"))
@@ -988,7 +816,11 @@ def _cmd_schedule(args: str) -> None:
                 "  2026-04-01T09:00     指定日時に1回[/dim]"
             )
             return
-        job = scheduler.add_job(goal=goal_text, trigger=trigger)
+        try:
+            job = scheduler.add_job(goal=goal_text, trigger=trigger)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
         next_str = scheduler.format_next_run(job)
         console.print(
             f"[green]ジョブを登録しました:[/green] [{job.id}] {goal_text[:60]}\n"
@@ -1285,12 +1117,20 @@ def _start_inline_scheduler(llm: MistralClient, con: Console) -> "threading.Even
     from hermes_agi_gen.meta_cognition import GoalQueue
 
     stop_event = threading.Event()
+    if HermesDaemon.get_status().get("running"):
+        con.print("[dim][スケジューラ] デーモン起動中のためCLI内蔵スケジューラは無効化します。[/dim]")
+        stop_event.set()
+        return stop_event
 
     def _loop() -> None:
         scheduler = JobScheduler()
         goal_queue = GoalQueue()  # ダミー — tick() の戻り値ジョブだけ使う
         while not stop_event.wait(timeout=20):  # 20秒ごとにチェック
             try:
+                if HermesDaemon.get_status().get("running"):
+                    con.print("[dim][スケジューラ] デーモン起動を検出したためCLI内蔵スケジューラを停止します。[/dim]")
+                    stop_event.set()
+                    break
                 triggered = scheduler.tick(goal_queue)
                 for job in triggered:
                     con.print(f"\n[bold cyan][スケジューラ][/bold cyan] ジョブ発火: [{job.id}] {job.goal[:60]}")

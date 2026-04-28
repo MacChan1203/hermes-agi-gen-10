@@ -39,8 +39,7 @@ def main(dataset_file: str, output_file: str = "batch_results.jsonl", run_name: 
                 "timestamp": datetime.now().isoformat(),
                 "result": result,
             }
-            f.write(json.dumps(entry, ensure_ascii=False) + "
-")
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     print(f"{len(prompts)} 件を書き出しました: {out_path}")
 
 

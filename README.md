@@ -1,6 +1,6 @@
 # Hermes AGI Gen 10
 
-**自律進化型AGIフレームワーク** — 認知科学に基づく10段階認知ループ、6つの自己適応フィードバックループ、許可リスト方式セキュリティ、576件のテストを備えた自律型AGI。
+**自律進化型AGIフレームワーク** — 認知科学に基づく10段階認知ループ、6つの自己適応フィードバックループ、許可リスト方式セキュリティ、モックテストと条件付き実LLMテストを備えた自律型AGI。
 
 > Gen 6: タスク反応型AGI (入力→処理→出力)
 > Gen 7: 自律認知型AGI (知覚→省察→注意→計画→行動→学習)
@@ -10,10 +10,10 @@
 | 指標 | 値 |
 |------|-----|
 | モジュール数 | 43 |
-| コード行数 | 14,426 |
-| テスト件数 | **576 (モック 562 + 実LLM 14、全合格)** |
+| コード行数 | 14,707 |
+| テスト件数 | **モック 603 + 実LLM 14 (Ollama 起動時のみ実行)** |
 | テストカバレッジ | 43/43 モジュール (100%) |
-| config 定数 | 150 |
+| config 定数 | 155 |
 
 ---
 
@@ -23,6 +23,8 @@
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# テストや開発も行う場合
+pip install -r requirements-dev.txt
 
 # Ollama で gemma4:e4b を起動しておく
 ollama pull gemma4:e4b
@@ -35,9 +37,10 @@ python cli.py
 python cli.py --daemon
 
 # テスト実行
-python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (562件)
-python3 -m pytest tests/test_live_llm.py -v              # 実LLMテスト (14件, Ollama必須)
-python3 -m pytest tests/                                  # 全テスト (576件)
+pip install -r requirements-dev.txt
+python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (603件)
+python3 -m pytest tests/test_live_llm.py -v              # 実LLMテスト (14件, Ollama必須。未起動ならskip)
+python3 -m pytest tests/                                  # Ollama起動時は実LLMテストも実行
 
 # Python から直接
 python3 -c "
@@ -285,13 +288,13 @@ python cli.py
 ## テスト
 
 ```bash
-# 全テスト (Ollama 不要: 562件)
+# 全テスト (Ollama 不要: 603件)
 python3 -m pytest tests/ --ignore=tests/test_live_llm.py
 
-# 実 LLM テスト (Ollama + gemma4:e4b 必須: 14件)
+# 実 LLM テスト (Ollama + gemma4:e4b 必須: 14件。未起動ならskip)
 python3 -m pytest tests/test_live_llm.py -v
 
-# 全テスト (Ollama 起動時: 576件)
+# 全テスト (Ollama 起動時は実LLMテストも実行)
 python3 -m pytest tests/
 ```
 

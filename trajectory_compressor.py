@@ -25,8 +25,7 @@ def main(input: str, output: str | None = None, max_chars: int = 400):
             obj = json.loads(line)
             if "result" in obj and "final_response" in obj["result"]:
                 obj["result"]["final_response"] = compress_text(obj["result"]["final_response"], max_chars=max_chars)
-            dst.write(json.dumps(obj, ensure_ascii=False) + "
-")
+            dst.write(json.dumps(obj, ensure_ascii=False) + "\n")
             count += 1
     print(f"{count} 件を圧縮して保存しました: {output_path}")
 

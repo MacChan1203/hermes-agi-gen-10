@@ -6,6 +6,7 @@ Uses mocks for subprocess, requests, and LLM. Uses tmp_path for file/DB ops.
 from __future__ import annotations
 
 import json
+import py_compile
 import sqlite3
 import threading
 import time
@@ -13,6 +14,64 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
+
+from hermes_agi_gen.agi_core import _infer_goal_domain
+
+
+# =========================================================================
+# Hermes home resolution
+# =========================================================================
+
+class TestHermesHomeResolution:
+    """Runtime HERMES_HOME changes are respected by default stores."""
+
+    def test_session_db_resolves_hermes_home_at_construction(self, tmp_path, monkeypatch):
+        from hermes_agi_gen.state_store import SessionDB
+
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        db = SessionDB()
+
+        assert db.db_path == hermes_home / "state2.db"
+        assert db.db_path.exists()
+
+    def test_scheduler_resolves_hermes_home_at_construction(self, tmp_path, monkeypatch):
+        import hermes_agi_gen.scheduler as sched_mod
+
+        hermes_home = tmp_path / "scheduler-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(sched_mod, "_HERMES_DIR", None)
+        monkeypatch.setattr(sched_mod, "_SCHEDULE_FILE", None)
+
+        scheduler = sched_mod.JobScheduler()
+
+        assert scheduler._schedule_file == hermes_home / "scheduler.json"
+
+
+class TestAGICoreDomainInference:
+    """Meta-learning domain keys stay within the known domain set."""
+
+    def test_japanese_project_goal_maps_to_coding(self):
+        assert _infer_goal_domain("このプロジェクトをテストしてバグを修正して") == "coding"
+
+    def test_freeform_japanese_prefix_does_not_become_domain(self):
+        assert _infer_goal_domain("このプロジェクトの悪いところを確認して") == "general"
+
+    def test_explicit_context_domain_wins(self):
+        assert _infer_goal_domain("READMEを直して", "domain=writing") == "writing"
+
+
+class TestScriptSyntax:
+    """Top-level helper scripts should remain syntactically valid."""
+
+    @pytest.mark.parametrize("script", [
+        "batch_runner.py",
+        "mini_swe_runner.py",
+        "trajectory_compressor.py",
+    ])
+    def test_top_level_script_compiles(self, script: str):
+        py_compile.compile(script, doraise=True)
 
 
 # =========================================================================
@@ -186,6 +245,19 @@ class TestParserTriggerSpec:
         from hermes_agi_gen.scheduler import parse_trigger_spec
         assert parse_trigger_spec("garbage input") is None
 
+    @pytest.mark.parametrize("spec", [
+        "daily 25:99",
+        "daily:24:00",
+        "weekly mon 25:99",
+        "weekly:mon:09:60",
+        "every 0m",
+        "every:-1m",
+        "+0m",
+    ])
+    def test_invalid_trigger_values_return_none(self, spec):
+        from hermes_agi_gen.scheduler import parse_trigger_spec
+        assert parse_trigger_spec(spec) is None
+
 
 class TestSchedulerMaxJobs:
     """Max job count enforcement."""
@@ -212,6 +284,22 @@ class TestSchedulerMaxJobs:
                 scheduler.add_job("job4", "every:30m")
         finally:
             sched_mod.SCHEDULER_MAX_JOBS = orig_max
+            sched_mod._HERMES_DIR = orig_dir
+            sched_mod._SCHEDULE_FILE = orig_file
+
+    def test_add_job_rejects_invalid_trigger(self, tmp_path):
+        import hermes_agi_gen.scheduler as sched_mod
+
+        orig_dir = sched_mod._HERMES_DIR
+        orig_file = sched_mod._SCHEDULE_FILE
+        sched_mod._HERMES_DIR = tmp_path
+        sched_mod._SCHEDULE_FILE = tmp_path / "scheduler.json"
+
+        try:
+            scheduler = sched_mod.JobScheduler()
+            with pytest.raises(ValueError, match="無効"):
+                scheduler.add_job("bad", "every:0s")
+        finally:
             sched_mod._HERMES_DIR = orig_dir
             sched_mod._SCHEDULE_FILE = orig_file
 
@@ -278,6 +366,16 @@ class TestCalcNextRun:
         from hermes_agi_gen.scheduler import _calc_next_run
         result = _calc_next_run("bogus:stuff", last_run=None)
         assert result is None
+
+    @pytest.mark.parametrize("trigger", [
+        "daily:25:99",
+        "weekly:mon:25:99",
+        "every:0s",
+        "every:-1m",
+    ])
+    def test_invalid_values_return_none(self, trigger):
+        from hermes_agi_gen.scheduler import _calc_next_run
+        assert _calc_next_run(trigger, last_run=None) is None
 
 
 # =========================================================================

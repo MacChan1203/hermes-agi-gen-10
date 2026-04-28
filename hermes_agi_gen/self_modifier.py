@@ -50,9 +50,10 @@ _SAFE_MODIFY_TARGETS = {
     "hermes_agi_gen/inner_dialogue.py",
 }
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
-_PATCH_DB_PATH = get_hermes_home() / "self_modifier.db"
+_PATCH_DB_NAME = "self_modifier.db"
+_PATCH_DB_PATH = get_hermes_path(_PATCH_DB_NAME)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS code_patches (
@@ -173,7 +174,7 @@ class SelfModifier:
     ) -> None:
         self.llm = llm
         self.repo_root = Path(repo_root).resolve()
-        self.db_path = db_path or _PATCH_DB_PATH
+        self.db_path = Path(db_path) if db_path is not None else get_hermes_path(_PATCH_DB_NAME)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row

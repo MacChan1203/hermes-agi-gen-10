@@ -107,6 +107,31 @@ from .world_model import WorldModel
 
 logger = logging.getLogger(__name__)
 
+_KNOWN_DOMAINS = frozenset({"general", "coding", "research", "writing", "data", "ops"})
+
+
+def _infer_goal_domain(goal: str, context: str = "") -> str:
+    """Infer a stable domain key for learning tables.
+
+    MetaLearner domains are persistent DB keys, so free-form Japanese goal
+    prefixes such as "このプロジェクトを" should never become domain names.
+    """
+    text = f"{goal}\n{context}".lower()
+    for domain in _KNOWN_DOMAINS:
+        if f"domain={domain}" in text or f"domain: {domain}" in text:
+            return domain
+    if any(kw in text for kw in ("python", "コード", "実装", "修正", "テスト", "pytest", "bug", "バグ")):
+        return "coding"
+    if any(kw in text for kw in ("調査", "検索", "論文", "ニュース", "research", "web", "url", "http")):
+        return "research"
+    if any(kw in text for kw in ("文章", "要約", "翻訳", "README", "ドキュメント", "書いて", "writing")):
+        return "writing"
+    if any(kw in text for kw in ("csv", "json", "データ", "分析", "集計", "data")):
+        return "data"
+    if any(kw in text for kw in ("デーモン", "環境", "起動", "設定", "deploy", "ops", "運用")):
+        return "ops"
+    return "general"
+
 
 class RunGoalResult(TypedDict, total=False):
     """run_goal() の返却型。"""
@@ -452,7 +477,7 @@ class AGICore:
         domain = "general"
         strategy = None
         try:
-            domain = getattr(deliberation, "original_goal", goal).split()[0] if deliberation else "general"
+            domain = _infer_goal_domain(goal, context)
             strategy = self.meta_learner.select_strategy(domain)
             logger.info("[MetaLearner] 選択戦略: %s (UCB=%.2f)", strategy.name, strategy.ucb_score)
         except Exception as exc:

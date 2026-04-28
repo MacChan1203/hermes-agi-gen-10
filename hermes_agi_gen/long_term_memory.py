@@ -22,9 +22,10 @@ from .config import LTM_EMBEDDING_TIMEOUT, LTM_EMBEDDING_DETECT_TIMEOUT, LTM_MAX
 
 logger = logging.getLogger(__name__)
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
-DEFAULT_LTM_PATH = get_hermes_home() / "long_term_memory.db"
+DEFAULT_LTM_NAME = "long_term_memory.db"
+DEFAULT_LTM_PATH = get_hermes_path(DEFAULT_LTM_NAME)
 
 # Ollama埋め込みモデル (nomic-embed-textが最良、qwen3はフォールバック)
 _EMBED_MODEL_CANDIDATES = ["nomic-embed-text", "mxbai-embed-large", "all-minilm"]
@@ -186,7 +187,7 @@ class LongTermMemory:
     """
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        self.db_path = db_path or DEFAULT_LTM_PATH
+        self.db_path = Path(db_path) if db_path is not None else get_hermes_path(DEFAULT_LTM_NAME)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row

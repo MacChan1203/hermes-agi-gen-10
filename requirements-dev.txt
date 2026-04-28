@@ -1,0 +1,9 @@
+# Hermes AGI Gen development dependencies
+#
+# Install this file when running tests or working on the project:
+#   python -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest
+pytest-cov

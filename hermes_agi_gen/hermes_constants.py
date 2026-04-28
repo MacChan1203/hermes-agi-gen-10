@@ -2,19 +2,48 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
+
+
+def _is_writable_dir(path: Path) -> bool:
+    """Return True when Hermes can create and replace files in path."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".hermes_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
 
 
 def get_hermes_home() -> Path:
     """HERMES_HOME ディレクトリを返す。
 
     環境変数 HERMES_HOME が設定されていればそれを使い、
-    未設定なら ~/.hermes にフォールバックする。
-    ディレクトリが存在しなければ自動作成する。
+    未設定なら ~/.hermes にフォールバックする。書き込み不可の環境では
+    カレントディレクトリ配下の .hermes、最後に tempdir へ退避する。
     """
-    home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-    home.mkdir(parents=True, exist_ok=True)
-    return home
+    configured = os.getenv("HERMES_HOME")
+    candidates = [
+        Path(configured).expanduser() if configured else Path.home() / ".hermes",
+        Path.cwd() / ".hermes",
+        Path(tempfile.gettempdir()) / "hermes-agi-gen",
+    ]
+    for home in candidates:
+        if _is_writable_dir(home):
+            return home
+    raise OSError("Hermes home directory is not writable")
+
+
+def get_hermes_path(filename: str) -> Path:
+    """Return a file path under the current Hermes home.
+
+    Keeping this lookup dynamic lets tests and embedding applications set
+    HERMES_HOME after modules have been imported.
+    """
+    return get_hermes_home() / filename
 
 
 # LLM providers

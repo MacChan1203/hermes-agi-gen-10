@@ -51,9 +51,10 @@ from .config import (
 
 logger = logging.getLogger(__name__)
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
-_EXPERIMENT_DB_PATH = get_hermes_home() / "experiments.db"
+_EXPERIMENT_DB_NAME = "experiments.db"
+_EXPERIMENT_DB_PATH = get_hermes_path(_EXPERIMENT_DB_NAME)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (
@@ -204,7 +205,7 @@ class ExperimentRunner:
     ) -> None:
         self.agi_core = agi_core
         self.experiment_timeout = experiment_timeout
-        self.db_path = db_path or _EXPERIMENT_DB_PATH
+        self.db_path = Path(db_path) if db_path is not None else get_hermes_path(_EXPERIMENT_DB_NAME)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row

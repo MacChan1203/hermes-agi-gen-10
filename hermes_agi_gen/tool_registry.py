@@ -16,11 +16,12 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
 logger = logging.getLogger(__name__)
 
-_REGISTRY_PATH = get_hermes_home() / "tool_registry.db"
+_REGISTRY_DB_NAME = "tool_registry.db"
+_REGISTRY_PATH = get_hermes_path(_REGISTRY_DB_NAME)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tools (
@@ -110,6 +111,11 @@ def _is_tool_code_safe(code: str) -> Tuple[bool, str]:
             if isinstance(node.ctx, ast.Load):
                 return False, f"禁止名への参照: {node.id}"
 
+        # timeout なしの同一プロセス実行なので、明白な無限ループを拒否する。
+        if isinstance(node, ast.While):
+            if isinstance(node.test, ast.Constant) and bool(node.test.value):
+                return False, "無限ループ while True は禁止されています"
+
     return True, ""
 
 
@@ -198,7 +204,7 @@ class ToolRegistry:
     """
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        self.db_path = db_path or _REGISTRY_PATH
+        self.db_path = Path(db_path) if db_path is not None else get_hermes_path(_REGISTRY_DB_NAME)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row

@@ -24,9 +24,9 @@ _DOMAIN_HINTS: dict[str, str] = {
     "research": (
         "URLが含まれる場合は SEARCH: でなく FETCH: でそのURLに直接アクセスする。"
         "「URLからデータ取得 → 処理 → ファイル保存」のような複数ステップのタスクは、"
-        "requests/json/os/datetime などを使った単一の PYTHON: スクリプトにまとめて一括実行する。"
-        "スクリプト内でのLLM呼び出しは不要 — テキスト処理・フィルタ・保存はPythonで完結させる。"
-        "ファイル保存先が ~/Desktop/... の場合は os.path.expanduser('~') で絶対パスに展開する。"
+        "requests/json/os/datetime などを使った単一の PYTHON: スクリプトにまとめて処理できる。"
+        "スクリプト内でのLLM呼び出しは不要 — テキスト処理・フィルタはPythonで行う。"
+        "ただし PYTHON: でファイル書き込みはしない。ファイル保存は WRITE: を使い、原則リポジトリ配下へ保存する。外部保存先は HERMES_WRITE_ALLOW_DIRS で許可された場合のみ使う。"
     ),
     "writing": "既存の文章・構造を確認してから追記・編集する。参考資料が必要なら SEARCH: を活用する。URLから直接コンテンツ取得するなら FETCH: を使う。時刻指定タスクは SCHEDULE_AT: で登録する。",
     "data": "データファイルの形式・サイズを確認してから処理する。簡単な集計は CALC: で行う。手法に迷ったら SEARCH: で調べる。",
@@ -118,13 +118,15 @@ def _is_conversational(goal: str) -> bool:
 # ------------------------------------------------------------------
 _STATIC_BOOTSTRAP: dict[str, list[str]] = {
     "general": [
-        "CMD: pwd && ls -la && find . -maxdepth 2 -not -path '*/__pycache__/*' | sort | head -60",
+        "CMD: pwd",
+        "CMD: find . -maxdepth 2 -not -path '*/__pycache__/*' | sort | head -60",
         "DONE: 現状を把握しました。",
     ],
     "coding": [
-        "CMD: pwd && ls -la && find . -maxdepth 2 -not -path '*/__pycache__/*' | sort | head -60",
-        "CMD: cat README.md 2>/dev/null | head -60 || echo 'README なし'",
-        "CMD: cat requirements.txt 2>/dev/null || cat pyproject.toml 2>/dev/null | head -40 || echo '依存ファイルなし'",
+        "CMD: pwd",
+        "CMD: find . -maxdepth 2 -not -path '*/__pycache__/*' | sort | head -60",
+        "READ: README.md",
+        "READ: requirements.txt",
         "DONE: プロジェクト構造と依存関係を確認しました。",
     ],
     "research": [
@@ -132,17 +134,18 @@ _STATIC_BOOTSTRAP: dict[str, list[str]] = {
         "DONE: 調査結果をまとめました。",
     ],
     "writing": [
-        "CMD: pwd && ls -la",
+        "CMD: pwd",
         "CMD: find . -name '*.md' -o -name '*.txt' -o -name '*.rst' | head -20",
         "DONE: 文書ファイルを確認しました。",
     ],
     "data": [
-        "CMD: pwd && ls -la",
+        "CMD: pwd",
         "CMD: find . -name '*.csv' -o -name '*.json' -o -name '*.parquet' | head -20",
         "DONE: データファイルを確認しました。",
     ],
     "ops": [
-        "CMD: pwd && ls -la && env | grep -v SECRET | head -20",
+        "CMD: pwd",
+        "CMD: env | grep -v SECRET | head -20",
         "DONE: 環境を確認しました。",
     ],
 }

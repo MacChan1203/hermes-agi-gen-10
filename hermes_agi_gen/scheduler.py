@@ -14,6 +14,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -28,12 +29,46 @@ from .config import SCHEDULER_MAX_JOBS
 
 logger = logging.getLogger(__name__)
 
-from .hermes_constants import get_hermes_home
+from .hermes_constants import get_hermes_path
 
-_HERMES_DIR = get_hermes_home()
-_SCHEDULE_FILE = _HERMES_DIR / "scheduler.json"
+_HERMES_DIR: Optional[Path] = None
+_SCHEDULE_FILE: Optional[Path] = None
 
 _WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def _parse_hh_mm(value: str) -> Optional[tuple[int, int]]:
+    try:
+        hh, mm = map(int, value.split(":"))
+    except ValueError:
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return hh, mm
+
+
+def _parse_positive_interval(spec: str) -> Optional[timedelta]:
+    spec = spec.lower().strip()
+    try:
+        if spec.endswith("m"):
+            amount = int(spec[:-1])
+            delta = timedelta(minutes=amount)
+        elif spec.endswith("h"):
+            amount = int(spec[:-1])
+            delta = timedelta(hours=amount)
+        elif spec.endswith("s"):
+            amount = int(spec[:-1])
+            delta = timedelta(seconds=amount)
+        else:
+            logger.warning("every: の単位が不明です: %s", spec)
+            return None
+    except ValueError:
+        logger.warning("every: の間隔が無効です: %s", spec)
+        return None
+    if amount <= 0:
+        logger.warning("every: の間隔は正の値が必要です: %s", spec)
+        return None
+    return delta
 
 
 @dataclass
@@ -87,18 +122,8 @@ def _calc_next_run(trigger: str, last_run: Optional[float]) -> Optional[float]:
     # every:<N>m or every:<N>h
     if trigger.lower().startswith("every:"):
         spec = trigger[6:].lower().strip()
-        try:
-            if spec.endswith("m"):
-                delta = timedelta(minutes=int(spec[:-1]))
-            elif spec.endswith("h"):
-                delta = timedelta(hours=int(spec[:-1]))
-            elif spec.endswith("s"):
-                delta = timedelta(seconds=int(spec[:-1]))
-            else:
-                logger.warning("every: の単位が不明です: %s", spec)
-                return None
-        except ValueError:
-            logger.warning("every: の間隔が無効です: %s", spec)
+        delta = _parse_positive_interval(spec)
+        if delta is None:
             return None
 
         base = datetime.fromtimestamp(last_run) if last_run else now
@@ -107,11 +132,11 @@ def _calc_next_run(trigger: str, last_run: Optional[float]) -> Optional[float]:
     # daily:<HH:MM>
     if trigger.lower().startswith("daily:"):
         t_str = trigger[6:].strip()
-        try:
-            hh, mm = map(int, t_str.split(":"))
-        except ValueError:
+        parsed_time = _parse_hh_mm(t_str)
+        if parsed_time is None:
             logger.warning("daily: の時刻が無効です: %s", t_str)
             return None
+        hh, mm = parsed_time
         candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if candidate.timestamp() <= time.time():
             candidate += timedelta(days=1)
@@ -128,11 +153,11 @@ def _calc_next_run(trigger: str, last_run: Optional[float]) -> Optional[float]:
         if weekday is None:
             logger.warning("weekly: の曜日が不明です: %s", day_str)
             return None
-        try:
-            hh, mm = map(int, t_str.split(":"))
-        except ValueError:
+        parsed_time = _parse_hh_mm(t_str)
+        if parsed_time is None:
             logger.warning("weekly: の時刻が無効です: %s", t_str)
             return None
+        hh, mm = parsed_time
 
         candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         days_ahead = (weekday - now.weekday()) % 7
@@ -167,7 +192,8 @@ def parse_trigger_spec(spec: str) -> Optional[str]:
 
     # +30m / +2h
     if spec.startswith("+"):
-        return f"every:{spec[1:]}"
+        canonical = f"every:{spec[1:]}"
+        return canonical if _calc_next_run(canonical, last_run=None) is not None else None
 
     lower = spec.lower()
 
@@ -175,21 +201,24 @@ def parse_trigger_spec(spec: str) -> Optional[str]:
     if lower.startswith("every "):
         rest = lower[6:].strip().replace("min", "m").replace("hour", "h").replace("hours", "h")
         rest = rest.replace(" ", "")
-        return f"every:{rest}"
+        canonical = f"every:{rest}"
+        return canonical if _calc_next_run(canonical, last_run=None) is not None else None
 
     # daily 09:00
     if lower.startswith("daily "):
-        return f"daily:{lower[6:].strip()}"
+        canonical = f"daily:{lower[6:].strip()}"
+        return canonical if _calc_next_run(canonical, last_run=None) is not None else None
 
     # weekly mon 09:00
     if lower.startswith("weekly "):
         parts = lower[7:].strip().split()
         if len(parts) == 2:
-            return f"weekly:{parts[0]}:{parts[1]}"
+            canonical = f"weekly:{parts[0]}:{parts[1]}"
+            return canonical if _calc_next_run(canonical, last_run=None) is not None else None
 
     # already in canonical form
     if any(lower.startswith(p) for p in ("once:", "every:", "daily:", "weekly:")):
-        return spec
+        return spec if _calc_next_run(spec, last_run=None) is not None else None
 
     return None
 
@@ -202,9 +231,24 @@ class JobScheduler:
     """ジョブのスケジュール管理と実行トリガー。"""
 
     def __init__(self) -> None:
-        _HERMES_DIR.mkdir(parents=True, exist_ok=True)
+        self._schedule_file = self._resolve_schedule_file()
+        self._schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_file = self._schedule_file.with_suffix(self._schedule_file.suffix + ".lock")
         self._jobs: List[ScheduledJob] = []
         self.load()
+
+    @staticmethod
+    def _resolve_schedule_file() -> Path:
+        """Resolve schedule path at construction time.
+
+        The module-level variables are kept only for older tests/callers that
+        monkeypatch them directly.
+        """
+        if _SCHEDULE_FILE is not None:
+            return Path(_SCHEDULE_FILE)
+        if _HERMES_DIR is not None:
+            return Path(_HERMES_DIR) / "scheduler.json"
+        return get_hermes_path("scheduler.json")
 
     # ------------------------------------------------------------------
     # CRUD
@@ -228,12 +272,16 @@ class JobScheduler:
                 f"ジョブ数が上限 ({SCHEDULER_MAX_JOBS}) に達しています。"
                 " 不要なジョブを削除してから追加してください。"
             )
+        next_run = _calc_next_run(trigger, last_run=None)
+        if next_run is None:
+            raise ValueError(f"無効なスケジュールトリガーです: {trigger}")
         job = ScheduledJob(
             id=job_id or str(uuid.uuid4())[:8],
             goal=goal,
             trigger=trigger,
             domain=domain,
             priority=priority,
+            next_run=next_run,
         )
         self._jobs.append(job)
         self.save()
@@ -323,10 +371,10 @@ class JobScheduler:
 
     def _reload_if_changed(self) -> None:
         """ファイルが更新されていれば再読み込みする (デーモン起動後の追加ジョブを拾う)。"""
-        if not _SCHEDULE_FILE.exists():
+        if not self._schedule_file.exists():
             return
         try:
-            mtime = _SCHEDULE_FILE.stat().st_mtime
+            mtime = self._schedule_file.stat().st_mtime
             if not hasattr(self, "_last_mtime") or mtime != self._last_mtime:
                 self.load()
                 self._last_mtime = mtime
@@ -334,17 +382,29 @@ class JobScheduler:
             logger.warning("スケジューラー再読み込みエラー: %s", exc)
 
     def save(self) -> None:
-        """ジョブリストをJSONファイルに保存する (flock で排他ロック)。"""
+        """ジョブリストをJSONファイルに保存する (flock + atomic replace)。"""
         try:
+            self._schedule_file.parent.mkdir(parents=True, exist_ok=True)
+            self._lock_file.parent.mkdir(parents=True, exist_ok=True)
             data = [j.to_dict() for j in self._jobs]
-            content = json.dumps(data, ensure_ascii=False, indent=2)
-            with open(_SCHEDULE_FILE, "w", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+            with open(self._lock_file, "a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                tmp_path = self._schedule_file.with_suffix(self._schedule_file.suffix + ".tmp")
                 try:
-                    f.write(content)
-                    f.flush()
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, self._schedule_file)
+                    self._last_mtime = self._schedule_file.stat().st_mtime
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    try:
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                    except OSError:
+                        pass
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         except Exception as exc:
             logger.warning("スケジューラー保存エラー: %s", exc)
 
@@ -354,19 +414,18 @@ class JobScheduler:
         ロック保持中にファイル読み込み・JSON解析・ジョブ構築を全て行い、
         TOCTOU 競合を防止する。
         """
-        if not _SCHEDULE_FILE.exists():
+        if not self._schedule_file.exists():
             return
         try:
-            with open(_SCHEDULE_FILE, "r", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            with open(self._lock_file, "a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
                 try:
-                    raw = f.read()
-                    # ロック保持中に解析まで完了させる (TOCTOU 防止)
-                    data = json.loads(raw)
+                    raw = self._schedule_file.read_text(encoding="utf-8")
+                    data = json.loads(raw) if raw.strip() else []
                     self._jobs = [ScheduledJob.from_dict(d) for d in data]
-                    self._last_mtime = _SCHEDULE_FILE.stat().st_mtime
+                    self._last_mtime = self._schedule_file.stat().st_mtime
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         except Exception as exc:
             logger.warning("スケジューラーロードエラー: %s", exc)
 

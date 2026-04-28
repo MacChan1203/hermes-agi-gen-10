@@ -85,13 +85,19 @@ _OS_DENY_FUNCS = frozenset({
     "exec", "_exec", "abort", "_exit",
 })
 
-# open() で書き込みを禁止するパス (literal 引数でのみ検査可能)
+# pathlib.Path.write_text()/unlink()/chmod() などは import 自体が安全でも
+# メソッド呼び出しでファイルシステムを書き換えられるため、AST段階で拒否する。
+_PATHLIB_SIDE_EFFECT_METHODS = frozenset({
+    "write_text", "write_bytes", "unlink", "chmod", "lchmod",
+    "rename", "replace", "rmdir", "mkdir", "touch",
+    "symlink_to", "hardlink_to", "link_to", "open",
+})
+
+# open()/WRITE: で書き込みを禁止するパス (literal 引数でのみ検査可能)
 #
 # 設計注記:
-#   本 denylist は PYTHON: コード内の open(..., 'w') に対する AST 解析ゲートで、
-#   変数パスは判定できないため「明示的に危険なゾーンのみ弾く」方針 (permissive)。
-#   一方、WRITE: ツールの _write_file() は allowlist 方式 (repo_root / HOME のみ許可)
-#   を採っており、こちらの方が強い制約。2段で役割が異なるため両者を残す。
+#   本 denylist は PYTHON: コード内の open(..., 'w') に対する AST 解析ゲートと、
+#   WRITE: ツールの正規化後パス検査で共用する。
 _OPEN_WRITE_DENYLIST_PREFIXES = (
     "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev",
     "/System", "/Library/LaunchDaemons", "/Library/LaunchAgents",
@@ -100,7 +106,7 @@ _OPEN_WRITE_DENYLIST_PREFIXES = (
 _OPEN_WRITE_DENYLIST_COMPONENTS = frozenset({
     ".ssh", ".aws", ".gnupg", ".config",
     ".bashrc", ".zshrc", ".profile", ".bash_profile", ".zshenv",
-    "authorized_keys", "id_rsa", "id_ed25519",
+    ".env", ".netrc", ".pypirc", "authorized_keys", "id_rsa", "id_ed25519",
 })
 
 
@@ -108,7 +114,7 @@ def _is_safe_open_write_path(path: Any) -> bool:
     """open() 書き込みモードで literal 指定されたパスが安全かを判定する。
 
     - システムディレクトリ (/etc, /usr, ...) や秘密ファイル (~/.ssh/*, ~/.bashrc) を拒否
-    - それ以外 (リポジトリ配下、~/Desktop/、/tmp/ など) は許可
+    - それ以外 (リポジトリ配下、明示 allowlist 配下など) は呼び出し側で追加判定する
     """
     if not isinstance(path, str):
         return False
@@ -123,6 +129,36 @@ def _is_safe_open_write_path(path: Any) -> bool:
         if part in _OPEN_WRITE_DENYLIST_COMPONENTS:
             return False
     return True
+
+
+def _has_protected_path_component(path: Path | str) -> bool:
+    parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+    return any(part in _OPEN_WRITE_DENYLIST_COMPONENTS for part in parts)
+
+
+def _iter_write_allow_dirs() -> list[Path]:
+    """Return explicitly allowed external WRITE directories.
+
+    HERMES_WRITE_ALLOW_DIRS is a path-list (os.pathsep separated). The repo
+    root is always allowed by _write_file(); this only covers intentional
+    external output directories such as a user-chosen Desktop folder.
+    """
+    raw = os.getenv("HERMES_WRITE_ALLOW_DIRS", "")
+    dirs: list[Path] = []
+    for item in raw.split(os.pathsep):
+        item = item.strip()
+        if not item:
+            continue
+        dirs.append(Path(item).expanduser().resolve())
+    return dirs
+
+
+def _path_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 # 許可する組み込み関数呼び出し
 _ALLOWED_BUILTINS = frozenset({
@@ -141,6 +177,20 @@ _DANGEROUS_ATTRS = frozenset({
     "__class__", "__bases__", "__subclasses__", "__mro__",
     "__globals__", "__builtins__", "__code__", "__import__",
     "__qualname__", "__module__", "__dict__",
+})
+
+# CMD: は shell=True を使わないが、単体コマンドでも破壊的操作はあり得る。
+# 実行前にコマンド名で拒否する。
+_BLOCKED_SHELL_COMMANDS = frozenset({
+    "rm", "rmdir", "unlink", "shred", "wipefs",
+    "chmod", "chown", "chgrp", "chroot",
+    "dd", "mkfs", "mount", "umount", "diskutil",
+    "sudo", "su", "doas",
+    "kill", "pkill", "killall",
+    "shutdown", "reboot", "halt", "poweroff",
+    # Interpreter entrypoints bypass the PYTHON: sandbox and shell policy.
+    "python", "python3", "python2", "pypy", "pypy3",
+    "bash", "sh", "zsh", "fish", "perl", "ruby", "node", "deno", "php",
 })
 
 
@@ -295,26 +345,88 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
 
     # ユーザー定義の関数・クラス名を収集 (呼び出し許可用)
     _user_defined: set[str] = set()
+    _import_aliases: dict[str, str] = {}
+    _pathlike_vars: set[str] = set()
+
+    def _is_pathlib_constructor(expr: ast.AST) -> bool:
+        if not isinstance(expr, ast.Call):
+            return False
+        func = expr.func
+        if isinstance(func, ast.Name):
+            return _import_aliases.get(func.id) == "pathlib"
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            return _import_aliases.get(func.value.id, func.value.id) == "pathlib" and func.attr in {"Path", "PurePath"}
+        return False
+
+    def _expr_comes_from_pathlib(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in _pathlike_vars
+        if _is_pathlib_constructor(expr):
+            return True
+        if isinstance(expr, ast.Call):
+            if isinstance(expr.func, ast.Attribute) and _expr_comes_from_pathlib(expr.func.value):
+                return True
+            return _expr_comes_from_pathlib(expr.func)
+        if isinstance(expr, ast.Attribute):
+            if isinstance(expr.value, ast.Name) and _import_aliases.get(expr.value.id, expr.value.id) == "pathlib":
+                return expr.attr in {"Path", "PurePath"}
+            return _expr_comes_from_pathlib(expr.value)
+        if isinstance(expr, ast.BinOp):
+            return _expr_comes_from_pathlib(expr.left) or _expr_comes_from_pathlib(expr.right)
+        if isinstance(expr, ast.Subscript):
+            return _expr_comes_from_pathlib(expr.value)
+        if isinstance(expr, ast.IfExp):
+            return _expr_comes_from_pathlib(expr.body) or _expr_comes_from_pathlib(expr.orelse)
+        if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+            return any(_expr_comes_from_pathlib(elt) for elt in expr.elts)
+        return False
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             _user_defined.add(node.name)
         elif isinstance(node, ast.ClassDef):
             _user_defined.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    _user_defined.add(target.id)
         elif isinstance(node, ast.ImportFrom):
             # from X import Y, Z — Y/Z をローカル名として呼び出し許可
             for alias in node.names:
                 local = alias.asname or alias.name
                 if local != "*":
                     _user_defined.add(local)
+                    if node.module:
+                        _import_aliases[local] = node.module.split(".")[0]
         elif isinstance(node, ast.Import):
             # import X as Y / import X — 束縛名 (X または Y) を許可
             for alias in node.names:
                 local = alias.asname or alias.name.split(".")[0]
                 _user_defined.add(local)
+                _import_aliases[local] = alias.name.split(".")[0]
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _expr_comes_from_pathlib(node.value):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in _pathlike_vars:
+                        _pathlike_vars.add(target.id)
+                        changed = True
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and _expr_comes_from_pathlib(node.value)
+                and isinstance(node.target, ast.Name)
+                and node.target.id not in _pathlike_vars
+            ):
+                _pathlike_vars.add(node.target.id)
+                changed = True
+            elif (
+                isinstance(node, ast.NamedExpr)
+                and _expr_comes_from_pathlib(node.value)
+                and isinstance(node.target, ast.Name)
+                and node.target.id not in _pathlike_vars
+            ):
+                _pathlike_vars.add(node.target.id)
+                changed = True
 
     for node in ast.walk(tree):
         # --- インポート: 許可リストのみ通す ---
@@ -339,6 +451,20 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
                 for alias in node.names:
                     if alias.name in _OS_DENY_FUNCS:
                         return False, f"from os import {alias.name} は禁止されています"
+
+        # --- 危険 callable の別名化を拒否 ---
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id in {"open", "__import__", "eval", "exec", "compile"}:
+                return False, f"危険な callable '{value.id}' の別名化は禁止されています"
+            if isinstance(value, ast.Attribute):
+                root = value.value
+                if (
+                    isinstance(root, ast.Name)
+                    and _import_aliases.get(root.id, root.id) == "os"
+                    and value.attr in _OS_DENY_FUNCS
+                ):
+                    return False, f"os.{value.attr} の別名化は禁止されています"
 
         # --- 関数呼び出し: 許可リスト + ユーザー定義のみ ---
         elif isinstance(node, ast.Call):
@@ -367,27 +493,19 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
                         return False, f"open() の mode '{mode_value}' は無効です"
                     is_write = any(ch in mode_value for ch in ("w", "a", "x", "+"))
                     if is_write:
-                        # 書き込み時は literal パスの危険ゾーンを拒否
-                        # (変数パスは AST では判定できないため通す)
-                        if node.args and isinstance(node.args[0], ast.Constant):
-                            path = node.args[0].value
-                            if isinstance(path, str) and not _is_safe_open_write_path(path):
-                                return False, f"open() 書き込みパス '{path}' は保護ゾーンにあります"
-                        for kw in node.keywords:
-                            if kw.arg == "file" and isinstance(kw.value, ast.Constant):
-                                path = kw.value.value
-                                if isinstance(path, str) and not _is_safe_open_write_path(path):
-                                    return False, f"open() 書き込みパス '{path}' は保護ゾーンにあります"
+                        return False, "PYTHON: での open() 書き込みは禁止されています。WRITE: を使ってください"
                 elif name not in _ALLOWED_BUILTINS and name not in _user_defined:
                     return False, f"関数 '{name}()' は許可されていません"
             # メソッド呼び出し (.method()) — 属性部分を検査
             elif isinstance(func, ast.Attribute):
                 if func.attr.startswith("__") and func.attr.endswith("__"):
                     return False, f"メソッド '.{func.attr}()' は禁止されています (dunder)"
+                if func.attr in _PATHLIB_SIDE_EFFECT_METHODS and _expr_comes_from_pathlib(func.value):
+                    return False, f"pathlib の副作用メソッド '.{func.attr}()' は禁止されています"
                 # os.<危険関数>() を拒否。os.path.xxx は value が Attribute なので通過。
                 if (
                     isinstance(func.value, ast.Name)
-                    and func.value.id == "os"
+                    and _import_aliases.get(func.value.id, func.value.id) == "os"
                     and func.attr in _OS_DENY_FUNCS
                 ):
                     return False, f"os.{func.attr}() は禁止されています (破壊的/シェル実行系)"
@@ -543,6 +661,21 @@ class Executor:
                 "ok": False,
                 "stdout": "",
                 "stderr": "セキュリティ制限: $(...) コマンド置換は禁止されています",
+                "returncode": 1,
+                "command": None
+            }
+        try:
+            _first_tokens = shlex.split(cmd)
+        except ValueError as e:
+            return {"ok": False, "stdout": "", "stderr": f"コマンド解析エラー: {e}", "returncode": -1, "command": None}
+        if not _first_tokens:
+            return {"ok": False, "stdout": "", "stderr": "コマンドが空です", "returncode": 1, "command": None}
+        _cmd_name = os.path.basename(_first_tokens[0])
+        if _cmd_name in _BLOCKED_SHELL_COMMANDS:
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": f"セキュリティ制限: コマンド '{_cmd_name}' は禁止されています",
                 "returncode": 1,
                 "command": None
             }
@@ -786,22 +919,29 @@ class Executor:
         # セキュリティ: symlink を追跡した後の正規パスで検証
         resolved_path = path.resolve()
         resolved_root = self.repo_root.resolve()
-        resolved_home = home.resolve()
+        if _has_protected_path_component(resolved_path):
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": f"アクセス拒否: WRITE: パス '{filepath}' は保護ゾーンにあります",
+                "returncode": 1,
+                "command": None,
+            }
 
-        allowed = False
-        try:
-            resolved_path.relative_to(resolved_root)
-            allowed = True
-        except ValueError:
-            pass
+        allowed = _path_under(resolved_path, resolved_root)
         if not allowed:
-            try:
-                resolved_path.relative_to(resolved_home)
-                allowed = True
-            except ValueError:
-                pass
+            allowed = any(_path_under(resolved_path, allow_dir) for allow_dir in _iter_write_allow_dirs())
         if not allowed:
-            return {"ok": False, "stdout": "", "stderr": f"アクセス拒否: WRITE: はリポジトリ外かつホーム外のパス '{filepath}' に書けません", "returncode": 1, "command": None}
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": (
+                    f"アクセス拒否: WRITE: はリポジトリ外のパス '{filepath}' に書けません。"
+                    "外部出力先は HERMES_WRITE_ALLOW_DIRS で明示してください。"
+                ),
+                "returncode": 1,
+                "command": None,
+            }
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -842,12 +982,24 @@ class Executor:
         # Note: AST-based allowlist (_is_python_safe) が主ゲート。
         # 旧ブロックリスト方式 (_PY_DANGER_PATTERNS) は許可リスト方式に置換済みのため削除。
 
+        env = {
+            "PATH": os.getenv("PATH", ""),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONSAFEPATH": "1",
+        }
+        for key in ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE"):
+            value = os.getenv(key)
+            if value:
+                env[key] = value
+
         try:
             proc = subprocess.run(
-                [sys.executable, "-c", code],
+                [sys.executable, "-I", "-c", code],
                 capture_output=True,
                 text=True,
                 cwd=str(self.repo_root),
+                env=env,
                 timeout=EXECUTOR_PYTHON_TIMEOUT,
             )
         except subprocess.TimeoutExpired:

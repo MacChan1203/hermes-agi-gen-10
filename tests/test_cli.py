@@ -23,6 +23,7 @@ from cli import (
     _classify_intent,
     _build_llm,
     _cmd_mvp,
+    _start_inline_scheduler,
     _parse_args,
     _TIME_SPEC_RE,
 )
@@ -548,3 +549,13 @@ class TestMainREPL:
                         main()
                 calls = [str(c) for c in mock_con.print.call_args_list]
                 assert any("Ollama" in c for c in calls)
+
+
+class TestInlineScheduler:
+    def test_disabled_when_daemon_running(self):
+        con = MagicMock()
+        with patch("cli.HermesDaemon.get_status", return_value={"running": True}):
+            stop_event = _start_inline_scheduler(MagicMock(), con)
+
+        assert stop_event.is_set()
+        assert con.print.called
