@@ -310,3 +310,18 @@ EXPERIMENT_DIVERSITY_SCALE = 20        # 戦略多様性の正規化除数
 # Orchestrator 追加 (orchestrator.py)
 # ===========================================================================
 ORCHESTRATOR_RESULT_TRUNCATE = 200     # 結果切り詰め長
+
+# ===========================================================================
+# Bellman Planner (bellman_planner.py)
+#  Q(s,a) = r(s,a) + γ * V(s')   with table-based learning persisted in LTM.
+# ===========================================================================
+BELLMAN_GAMMA = 0.85                   # 割引率 γ
+BELLMAN_ALPHA = 0.25                   # TD学習率 α
+BELLMAN_QTABLE_BLEND_BETA_INIT = 0.0   # Q_table の混合比 β の初期値 (経験ゼロでは無視)
+BELLMAN_QTABLE_BLEND_BETA_MAX = 0.6    # 経験が貯まった時の β 上限
+BELLMAN_QTABLE_VISITS_FOR_FULL_TRUST = 20  # この訪問回数で β=BETA_MAX
+BELLMAN_CANDIDATE_K = 4                # 評価する候補行動の最大数
+BELLMAN_LTM_KEY_PREFIX = "qtable:"     # LTM 内の Q-table キー接頭辞
+BELLMAN_QTABLE_PER_STATE_CAP = 64      # 1状態あたり保持する行動数上限 (LRU 削減)
+BELLMAN_GOAL_PROGRESS_BONUS = 0.15     # DONE: 系の終端報酬ボーナス
+BELLMAN_DEFAULT_GOAL_RELEVANCE = 0.5   # トークン重複なし時の関連度

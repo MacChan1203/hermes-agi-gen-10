@@ -1,6 +1,14 @@
 from .agi_core import AGICore, AGIIdentity, RunGoalResult
 from .agent_message import AgentMessage
 from .agent_runner import HermesAgentV10
+from .bellman_planner import (
+    BellmanEvaluator,
+    BellmanPlanner,
+    CandidateScore,
+    QTable,
+    action_signature,
+    state_signature,
+)
 from .agent_state import AgentState
 from .code_agents import CodeGeneratorAgent, CodeReviewerAgent
 from .cognitive_roles import CognitiveRole, decompose_into_roles, select_roles_for_goal
@@ -45,6 +53,13 @@ __all__ = [
     "GrowthMetrics",
     "Insight",
     "ReflectionEngine",
+    # Bellman 最適方程式
+    "BellmanEvaluator",
+    "BellmanPlanner",
+    "CandidateScore",
+    "QTable",
+    "action_signature",
+    "state_signature",
     # Gen 10: 新認知モジュール
     "InnerDialogue",
     "DeliberationResult",

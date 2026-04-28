@@ -5,15 +5,16 @@
 > Gen 6: タスク反応型AGI (入力→処理→出力)
 > Gen 7: 自律認知型AGI (知覚→省察→注意→計画→行動→学習)
 > Gen 8: 実験駆動型AGI (洞察→コード自己修正→メトリクス検証)
-> **Gen 10: 自律進化型AGI (内発動機→メタ学習→内部対話→適応的行動→夢→永続Identity)**
+> Gen 10: 自律進化型AGI (内発動機→メタ学習→内部対話→適応的行動→夢→永続Identity)
+> **Gen 10.1: + ベルマン最適方程式 (Q\*(s,a) = r + γ·max Q\*(s',a')) によるモデル/表ハイブリッド行動選択**
 
 | 指標 | 値 |
 |------|-----|
-| モジュール数 | 43 |
-| コード行数 | 14,707 |
-| テスト件数 | **モック 603 + 実LLM 14 (Ollama 起動時のみ実行)** |
-| テストカバレッジ | 43/43 モジュール (100%) |
-| config 定数 | 155 |
+| モジュール数 | 44 |
+| コード行数 | 15,337 |
+| テスト件数 | **モック 636 + 実LLM 14 (Ollama 起動時のみ実行)** |
+| テストカバレッジ | 44/44 モジュール (100%) |
+| config 定数 | 160 |
 
 ---
 
@@ -38,7 +39,7 @@ python cli.py --daemon
 
 # テスト実行
 pip install -r requirements-dev.txt
-python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (603件)
+python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (636件)
 python3 -m pytest tests/test_live_llm.py -v              # 実LLMテスト (14件, Ollama必須。未起動ならskip)
 python3 -m pytest tests/                                  # Ollama起動時は実LLMテストも実行
 
@@ -180,6 +181,29 @@ Identity永続化 -> [ループ]
 - **対話品質 EMA**: `record_outcome()` で品質を追跡、高品質時はより積極的に発動
 - 発動条件: 予測確信度 < 40% / 倫理スコア > 50% / 自己修正タスク
 
+### 4.5. ベルマン最適方程式プランナー (`bellman_planner.py`)
+
+認知ループに **MDP (Markov Decision Process)** 化レイヤーを追加。`Q*(s,a) = r(s,a) + γ · max_{a'} Q*(s',a')` に従って候補行動を評価・選択する。
+
+- **状態 s**: ドメイン + 直近行動種別 + last_status から SHA1 シグネチャ
+- **行動 a**: planner 出力 + LTM 成功戦略 + Reviewer 改善ヒントの候補プール
+- **報酬 r**: `ValueSystem.utility_score` × 目標トークン重複度 + 終端ボーナス (DONE/ANSWER/WRITE)
+- **遷移 P**: `PredictiveEngine.predict(a).success_probability` で近似
+
+二段階構成:
+
+| Phase | 役割 | 学習方式 |
+|-------|------|----------|
+| **A: BellmanEvaluator** | r + γ·V_model(s') によるモデルベース評価 | 学習なし (即時評価) |
+| **B: QTable** | 表形式 Q-learning を LTM (`qtable:*` キー) に永続化 | TD 更新: `Q ← Q + α[r + γ max Q(s',a') − Q]` |
+
+混合スコア `Q_total = (1−β)·Q_model + β·Q_table` で β は訪問回数に応じて 0.0 → 0.6 へ成長。経験ゼロではモデル評価、経験が貯まると表 Q を信頼する。状態あたり 64 行動で LRU 削減。
+
+**有効化** (デフォルト無効):
+```python
+agent = HermesAgentV10(repo_root=".", llm=llm, use_bellman=True)
+```
+
 ### 5. セキュリティ
 
 | レイヤー | 手法 |
@@ -222,6 +246,7 @@ Identity永続化 -> [ループ]
 | `hermes_agi_gen/inner_dialogue.py` | 内部対話システム (4ロール合意・品質EMA) |
 | `hermes_agi_gen/consciousness.py` | Global Workspace (11シグナル・3次元勝者抑制) |
 | `hermes_agi_gen/predictive_engine.py` | 予測エンジン (アクション別事前分布・ベイズ時間減衰) |
+| `hermes_agi_gen/bellman_planner.py` | ベルマン最適方程式プランナー (モデル評価 + 表形式Q-learning + LTM永続化) |
 | `hermes_agi_gen/value_system.py` | 価値整合・倫理的意思決定 (Unicode NFKC 正規化) |
 | `hermes_agi_gen/executor.py` | ツール実行 (許可リスト AST sandbox・`ExecutorResult` TypedDict) |
 | `hermes_agi_gen/self_modifier.py` | 自己修正 (git clean検査・アトミック書込・リスク段階制) |
@@ -288,7 +313,7 @@ python cli.py
 ## テスト
 
 ```bash
-# 全テスト (Ollama 不要: 603件)
+# 全テスト (Ollama 不要: 636件)
 python3 -m pytest tests/ --ignore=tests/test_live_llm.py
 
 # 実 LLM テスト (Ollama + gemma4:e4b 必須: 14件。未起動ならskip)
@@ -305,6 +330,7 @@ python3 -m pytest tests/
 | `test_cognitive.py` | 92 | GWT 3次元抑制、フィードバック収束、ドメインベクトル学習 |
 | `test_cli.py` | 66 | REPL、コマンド、スケジュール検出、インテント分類、HNパイプライン |
 | `test_planner_orchestrator.py` | 60 | プランナー、オーケストレーター |
+| `test_bellman_planner.py` | 20 | 状態/行動シグネチャ、Bellman評価、QTable TD更新、LTM永続化、AgentRunner統合 |
 | `test_integration.py` | 37 | Plan->Execute->Review、AGICore E2E、セキュリティ横断 |
 | `test_clients_utils.py` | 36 | MistralClient、utils、toolsets |
 | `test_spec_core.py` | 3 | 仕様書準拠MVP、JSONメモリ、最大3ループ |
@@ -322,6 +348,7 @@ python3 -m pytest tests/
 - **Global Workspace Theory** (Baars, 1988) — 11シグナルソースの3次元注意競争
 - **Predictive Coding** (Clark & Friston, 2013) — アクションタイプ別事前分布 + ベイズ時間減衰
 - **Active Inference** (Friston, 2010) — 不確実性マップの動的更新
+- **Bellman Optimality** (Bellman, 1957) — `Q*(s,a) = r + γ·max Q*(s',a')` のモデル評価 + 表形式 Q-learning ハイブリッド
 - **Intrinsic Motivation** (Oudeyer & Kaplan, 2007) — 5動機源 (収束保証+ヒステリシス)
 - **UCB1 Multi-Armed Bandit** (Auer et al., 2002) — 経験蓄積に応じた自然減衰スケジュール
 - **Transfer Learning** — コサイン意味ベクトル類似度 + ドメインベクトル自動学習

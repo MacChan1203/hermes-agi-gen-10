@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .agent_state import AgentState
+from .bellman_planner import BellmanEvaluator, BellmanPlanner, QTable
 from .config import AGENT_MAX_TOOL_OUTPUTS, AGENT_TOOL_OUTPUT_MAX_LEN
 from .executor import Executor
 from .long_term_memory import LongTermMemory
@@ -44,6 +45,7 @@ class HermesAgentV10:
         agent_role: str = "worker",
         system_prompt: str | None = None,
         ltm: LongTermMemory | None = None,
+        use_bellman: bool = False,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.model = model
@@ -62,6 +64,20 @@ class HermesAgentV10:
         # Gen 6: 予測エンジン & 価値体系
         self.predictor = PredictiveEngine(ltm=self.ltm)
         self.value_system = ValueSystem()
+        # Bellman 最適方程式に基づく行動選択 (オプトイン)
+        self.use_bellman = use_bellman
+        self.bellman_planner: BellmanPlanner | None = None
+        if use_bellman:
+            evaluator = BellmanEvaluator(
+                value_system=self.value_system,
+                predictor=self.predictor,
+            )
+            qtable = QTable(ltm=self.ltm)
+            self.bellman_planner = BellmanPlanner(
+                planner=self.planner,
+                evaluator=evaluator,
+                qtable=qtable,
+            )
 
     def run(self, state: AgentState) -> AgentState:
         initialize_working_memory(state)
@@ -127,7 +143,8 @@ class HermesAgentV10:
                 elif pivot:
                     logger.debug("[メタ認知] pivot 候補が実行可能形式でないため破棄: %s", pivot[:80])
 
-            step = self.planner.next_step(state, self.repo_root)
+            active_planner = self.bellman_planner or self.planner
+            step = active_planner.next_step(state, self.repo_root)
             if not step:
                 state.is_done = True
                 state.last_status = "finished"
@@ -188,6 +205,17 @@ class HermesAgentV10:
                 actual_outcome=review.get("summary", "")[:200],
                 actual_success=actual_success,
             )
+
+            # Bellman: TD 更新で Q-table を学習
+            if self.bellman_planner is not None:
+                terminal = bool(review.get("goal_achieved", False)) and not state.current_plan
+                self.bellman_planner.update_after_step(
+                    state=state,
+                    action=step,
+                    success=actual_success,
+                    terminal=terminal,
+                    session_id=state.session_id,
+                )
 
             state.observations.append(review["summary"])
             state.last_status = review["status"]
