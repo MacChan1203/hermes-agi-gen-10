@@ -126,10 +126,15 @@ class BellmanEvaluator:
         value_system: "ValueSystem",
         predictor: Optional["PredictiveEngine"] = None,
         gamma: float = BELLMAN_GAMMA,
+        peer_reward_hook: Optional[Any] = None,
     ) -> None:
         self.value_system = value_system
         self.predictor = predictor
         self.gamma = gamma
+        # Gen 10.2: action -> float のコールバック。TokenCodebook.bonus_for を
+        # 噛ませて「強化された通信トークンを使う行動」を即時報酬で押し上げる。
+        # #2 (CognitiveRole 同士の内部対話) で利用予定の拡張点。
+        self.peer_reward_hook = peer_reward_hook
 
     def reward(self, action: str, goal: str) -> float:
         rel = goal_relevance(action, goal)
@@ -137,10 +142,19 @@ class BellmanEvaluator:
         util = self.value_system.utility_score(action, goal_relevance=rel)
         a_type = _action_type(action)
         if a_type == "DONE":
-            return util + BELLMAN_GOAL_PROGRESS_BONUS
-        if a_type in ("ANSWER", "WRITE"):
-            return util + BELLMAN_GOAL_PROGRESS_BONUS * 0.5
-        return util
+            base = util + BELLMAN_GOAL_PROGRESS_BONUS
+        elif a_type in ("ANSWER", "WRITE"):
+            base = util + BELLMAN_GOAL_PROGRESS_BONUS * 0.5
+        else:
+            base = util
+        if self.peer_reward_hook is not None:
+            try:
+                bonus = float(self.peer_reward_hook(action))
+            except Exception:
+                logger.debug("peer_reward_hook 失敗", exc_info=True)
+                bonus = 0.0
+            base += bonus
+        return base
 
     def estimate_v_next(self, action: str, goal: str) -> float:
         """V(s') の推定値。DONE: は終端なので 0。"""

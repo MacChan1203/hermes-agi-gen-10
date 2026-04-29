@@ -50,7 +50,10 @@ from .spec_full import (
     make_real_tool_runner,
     run_spec_full,
 )
+from .peer_channel import PeerChannel
 from .state_store import SessionDB
+from .token_codebook import TokenCodebook, TokenStats
+from .token_interpreter import TokenInterpreter
 from .tool_registry import DynamicTool, ToolRegistry
 from .value_system import CoreValue, ValueAssessment, ValueSystem
 from .world_model import CausalEffect, ResourceCost, WorldModel
@@ -139,4 +142,9 @@ __all__ = [
     "SessionDB",
     "ToolRegistry",
     "WorldModel",
+    # Gen 10.2: 離散トークン通信レイヤー
+    "PeerChannel",
+    "TokenCodebook",
+    "TokenStats",
+    "TokenInterpreter",
 ]

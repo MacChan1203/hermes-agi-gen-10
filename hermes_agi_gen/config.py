@@ -325,3 +325,55 @@ BELLMAN_LTM_KEY_PREFIX = "qtable:"     # LTM 内の Q-table キー接頭辞
 BELLMAN_QTABLE_PER_STATE_CAP = 64      # 1状態あたり保持する行動数上限 (LRU 削減)
 BELLMAN_GOAL_PROGRESS_BONUS = 0.15     # DONE: 系の終端報酬ボーナス
 BELLMAN_DEFAULT_GOAL_RELEVANCE = 0.5   # トークン重複なし時の関連度
+
+# ===========================================================================
+# Gen 10.2 — 離散トークン通信レイヤー
+#  (token_codebook.py / peer_channel.py / token_interpreter.py)
+#  サマリ ② 2体協調 / ③ 通信 / ④ 離散トークン / ⑤ RL / ⑥ 解釈 に対応。
+# ===========================================================================
+# 既定の語彙 (token_id, label, keywords, expected_patterns)。
+#  - label: 人間可読
+#  - keywords: emit() 時の自然言語マッチング語
+#  - expected_patterns: 受信側がこのトークンから「予測する」コード/発話の特徴語。
+#    → Reviewer はこれを使って予測を立て、実コードとの一致率で予測誤差を計算する。
+TOKEN_CODEBOOK_DEFAULT_VOCAB: tuple = (
+    ("T_OTHER",   "その他",         (),                                                            ()),
+    ("T_ALGO",    "アルゴリズム",   ("sort", "search", "algorithm", "ソート", "アルゴリズム", "クイックソート"),
+                                    ("def ", "for ", "while ", "return", "compare", "swap", "partition")),
+    ("T_WEB",     "Web",            ("http", "html", "css", "javascript", "react", "fastapi", "flask", "web"),
+                                    ("http", "request", "response", "route", "@app", "url")),
+    ("T_DATA",    "データ処理",     ("csv", "json", "pandas", "numpy", "dataframe", "データ", "集計"),
+                                    ("import pandas", "import numpy", "csv", "json", "dataframe", "groupby")),
+    ("T_TEST",    "テスト",         ("test", "pytest", "unittest", "assert", "テスト"),
+                                    ("assert", "def test_", "pytest", "unittest", "mock")),
+    ("T_REFACTOR","リファクタ",     ("refactor", "rename", "cleanup", "リファクタ", "整理"),
+                                    ("def ", "class ", "rename", "extract")),
+    ("T_FIX",     "バグ修正",       ("bug", "fix", "error", "exception", "修正", "バグ", "エラー"),
+                                    ("try", "except", "raise", "if ", "logger.error")),
+    ("T_DOC",     "ドキュメント",   ("doc", "docstring", "comment", "readme", "ドキュメント", "コメント"),
+                                    ('"""', "#", "param", "return", "example")),
+)
+TOKEN_CODEBOOK_REWARD_INIT = 0.5        # avg_reward の初期値 (中立)
+TOKEN_CODEBOOK_REWARD_EMA_ALPHA = 0.2   # EMA 学習率
+TOKEN_CODEBOOK_BONUS_MAX = 0.3          # bonus_for() の上限
+TOKEN_CODEBOOK_BONUS_MIN = -0.3         # bonus_for() の下限
+TOKEN_CODEBOOK_EXAMPLE_CAP = 5          # トークンごとに保持する例文数
+TOKEN_CODEBOOK_EMIT_REWARD_WEIGHT = 0.5 # emit() スコアでの avg_reward 寄与係数 λ
+                                        # score = hits + λ*(avg_reward - 0.5)*2
+                                        # → 強化されたトークンが選ばれやすくなる (RL ループ閉)
+
+PEER_CHANNEL_MAX_INBOX = 32             # 受信箱に積めるメッセージ数の上限
+
+# 内部対話 (InnerDialogue) 専用の語彙。
+# 各認知ロールの発話を「stance × concern type」の組合せで符号化する。
+# expected_patterns は使わない (受信側で予測誤差を測らないため空タプル)。
+TOKEN_CODEBOOK_INNER_VOCAB: tuple = (
+    ("T_OTHER",    "その他",         (),                                          ()),
+    ("T_SUPPORT",  "支持",           ("support",),                                ()),
+    ("T_OPPOSE",   "反対",           ("oppose",),                                 ()),
+    ("T_QUALIFY",  "条件付き",       ("qualify",),                                ()),
+    ("T_EXTEND",   "拡張提案",       ("extend",),                                 ()),
+    ("T_RISK",     "リスク警告",     ("risk", "danger", "リスク", "危険"),        ()),
+    ("T_CREATIVE", "創造的代替",     ("alternative", "innovation", "代替", "創造"), ()),
+    ("T_ETHICS",   "倫理的懸念",     ("ethics", "倫理", "公正", "透明"),          ()),
+)

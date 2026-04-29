@@ -18,6 +18,7 @@ from .predictive_engine import PredictiveEngine
 from .reviewer import Reviewer
 from .self_improvement import SelfImprovementEngine
 from .state_store import SessionDB
+from .token_codebook import TokenCodebook
 from .state_store import load_latest_run_summary, save_run_summary
 from .value_system import ValueSystem
 from .world_model import WorldModel
@@ -46,6 +47,7 @@ class HermesAgentV10:
         system_prompt: str | None = None,
         ltm: LongTermMemory | None = None,
         use_bellman: bool = False,
+        codebook: TokenCodebook | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.model = model
@@ -64,13 +66,23 @@ class HermesAgentV10:
         # Gen 6: 予測エンジン & 価値体系
         self.predictor = PredictiveEngine(ltm=self.ltm)
         self.value_system = ValueSystem()
+        # Gen 10.2: トークン語彙 (省略時は配線しない)。
+        self.codebook = codebook
         # Bellman 最適方程式に基づく行動選択 (オプトイン)
         self.use_bellman = use_bellman
         self.bellman_planner: BellmanPlanner | None = None
         if use_bellman:
+            # Gen 10.2: codebook がある時のみ peer_reward_hook を実配線。
+            # 候補 action ごとに lookup() (副作用なし) → bonus_for() を流す。
+            peer_hook = None
+            if self.codebook is not None:
+                cb = self.codebook
+                def peer_hook(action: str, _cb=cb) -> float:
+                    return _cb.bonus_for(_cb.lookup(action))
             evaluator = BellmanEvaluator(
                 value_system=self.value_system,
                 predictor=self.predictor,
+                peer_reward_hook=peer_hook,
             )
             qtable = QTable(ltm=self.ltm)
             self.bellman_planner = BellmanPlanner(

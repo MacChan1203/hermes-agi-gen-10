@@ -6,15 +6,16 @@
 > Gen 7: 自律認知型AIエージェント (知覚→省察→注意→計画→行動→学習)
 > Gen 8: 実験駆動型AIエージェント (洞察→コード自己修正→メトリクス検証)
 > Gen 10: 自律進化型AIエージェント (内発動機→メタ学習→内部対話→適応的行動→夢→永続Identity)
-> **Gen 10.1: + ベルマン最適方程式 (Q\*(s,a) = r + γ·max Q\*(s',a')) によるモデル/表ハイブリッド行動選択**
+> Gen 10.1: + ベルマン最適方程式 (Q\*(s,a) = r + γ·max Q\*(s',a')) によるモデル/表ハイブリッド行動選択
+> **Gen 10.2: + 離散トークン通信レイヤー (エージェント間/ロール間で内部言語を発話・予測・強化学習)**
 
 | 指標 | 値 |
 |------|-----|
-| モジュール数 | 45 |
-| コード行数 | 16,100 |
-| テスト件数 | **モック 673 + 実LLM 14 (Ollama 起動時のみ実行)** |
-| テストカバレッジ | 45/45 モジュール (100%) |
-| config 定数 | 160 |
+| モジュール数 | 48 |
+| コード行数 | 16,800 |
+| テスト件数 | **モック 715 + 実LLM 14 (Ollama 起動時のみ実行)** |
+| テストカバレッジ | 48/48 モジュール (100%) |
+| config 定数 | 170 |
 
 ---
 
@@ -39,7 +40,7 @@ python cli.py --daemon
 
 # テスト実行
 pip install -r requirements-dev.txt
-python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (673件)
+python3 -m pytest tests/ --ignore=tests/test_live_llm.py  # Ollama不要で全テスト (715件)
 python3 -m pytest tests/test_live_llm.py -v              # 実LLMテスト (14件, Ollama必須。未起動ならskip)
 python3 -m pytest tests/                                  # Ollama起動時は実LLMテストも実行
 
@@ -243,6 +244,56 @@ app = HermesAGIFull(
 print(app.run("テストを実行して結果をまとめる"))
 ```
 
+### 4.7. 離散トークン通信レイヤー (Gen 10.2)
+
+階層的・予測的AIサマリの **② 2体協調 / ③ 通信 / ④ 離散トークン / ⑤ RL / ⑥ 解釈 / ⑧ 自己評価** に対応する内部言語レイヤー。エージェント間 (#3 CodeGenerator ↔ CodeReviewer) およびロール間 (#2 critic/innovator/ethicist ↔ strategist) が固定サイズの離散語彙でメッセージを交換し、予測誤差で語彙を強化学習する。
+
+| モジュール | 役割 |
+|---|---|
+| `token_codebook.py` | 離散語彙 (id, label, keywords, expected_patterns) + EMA 強化統計。`emit()` / `lookup()` (副作用なし) / `record_reward()` / `bonus_for()` / snapshot 永続化 |
+| `peer_channel.py` | `AgentMessage` を運搬する受信箱バス。受信者ロール名でルーティング |
+| `token_interpreter.py` | トークン列 → 人間可読な解釈文字列 (label + 使用例) |
+
+**フロー (#3 コード生成 ↔ レビュー)**:
+
+```
+[Generator]  request → codebook.emit() → token_id → channel.send("reviewer")
+                                                            ↓
+[Reviewer]   channel.receive("reviewer") → predict() ──→ CodePrediction
+                                              ↓ (コード観測前に期待パターンを立てる)
+                  LLM レビュー (token_hint をプロンプトへ注入)
+                                              ↓
+                  prediction.evaluate(code) → 予測誤差
+                                              ↓
+                  codebook.record_reward(token_id, 1.0 - error)  ←  サマリ⑤⑧
+                                              ↓
+                  TokenInterpreter.interpret() → レビュー末尾に [内部通信] 行を付与  ← サマリ⑥
+```
+
+**フロー (#2 内部対話)**: `InnerDialogue.deliberate()` で critic/innovator/ethicist の発話を `(stance × concern type)` で離散化 → strategist の context に `[内部トークン要約: T_RISK(リスク警告), T_EXTEND(拡張提案), ...]` として注入。`record_outcome(success=...)` 時に **stance 整合性で credit assignment** (support/extend は success 時に強化、oppose/qualify は failure 時に強化)。
+
+**RL ループの閉**:
+- `emit()` のスコア = `hits + λ·(avg_reward − 0.5)·2` (キーワード一致だけでなく強化済みかも考慮)
+- 強化されたトークンが同点時に選ばれるため、繰り返し成功した「内部言語」が固定化される
+
+**Bellman プランナーへの配線**: `HermesAgentV10(use_bellman=True, codebook=cb)` で `BellmanEvaluator.peer_reward_hook` に `lookup() → bonus_for()` が自動配線され、強化済みトークンに対応する候補行動の即時報酬が `[BONUS_MIN, BONUS_MAX]` の範囲で押し上げられる。
+
+```python
+from hermes_agi_gen import HermesAgentV10, TokenCodebook, PeerChannel
+from hermes_agi_gen.code_agents import CodeGeneratorAgent, CodeReviewerAgent
+
+# #3: エージェント間トークン通信
+ch, cb = PeerChannel(), TokenCodebook()
+gen = CodeGeneratorAgent(llm=llm, peer_channel=ch, codebook=cb)
+rev = CodeReviewerAgent(llm=llm, peer_channel=ch, codebook=cb)
+
+gen.generate("クイックソートを実装")          # → channel に T_ALGO が emit
+print(rev.review("def quicksort(a): ..."))    # 予測誤差で T_ALGO を強化、解釈付き出力
+
+# Bellman プランナーへ強化済み語彙のボーナスを流す
+agent = HermesAgentV10(use_bellman=True, codebook=cb)
+```
+
 ### 5. セキュリティ
 
 | レイヤー | 手法 |
@@ -285,7 +336,10 @@ print(app.run("テストを実行して結果をまとめる"))
 | `hermes_agi_gen/inner_dialogue.py` | 内部対話システム (4ロール合意・品質EMA) |
 | `hermes_agi_gen/consciousness.py` | Global Workspace (11シグナル・3次元勝者抑制) |
 | `hermes_agi_gen/predictive_engine.py` | 予測エンジン (アクション別事前分布・ベイズ時間減衰) |
-| `hermes_agi_gen/bellman_planner.py` | ベルマン最適方程式プランナー (モデル評価 + 表形式Q-learning + LTM永続化) |
+| `hermes_agi_gen/bellman_planner.py` | ベルマン最適方程式プランナー (モデル評価 + 表形式Q-learning + LTM永続化 + peer_reward_hook) |
+| `hermes_agi_gen/token_codebook.py` | 離散トークン語彙 + EMA 強化統計 (Gen 10.2) |
+| `hermes_agi_gen/peer_channel.py` | エージェント/ロール間メッセージバス (Gen 10.2) |
+| `hermes_agi_gen/token_interpreter.py` | トークン列 → 人間可読化 (Gen 10.2) |
 | `hermes_agi_gen/value_system.py` | 価値整合・倫理的意思決定 (Unicode NFKC 正規化) |
 | `hermes_agi_gen/executor.py` | ツール実行 (許可リスト AST sandbox・`ExecutorResult` TypedDict) |
 | `hermes_agi_gen/self_modifier.py` | 自己修正 (git clean検査・アトミック書込・リスク段階制) |
@@ -353,7 +407,7 @@ python cli.py
 ## テスト
 
 ```bash
-# 全テスト (Ollama 不要: 673件)
+# 全テスト (Ollama 不要: 715件)
 python3 -m pytest tests/ --ignore=tests/test_live_llm.py
 
 # 実 LLM テスト (Ollama + gemma4:e4b 必須: 14件。未起動ならskip)
@@ -371,6 +425,8 @@ python3 -m pytest tests/
 | `test_cli.py` | 66 | REPL、コマンド、スケジュール検出、インテント分類、HNパイプライン |
 | `test_planner_orchestrator.py` | 60 | プランナー、オーケストレーター |
 | `test_bellman_planner.py` | 20 | 状態/行動シグネチャ、Bellman評価、QTable TD更新、LTM永続化、AgentRunner統合 |
+| `test_token_layer.py` | 34 | 離散トークン語彙 (RL ループ閉)、PeerChannel、TokenInterpreter、Generator↔Reviewer 通信、Reviewer.predict、peer_reward_hook 配線 |
+| `test_inner_dialogue_tokens.py` | 8 | InnerDialogue × トークン通信、stance 別 credit assignment、strategist プロンプト注入 |
 | `test_integration.py` | 37 | Plan->Execute->Review、AGICore E2E、セキュリティ横断 |
 | `test_clients_utils.py` | 36 | MistralClient、utils、toolsets |
 | `test_spec_core.py` | 3 | 仕様書準拠MVP、JSONメモリ、最大3ループ |
@@ -397,6 +453,7 @@ python3 -m pytest tests/
 - **Cognitive Role Specialization** — 8ロール + 成功率 EMA フィードバック
 - **Metacognition** — 省察 + 解決済みTTL管理 + 適応的インターバル
 - **Deliberative Alignment** — 4ロール内部対話 + 品質 EMA 適応
+- **Emergent Communication** (Foerster et al., 2016 ほか) — 離散トークン通信 + 予測誤差による語彙強化 (Gen 10.2)
 
 ---
 
@@ -407,4 +464,6 @@ python3 -m pytest tests/
 | Gen 6 | タスク反応型 | 入力->GWT注意->8ロール実行->出力 |
 | Gen 7 | 自律認知型 | +省察->洞察->戦略的ゴール->few-shot学習 |
 | Gen 8 | 実験駆動型 | +AutoResearch実験->コード自己修正->メトリクス検証 |
-| **Gen 10** | **自律進化型 (現行)** | **+内発動機->メタ学習->内部対話->適応的行動->夢->永続Identity** |
+| Gen 10 | 自律進化型 | +内発動機->メタ学習->内部対話->適応的行動->夢->永続Identity |
+| Gen 10.1 | + ベルマン最適化 | +Q\*(s,a)=r+γ·max Q\*(s',a') (モデル/表ハイブリッド行動選択) |
+| **Gen 10.2** | **+ 内部言語 (現行)** | **+離散トークン通信->予測->誤差->語彙強化->Bellman 報酬連動** |

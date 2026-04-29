@@ -25,16 +25,34 @@ from .config import (
     DELIBERATION_HISTORY_MAX_SIZE,
     DELIBERATION_FEEDBACK_EMA_ALPHA,
 )
+from .peer_channel import PeerChannel
 
 if TYPE_CHECKING:
     from .consciousness import GlobalWorkspace, WorkspaceSignal
     from .mistral_client import MistralClient
+    from .token_codebook import TokenCodebook
     from .value_system import ValueAssessment
 
 
 # ------------------------------------------------------------------
 # 対話データ構造
 # ------------------------------------------------------------------
+
+def _stance_aligned_reward(stance: str, success: bool) -> float:
+    """stance と success の整合性から [0, 1] の reward を返す。
+
+    - success=True  かつ stance ∈ {support, extend}  → 1.0 (賛成派が正しかった)
+    - success=False かつ stance ∈ {oppose, qualify}  → 1.0 (反対派が正しかった)
+    - 不整合                                          → 0.0
+    - 不明な stance                                    → 0.5 (中立)
+    """
+    s = (stance or "").lower()
+    if s in ("support", "extend"):
+        return 1.0 if success else 0.0
+    if s in ("oppose", "qualify"):
+        return 0.0 if success else 1.0
+    return 0.5
+
 
 @dataclass
 class DialogueUtterance:
@@ -119,11 +137,24 @@ class InnerDialogue:
                 execute(result.refined_goal)
     """
 
-    def __init__(self, llm: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        llm: Optional[Any] = None,
+        peer_channel: Optional["PeerChannel"] = None,
+        codebook: Optional["TokenCodebook"] = None,
+    ) -> None:
         self.llm = llm
         self._deliberation_count = 0
         self._history: List[DeliberationResult] = []
         self._deliberation_quality: float = 0.5  # EMA of dialogue usefulness
+        # Gen 10.2 #2: ロール間の離散トークン通信。
+        # critic/innovator/ethicist の発話 → トークン → strategist が統合参照。
+        # record_outcome() の成否で同 deliberation のトークンに stance 別 reward を返す。
+        self._channel = peer_channel
+        self._codebook = codebook
+        # 直近 deliberation で発火した [(token_id, stance), ...]。
+        # stance は "support"/"oppose"/"qualify"/"extend" のいずれか。
+        self._pending_tokens: List[tuple] = []
 
     # ------------------------------------------------------------------
     # フィードバックループ
@@ -157,6 +188,23 @@ class InnerDialogue:
         self._deliberation_quality = (
             (1 - alpha) * self._deliberation_quality + alpha * signal
         )
+
+        # 直近 deliberation で発火した token に stance 別 reward を返す (#2 RL)。
+        # 対話あり実績 (=success/failure シグナル付き) のときのみ。
+        # credit assignment: 一律ではなく stance が結果と整合した token に高 reward。
+        #   success=True  → support/extend が「正しかった」
+        #   success=False → oppose/qualify が「正しかった」(リスクを正しく指摘)
+        if (
+            deliberation_was_used
+            and self._codebook is not None
+            and self._pending_tokens
+        ):
+            for tid, stance in self._pending_tokens:
+                self._codebook.record_reward(
+                    tid,
+                    reward=_stance_aligned_reward(stance, success),
+                )
+            self._pending_tokens = []
 
     # ------------------------------------------------------------------
     # 発動判定
@@ -220,6 +268,9 @@ class InnerDialogue:
         if self.llm is None:
             return self._rule_based_deliberation(goal, context)
 
+        # この deliberation 用のトークン履歴をリセット
+        self._pending_tokens = []
+
         # Phase 1: 批判者・革新者・倫理家が並行して意見を出す
         critic_response = self._invoke_role("critic", goal, context)
         innovator_response = self._invoke_role("innovator", goal, context)
@@ -233,13 +284,17 @@ class InnerDialogue:
                     stance=resp.get("stance", "qualify"),
                     confidence=min(1.0, max(0.0, resp.get("confidence", 0.5))),
                 ))
+                # トークン発火: stance + 発言内容から離散トークンを 1 個選ぶ
+                self._emit_role_token(role, resp)
 
-        # Phase 2: 戦略家が統合
+        # Phase 2: 戦略家が統合 (受信トークンをヒントとして付与)
+        token_hint = self._collect_token_hint_for_strategist()
         strategist_response = self._invoke_strategist(
             goal, context,
             critic_opinion=str(critic_response) if critic_response else "意見なし",
             innovator_opinion=str(innovator_response) if innovator_response else "意見なし",
             ethicist_opinion=str(ethicist_response) if ethicist_response else "意見なし",
+            token_hint=token_hint,
         )
 
         if strategist_response:
@@ -306,10 +361,14 @@ class InnerDialogue:
     def _invoke_strategist(
         self, goal: str, context: str,
         critic_opinion: str, innovator_opinion: str, ethicist_opinion: str,
+        token_hint: str = "",
     ) -> Optional[Dict]:
         """戦略家ロールに統合意見を生成させる。"""
+        ctx = context or "なし"
+        if token_hint:
+            ctx = f"{ctx}\n[内部トークン要約: {token_hint}]"
         prompt = _ROLE_PROMPTS["strategist"].format(
-            goal=goal, context=context or "なし",
+            goal=goal, context=ctx,
             critic_opinion=critic_opinion,
             innovator_opinion=innovator_opinion,
             ethicist_opinion=ethicist_opinion,
@@ -325,6 +384,65 @@ class InnerDialogue:
             return result
         except (json.JSONDecodeError, TypeError, ValueError, KeyError, OSError):
             return None
+
+    # ------------------------------------------------------------------
+    # Gen 10.2 #2: ロール間トークン通信ヘルパー
+    # ------------------------------------------------------------------
+
+    def _emit_role_token(self, role: str, response: Dict[str, Any]) -> Optional[str]:
+        """ロールの発話から離散トークンを emit して strategist 宛に送信。
+
+        emit する自然言語は「stance + 主要発言テキスト」を結合したもの。
+        TokenCodebook の keyword マッチでトークンが選ばれる。
+        """
+        if self._codebook is None:
+            return None
+        stance = str(response.get("stance", ""))
+        body = str(
+            response.get("criticism")
+            or response.get("innovation")
+            or response.get("assessment")
+            or ""
+        )
+        # critic は "risk"、innovator は "alternative"、ethicist は "ethics" を
+        # 強く示唆するテキストを足し、対応トークンが選ばれやすくする。
+        role_seed = {
+            "critic": "risk",
+            "innovator": "alternative",
+            "ethicist": "ethics",
+        }.get(role, "")
+        intent = f"{stance} {role_seed} {body}"
+        token_id = self._codebook.emit(intent)
+        self._pending_tokens.append((token_id, stance))
+        if self._channel is not None:
+            self._channel.send(
+                sender=role,
+                receiver="strategist",
+                task=body[:80],
+                tokens=[token_id],
+                extra={"stance": stance},
+            )
+        return token_id
+
+    def _collect_token_hint_for_strategist(self) -> str:
+        """strategist の受信箱を全消費し、トークン要約文字列を返す。
+
+        codebook がなければ空文字。channel がなければ _pending_tokens を
+        フォールバックとして使う (チャンネル単独で動かしたい時用)。
+        """
+        if self._codebook is None:
+            return ""
+        token_ids: List[str] = []
+        if self._channel is not None:
+            for msg in self._channel.receive("strategist"):
+                token_ids.extend(PeerChannel.tokens_of(msg))
+        if not token_ids:
+            # _pending_tokens は (token_id, stance) のタプル列なので id だけ取る
+            token_ids = [tid for tid, _ in self._pending_tokens]
+        if not token_ids:
+            return ""
+        labels = [f"{t}({self._codebook.label_of(t)})" for t in token_ids]
+        return ", ".join(labels)
 
     # ------------------------------------------------------------------
     # ルールベースフォールバック
