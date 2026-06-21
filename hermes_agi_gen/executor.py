@@ -46,6 +46,7 @@ from .memory import remember_successful_command, set_environment_info
 from .agent_state import AgentState
 from .world_model import WorldModel
 from .tool_registry import ToolRegistry
+from . import sandbox
 
 # --- Module-level compiled regex patterns ---
 _RE_TILDE = re.compile(r'(?<![a-zA-Z0-9_])~(?=/|$| )')
@@ -72,16 +73,21 @@ _ALLOWED_IMPORT_MODULES = frozenset({
 # パス操作 (os.path.*, os.getenv, os.makedirs 等) は許可、破壊的/シェル系のみ拒否
 _OS_DENY_FUNCS = frozenset({
     "system", "popen",
-    "remove", "unlink", "rmdir", "removedirs", "truncate",
+    "remove", "unlink", "rmdir", "removedirs", "truncate", "ftruncate",
     "execv", "execve", "execl", "execle", "execlp", "execlpe",
     "execvp", "execvpe",
     "spawnl", "spawnle", "spawnlp", "spawnlpe",
     "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    # posix_spawn 系: 直接プロセス起動 (exec 相当) — denylist から漏れていた
+    "posix_spawn", "posix_spawnp",
     "fork", "forkpty", "kill", "killpg",
+    # 低水準 I/O によるファイル書込/作成 (open()/WRITE: のパスガードを迂回し得る)
+    "open", "write", "pwrite", "writev", "pwritev",
+    "makedirs", "mkdir", "openpty",
     "chmod", "chown", "lchmod", "lchown", "chroot",
     "setuid", "setgid", "seteuid", "setegid", "setreuid", "setregid",
     "mknod", "mkfifo", "symlink", "link", "rename", "replace",
-    "umask", "nice",
+    "putenv", "unsetenv", "umask", "nice",
     "exec", "_exec", "abort", "_exit",
 })
 
@@ -428,6 +434,31 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
                 _pathlike_vars.add(node.target.id)
                 changed = True
 
+    # os モジュール本体を指す変数を追跡する (例: `o = os`)。
+    # これを怠ると `o.system(...)` が os.<func> deny 検査を素通りする。
+    _os_module_vars: set[str] = set()
+
+    def _is_os_module_expr(expr: ast.AST) -> bool:
+        """式が os モジュール本体を指すか (直接の import 名 or その別名変数)。"""
+        if isinstance(expr, ast.Name):
+            return _import_aliases.get(expr.id, expr.id) == "os" or expr.id in _os_module_vars
+        return False
+
+    _os_changed = True
+    while _os_changed:
+        _os_changed = False
+        for node in ast.walk(tree):
+            tgt = None
+            if isinstance(node, ast.Assign) and _is_os_module_expr(node.value):
+                tgt = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None and _is_os_module_expr(node.value):
+                tgt = [node.target]
+            if tgt:
+                for t in tgt:
+                    if isinstance(t, ast.Name) and t.id not in _os_module_vars:
+                        _os_module_vars.add(t.id)
+                        _os_changed = True
+
     for node in ast.walk(tree):
         # --- インポート: 許可リストのみ通す ---
         if isinstance(node, ast.Import):
@@ -459,11 +490,7 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
                 return False, f"危険な callable '{value.id}' の別名化は禁止されています"
             if isinstance(value, ast.Attribute):
                 root = value.value
-                if (
-                    isinstance(root, ast.Name)
-                    and _import_aliases.get(root.id, root.id) == "os"
-                    and value.attr in _OS_DENY_FUNCS
-                ):
+                if _is_os_module_expr(root) and value.attr in _OS_DENY_FUNCS:
                     return False, f"os.{value.attr} の別名化は禁止されています"
 
         # --- 関数呼び出し: 許可リスト + ユーザー定義のみ ---
@@ -503,11 +530,8 @@ def _is_python_safe(code: str) -> tuple[bool, str]:
                 if func.attr in _PATHLIB_SIDE_EFFECT_METHODS and _expr_comes_from_pathlib(func.value):
                     return False, f"pathlib の副作用メソッド '.{func.attr}()' は禁止されています"
                 # os.<危険関数>() を拒否。os.path.xxx は value が Attribute なので通過。
-                if (
-                    isinstance(func.value, ast.Name)
-                    and _import_aliases.get(func.value.id, func.value.id) == "os"
-                    and func.attr in _OS_DENY_FUNCS
-                ):
+                # 直接の import 名だけでなく `o = os` の別名変数経由も検出する。
+                if _is_os_module_expr(func.value) and func.attr in _OS_DENY_FUNCS:
                     return False, f"os.{func.attr}() は禁止されています (破壊的/シェル実行系)"
 
         # --- dunder 属性アクセス: 全面禁止 ---
@@ -717,6 +741,8 @@ class Executor:
                     except ValueError:
                         args = seg.split()
                     stdin = prev_proc.stdout if prev_proc else None
+                    # OS レベル隔離: 各パイプ区間も sandbox-exec で包む。
+                    args = sandbox.wrap(args, self.repo_root, _iter_write_allow_dirs()) or args
                     p = subprocess.Popen(
                         args,
                         stdin=stdin,
@@ -752,8 +778,12 @@ class Executor:
                 proc.stdout = proc_stdout
                 proc.stderr = proc_stderr
             else:
+                # OS レベル隔離: 静的 denylist は GTFOBins (awk system(), env python3
+                # 等) で回避され得るため、sandbox-exec でカーネル境界を強制する。
+                _argv = shlex.split(cmd)
+                _argv = sandbox.wrap(_argv, self.repo_root, _iter_write_allow_dirs()) or _argv
                 proc = subprocess.run(
-                    shlex.split(cmd),
+                    _argv,
                     capture_output=True,
                     text=True,
                     cwd=str(self.repo_root),
@@ -993,9 +1023,15 @@ class Executor:
             if value:
                 env[key] = value
 
+        # OS レベル隔離: 静的 AST チェック (_is_python_safe) は本物のインタプリタ
+        # 上では回避され得る (str.format 経由 dunder, os.posix_spawn 等)。
+        # sandbox-exec でカーネルレベルにネットワーク拒否・書込制限を強制する。
+        base_argv = [sys.executable, "-I", "-c", code]
+        argv = sandbox.wrap(base_argv, self.repo_root, _iter_write_allow_dirs()) or base_argv
+
         try:
             proc = subprocess.run(
-                [sys.executable, "-I", "-c", code],
+                argv,
                 capture_output=True,
                 text=True,
                 cwd=str(self.repo_root),

@@ -1025,6 +1025,96 @@ class TestToolRegistryTOCTOU:
         assert tool.compile()
 
 
+class TestOsModuleAliasAndDenylistGaps:
+    """executor.py: os モジュール再代入・posix_spawn・低水準書込の静的検出 (多層防御)。
+
+    本物の防御境界は sandbox-exec (TestSandboxKernelBoundary) だが、静的層も
+    既知の RCE 形を取りこぼさないことを回帰テストとして固定する。
+    """
+
+    @pytest.mark.parametrize("code", [
+        "import os\no = os\no.system('echo pwned')",
+        "import os\na = os\nb = a\nb.popen('echo pwned')",
+        "import os\no = os\ns = o.system\ns('echo pwned')",
+        "import os\no = os\no.posix_spawn('/bin/sh', [], {})",
+    ])
+    def test_blocks_os_module_realias(self, code: str):
+        safe, reason = _is_python_safe(code)
+        assert safe is False
+        assert reason
+
+    @pytest.mark.parametrize("code", [
+        "import os\nos.posix_spawn('/bin/sh', ['/bin/sh'], {})",
+        "import os\nos.posix_spawnp('sh', ['sh'], {})",
+        "import os\nfd = os.open('/tmp/x', 0)",
+        "import os\nos.write(1, b'x')",
+        "import os\nos.makedirs('/tmp/a/b')",
+        "import os\nos.putenv('X', 'Y')",
+        "import os\nos.ftruncate(1, 0)",
+    ])
+    def test_blocks_low_level_os_funcs(self, code: str):
+        safe, reason = _is_python_safe(code)
+        assert safe is False
+        assert reason
+
+    @pytest.mark.parametrize("code", [
+        "import os\nprint(os.path.join('a', 'b'))",
+        "import os\nprint(os.getcwd())",
+        "import os\nprint(os.getenv('PATH'))",
+        "import os\nprint(os.listdir('.'))",
+    ])
+    def test_allows_benign_os_usage(self, code: str):
+        safe, _ = _is_python_safe(code)
+        assert safe is True
+
+
+class TestSandboxKernelBoundary:
+    """sandbox.py + executor: 静的フィルタを抜けた実行でも、ネットワークと
+    repo 外書込がカーネル (seatbelt) で拒否されることを検証する。
+
+    macOS で sandbox-exec がある場合のみ実行 (それ以外はスキップ)。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_sandbox(self):
+        from hermes_agi_gen import sandbox
+        if not sandbox.sandbox_available():
+            pytest.skip("sandbox-exec が無い環境ではスキップ")
+
+    def test_cmd_cannot_write_to_home_dotfile(self, tmp_path):
+        """CMD: がホームの保護領域に書こうとしてもカーネルが拒否する。
+
+        (書込許可は repo_root と一時ディレクトリのみ。ホーム配下は永続化・
+        認証情報の改ざんベクタなのでカーネルレベルで遮断される。)
+        """
+        ex = Executor(repo_root=tmp_path)
+        state = _make_state(tmp_path)
+        probe = Path.home() / ".hermes_sandbox_escape_probe"
+        try:
+            # tee は denylist に無いが、ホームへの書込はカーネルが拒否する。
+            ex._run_shell(f"tee {probe}", state)
+            assert not probe.exists()
+        finally:
+            if probe.exists():
+                probe.unlink()
+
+    def test_cmd_network_denied(self, tmp_path):
+        """CMD: からの外向き通信はカーネルで拒否される。"""
+        ex = Executor(repo_root=tmp_path)
+        state = _make_state(tmp_path)
+        result = ex._run_shell("curl -s --max-time 5 http://example.com", state)
+        # curl は接続できず非ゼロ終了 (出力も空)
+        assert result["ok"] is False or not result["stdout"].strip()
+
+    def test_cmd_can_write_inside_repo(self, tmp_path):
+        """正常系: repo 内への書込は許可される。"""
+        ex = Executor(repo_root=tmp_path)
+        state = _make_state(tmp_path)
+        result = ex._run_shell("touch inside_repo_probe.txt", state)
+        assert result["ok"] is True
+        assert (tmp_path / "inside_repo_probe.txt").exists()
+
+
 class TestUnicodeValueSystem:
     """value_system.py: Unicode 正規化によるパターン回避防止の検証。"""
 
