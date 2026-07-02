@@ -6,8 +6,10 @@ ddgs ライブラリ (pip install ddgs) を優先使用。
 from __future__ import annotations
 
 import html
+import ipaddress
 import logging
 import re
+import socket
 import threading
 import time
 from typing import Dict, List
@@ -18,6 +20,72 @@ import requests
 from .config import WEB_SEARCH_TIMEOUT, WEB_SEARCH_MAX_RESULTS, WEB_SEARCH_RATE_LIMIT_SEC
 
 logger = logging.getLogger(__name__)
+
+# --- SSRF ガード -----------------------------------------------------------
+# FETCH: はメインプロセス (サンドボックス対象外・ネットワーク許可) で走る。
+# ここで URL を検証しないと、エージェント (やプロンプトインジェクション) が
+# ループバック / リンクローカル / プライベート網の内部サービスに到達でき
+# (SSRF・ポートスキャン)、サンドボックスのネットワーク遮断が意味を失う。
+# 注意: これは「内部到達」を塞ぐだけで、公開ホストへの秘密送信 (exfil) は
+#       URL 層では防げない (evil.com は正当な公開ホストに見える)。
+_ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+_MAX_FETCH_REDIRECTS = 5
+_MAX_FETCH_BYTES = 5_000_000  # レスポンス本文の上限 (メモリDoS抑止)
+
+
+class UnsafeURLError(ValueError):
+    """内部/非公開アドレスを指す等、取得を拒否すべき URL。"""
+
+
+def _ip_is_public(ip: str) -> bool:
+    """IP がグローバル (公開) アドレスなら True。
+
+    ループバック / プライベート / リンクローカル / 予約 / マルチキャスト /
+    未指定 のいずれかなら False。IPv4/IPv6 双方に対応。
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
+def _assert_safe_url(url: str) -> None:
+    """URL がスキーム/宛先の観点で安全でなければ UnsafeURLError を送出する。
+
+    ホスト名を解決し、解決された **全ての** A/AAAA が公開アドレスであることを
+    要求する (1つでも内部アドレスなら拒否)。
+    DNS リバインディング (接続時の再解決で内部へ振り替え) は残余リスクだが、
+    ローカルツールとしては本チェックで十分とし、IP ピニングは行わない。
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_URL_SCHEMES:
+        raise UnsafeURLError(f"許可されていないスキーム: '{scheme or '(なし)'}' (http/https のみ)")
+    host = parsed.hostname
+    if not host:
+        raise UnsafeURLError("URL にホストがありません")
+    # ホストが数値 IP リテラルの場合も getaddrinfo が正規化して返す。
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise UnsafeURLError(f"ホスト名を解決できません: {host} ({exc})") from exc
+    resolved = {info[4][0] for info in infos}
+    if not resolved:
+        raise UnsafeURLError(f"ホスト名を解決できません: {host}")
+    for ip in resolved:
+        if not _ip_is_public(ip):
+            raise UnsafeURLError(f"内部/非公開アドレスへの接続は拒否されました: {host} -> {ip}")
 
 _HEADERS = {
     "User-Agent": (
@@ -179,13 +247,47 @@ def fetch_url(url: str, max_chars: int = 6000) -> Dict[str, str]:
         {"url": str, "content": str, "type": "json"|"html"|"text", "error": str(optional)}
     """
     try:
-        resp = requests.get(url, headers=_HEADERS, timeout=WEB_SEARCH_TIMEOUT)
+        current = url
+        resp = None
+        # リダイレクトは自動追従せず、各ホップを個別に SSRF 検証する。
+        # (自動追従だと 302 -> http://127.0.0.1/ で検証を素通りされる)
+        for _hop in range(_MAX_FETCH_REDIRECTS + 1):
+            _assert_safe_url(current)
+            resp = requests.get(
+                current,
+                headers=_HEADERS,
+                timeout=WEB_SEARCH_TIMEOUT,
+                allow_redirects=False,
+                stream=True,
+            )
+            if resp.is_redirect or resp.is_permanent_redirect:
+                location = resp.headers.get("Location")
+                resp.close()
+                if not location:
+                    raise UnsafeURLError("Location ヘッダのないリダイレクト応答")
+                # 相対リダイレクトを絶対 URL に解決してから再検証する。
+                current = requests.compat.urljoin(current, location)
+                continue
+            break
+        else:
+            raise UnsafeURLError(f"リダイレクトが多すぎます (>{_MAX_FETCH_REDIRECTS})")
+
         resp.raise_for_status()
+        # 本文サイズを制限してからデコードする (メモリDoS抑止)。
+        body = resp.raw.read(_MAX_FETCH_BYTES + 1, decode_content=True)
+        resp.close()
+        if len(body) > _MAX_FETCH_BYTES:
+            raise UnsafeURLError(f"レスポンスが大きすぎます (>{_MAX_FETCH_BYTES} bytes)")
+        encoding = resp.encoding or "utf-8"
+        text_body = body.decode(encoding, errors="replace")
         content_type = resp.headers.get("Content-Type", "")
-        if "json" in content_type or url.endswith(".json"):
-            return {"url": url, "content": resp.text[:max_chars], "type": "json"}
-        text = _strip_tags(resp.text)[:max_chars]
-        return {"url": url, "content": text, "type": "html"}
+        if "json" in content_type or current.endswith(".json"):
+            return {"url": current, "content": text_body[:max_chars], "type": "json"}
+        text = _strip_tags(text_body)[:max_chars]
+        return {"url": current, "content": text, "type": "html"}
+    except UnsafeURLError as exc:
+        logger.warning("fetch_url 拒否 (%s): %s", url, exc)
+        return {"url": url, "content": "", "type": "error", "error": f"取得拒否: {exc}"}
     except Exception as exc:
         logger.error("fetch_url エラー (%s): %s", url, exc)
         return {"url": url, "content": "", "type": "error", "error": str(exc)}
