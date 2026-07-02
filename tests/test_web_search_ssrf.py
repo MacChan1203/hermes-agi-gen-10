@@ -97,3 +97,29 @@ def test_public_host_allowed_when_reachable(loopback_server, monkeypatch):
     r = fetch_url("http://127.0.0.1:%d/ok" % loopback_server)
     assert r["type"] == "html"
     assert "INTERNAL-SECRET" in r["content"]
+
+
+def test_audit_log_emitted_on_success(loopback_server, monkeypatch, caplog):
+    """成功した FETCH: は宛先ホストが監査ログに残る (検知的統制)。
+
+    SSRF ガードは内部到達を防ぐが、外部公開ホストへの exfil は URL 層では
+    防げない。せめて事後調査できるよう宛先を記録することを検証する。
+    """
+    monkeypatch.setattr(web_search, "_assert_safe_url", lambda url: None)
+    with caplog.at_level("INFO", logger="hermes_agi_gen.web_search"):
+        fetch_url("http://127.0.0.1:%d/ok" % loopback_server)
+    assert any("FETCH 監査" in r.message and "127.0.0.1" in r.message for r in caplog.records)
+
+
+def test_audit_log_flags_long_query(loopback_server, monkeypatch, caplog):
+    """query 文字列が長大な場合、監査ログが WARNING に格上げされる。
+
+    ブロックはしない (ヒューリスティック・非予防的)。ログレベルの違いだけを検証する。
+    """
+    monkeypatch.setattr(web_search, "_assert_safe_url", lambda url: None)
+    long_q = "d=" + "A" * 300
+    with caplog.at_level("INFO", logger="hermes_agi_gen.web_search"):
+        r = fetch_url("http://127.0.0.1:%d/ok?%s" % (loopback_server, long_q))
+    assert r["type"] == "html"  # ブロックされない
+    warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"]
+    assert any("query" in rec.message and "127.0.0.1" in rec.message for rec in warnings)

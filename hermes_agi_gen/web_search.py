@@ -87,6 +87,34 @@ def _assert_safe_url(url: str) -> None:
         if not _ip_is_public(ip):
             raise UnsafeURLError(f"内部/非公開アドレスへの接続は拒否されました: {host} -> {ip}")
 
+
+# FETCH: 監査ログのしきい値。query 文字列がこれを超えたら WARNING で目立たせる。
+# これは検知的ヒューリスティックであり、ブロックはしない (正規の長い URL も
+# 存在するため false positive は避けられない。予防的統制ではなく事後調査用)。
+_AUDIT_LONG_QUERY_THRESHOLD = 200
+
+
+def _audit_log_fetch(requested_url: str, final_url: str) -> None:
+    """成功した FETCH: の宛先を監査ログに記録する。
+
+    SSRF ガードは内部ホストへの到達を防ぐが、公開ホストへのデータ持ち出し
+    (例: query 文字列に秘密を埋め込んで送る) は URL 層では原理的に防げない
+    (evil.com は正当な公開ホストに見える)。これは防げないものを「見える化」
+    する検知的統制。query が異常に長い場合は WARNING でログを目立たせる
+    (あくまでヒューリスティックで、正規の長い URL も引っかかり得る)。
+    """
+    parsed = urlparse(final_url)
+    query_len = len(parsed.query or "")
+    if query_len > _AUDIT_LONG_QUERY_THRESHOLD:
+        logger.warning(
+            "FETCH 監査: 宛先 %s (query長=%d, 要求URL=%s) — query が長大です。"
+            "データ持ち出しの可能性がないか目視確認してください。",
+            parsed.hostname, query_len, requested_url,
+        )
+    else:
+        logger.info("FETCH 監査: 宛先 %s (要求URL=%s)", parsed.hostname, requested_url)
+
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -281,6 +309,11 @@ def fetch_url(url: str, max_chars: int = 6000) -> Dict[str, str]:
         encoding = resp.encoding or "utf-8"
         text_body = body.decode(encoding, errors="replace")
         content_type = resp.headers.get("Content-Type", "")
+        # 監査ログ: SSRF ガードは内部到達を防ぐが、外部公開ホストへの
+        # データ持ち出し (query 文字列経由の exfil 等) は URL 層では防げない。
+        # 検知はできなくても事後調査できるよう、宛先と URL 全体を記録する
+        # (これはブロックしない検知的統制であり、予防的統制ではない)。
+        _audit_log_fetch(url, current)
         if "json" in content_type or current.endswith(".json"):
             return {"url": current, "content": text_body[:max_chars], "type": "json"}
         text = _strip_tags(text_body)[:max_chars]
