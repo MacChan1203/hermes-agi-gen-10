@@ -1114,6 +1114,91 @@ class TestSandboxKernelBoundary:
         assert result["ok"] is True
         assert (tmp_path / "inside_repo_probe.txt").exists()
 
+    # --- 読取り制限 (機微な秘密の巣をカーネルで遮断) --------------------------
+
+    def _sbexec_cat(self, profile: str, target: Path):
+        """指定プロファイルで target を cat した結果 (returncode, stdout) を返す。"""
+        import subprocess
+        from hermes_agi_gen import sandbox
+        r = subprocess.run(
+            [sandbox._SANDBOX_EXEC, "-p", profile, "/bin/cat", str(target)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.returncode, r.stdout
+
+    def test_cannot_read_home_secret(self, tmp_path, monkeypatch):
+        """ホームの機微ディレクトリ (~/.ssh 等) はカーネルが読取り拒否する。
+
+        検証は「文字列がブロックされる」ではなく「実際に cat しても中身が
+        取れない」ことで行う。
+        """
+        from hermes_agi_gen import sandbox
+        fake_home = tmp_path / "home"
+        (fake_home / ".ssh").mkdir(parents=True)
+        secret = fake_home / ".ssh" / "id_secret"
+        secret.write_text("PRIVATE-KEY-MATERIAL")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        profile = sandbox.build_profile(repo)
+        rc, out = self._sbexec_cat(profile, secret)
+        assert rc != 0
+        assert "PRIVATE-KEY-MATERIAL" not in out
+
+    def test_cannot_read_home_secret_via_firmlink(self, tmp_path, monkeypatch):
+        """firmlink エイリアス経由でも読取り拒否される (seatbelt は vnode 正規化)。"""
+        from hermes_agi_gen import sandbox
+        fake_home = tmp_path / "home"
+        (fake_home / ".aws").mkdir(parents=True)
+        secret = fake_home / ".aws" / "credentials"
+        secret.write_text("AWS-SECRET")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        profile = sandbox.build_profile(repo)
+        # 別表記 (.resolve 済み絶対パス) でも拒否されること
+        rc, out = self._sbexec_cat(profile, secret.resolve())
+        assert rc != 0
+        assert "AWS-SECRET" not in out
+
+    def test_cannot_read_repo_dotenv(self, tmp_path, monkeypatch):
+        """repo 内の .env (API キー等) も読取り拒否される。"""
+        from hermes_agi_gen import sandbox
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        env_file = repo / ".env"
+        env_file.write_text("API_KEY=super-secret")
+
+        profile = sandbox.build_profile(repo)
+        rc, out = self._sbexec_cat(profile, env_file)
+        assert rc != 0
+        assert "super-secret" not in out
+
+    def test_can_still_read_repo_file(self, tmp_path, monkeypatch):
+        """正常系: repo 内の通常ファイルは引き続き読める。"""
+        from hermes_agi_gen import sandbox
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        f = repo / "notes.txt"
+        f.write_text("HELLO-REPO")
+
+        profile = sandbox.build_profile(repo)
+        rc, out = self._sbexec_cat(profile, f)
+        assert rc == 0
+        assert "HELLO-REPO" in out
+
+    def test_interpreter_still_starts_under_read_deny(self, tmp_path):
+        """回帰: 読取り deny を重ねてもインタプリタは起動する (dyld を壊さない)。"""
+        ex = Executor(repo_root=tmp_path)
+        state = _make_state(tmp_path)
+        result = ex._run_python("import json, math, re; print('ok', json.dumps({'a': 1}))", state)
+        assert result["ok"] is True
+        assert "ok" in result["stdout"]
+
 
 class TestUnicodeValueSystem:
     """value_system.py: Unicode 正規化によるパターン回避防止の検証。"""

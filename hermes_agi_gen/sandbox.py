@@ -85,6 +85,48 @@ def _write_subpaths(repo_root: Path, allow_dirs: Iterable[Path]) -> List[str]:
     return sorted(paths)
 
 
+# 読み取りを拒否する機微な場所 (ホームディレクトリ相対)。
+#
+# file-read* は blanket 許可のまま (インタプリタ/dyld 共有キャッシュの起動には
+# macOS バージョン依存の広範な read が要る。allow-list 方式は /System 配下の
+# firmlink を辿れず SIGABRT する)。その上に「秘密の巣」だけを deny で穴埋めする。
+#
+# 目的: サンドボックス下の PYTHON:/CMD: が repo 外の秘密 (SSH 鍵・クラウド資格
+# 情報・キーチェーン・ブラウザ保存クレデンシャル・シェル履歴) を読めないように
+# する。これらは実行系サブプロセスが正当に必要とする場面が無い。
+# 注意: これは高価値の既知の場所を塞ぐ多層防御であり、任意の場所 (例:
+# ~/Documents/passwords.txt) までは列挙できない。外部公開ホストへの exfil は
+# 別問題 (FETCH: の SSRF ガードは web_search 側で対応済み)。
+_SENSITIVE_HOME_SUBPATHS: tuple[str, ...] = (
+    ".ssh", ".aws", ".gnupg", ".config", ".docker", ".kube",
+    ".azure", ".gcp", ".oci", ".terraform.d",
+    ".netrc", ".pgpass", ".git-credentials", ".npmrc", ".pypirc",
+    ".zsh_history", ".bash_history", ".python_history", ".irb_history",
+    "Library/Keychains",
+    "Library/Application Support",
+    "Library/Cookies",
+    "Library/Safari",
+    "Library/Messages",
+    "Library/Mail",
+)
+
+# repo 内にある秘密ファイル (実行系サブプロセスは読む必要が無い)。
+_SENSITIVE_REPO_NAMES: tuple[str, ...] = (".env",)
+
+
+def _read_deny_paths(repo_root: Path) -> List[str]:
+    """読み取りを拒否する絶対パス群を構築する (存在有無に関わらず列挙する)。"""
+    home = Path.home()
+    deny: set[str] = set()
+    for rel in _SENSITIVE_HOME_SUBPATHS:
+        for v in _resolve_variants(home / rel):
+            deny.add(v)
+    for name in _SENSITIVE_REPO_NAMES:
+        for v in _resolve_variants(repo_root / name):
+            deny.add(v)
+    return sorted(deny)
+
+
 def build_profile(repo_root: Path | str, allow_dirs: Iterable[Path] = ()) -> str:
     """repo_root と allow_dirs を書込可能とする seatbelt プロファイルを生成する。"""
     repo_root = Path(repo_root)
@@ -98,6 +140,11 @@ def build_profile(repo_root: Path | str, allow_dirs: Iterable[Path] = ()) -> str
         "(allow file-read*)",
         "(allow network*)" if _network_allowed() else "(deny network*)",
     ]
+    # file-read* の後に機微パスの deny を重ねる (seatbelt は最後に一致した規則が勝つ)。
+    read_deny = _read_deny_paths(repo_root)
+    if read_deny:
+        deny_rules = " ".join(f'(subpath "{_sb_escape(p)}")' for p in read_deny)
+        lines.append(f"(deny file-read* {deny_rules})")
     write_rules = " ".join(
         f'(subpath "{_sb_escape(p)}")' for p in _write_subpaths(repo_root, allow_dirs)
     )
